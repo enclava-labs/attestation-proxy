@@ -31,3 +31,6 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 x509-cert = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

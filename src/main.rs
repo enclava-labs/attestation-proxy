@@ -75,8 +75,8 @@ async fn main() {
         }
     }
 
-    let http_app = app_router(state.clone());
-    let tls_app = app_router(state);
+    let http_app = http_router(state.clone());
+    let tls_app = tls_router(state);
     let http_listener = tokio::net::TcpListener::bind(&http_addr)
         .await
         .expect("failed to bind attestation HTTP listener");
@@ -116,8 +116,16 @@ fn build_http_client(config: &Config) -> Result<reqwest::Client, Box<dyn Error +
     Ok(builder.build()?)
 }
 
-fn app_router(state: AppState) -> Router {
-    Router::new()
+fn http_router(state: AppState) -> Router {
+    app_router(state, false)
+}
+
+fn tls_router(state: AppState) -> Router {
+    app_router(state, true)
+}
+
+fn app_router(state: AppState, expose_config_routes: bool) -> Router {
+    let router = Router::new()
         .route("/health", get(handlers::health))
         .route("/status", get(handlers::status))
         .route("/.well-known/confidential/status", get(handlers::status))
@@ -154,21 +162,29 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/.well-known/confidential/bootstrap/claim",
             post(handlers::bootstrap_claim),
-        )
-        // CAP config routes (JWT-authenticated, ownership-gated)
-        .route(
-            "/.well-known/confidential/config/{key}",
-            put(handlers::config_put).delete(handlers::config_delete),
-        )
-        .route(
-            "/config/{key}",
-            put(handlers::config_put).delete(handlers::config_delete),
-        )
-        .route(
-            "/.well-known/confidential/config",
-            get(handlers::config_list),
-        )
-        .route("/config", get(handlers::config_list))
+        );
+
+    let router = if expose_config_routes {
+        router
+            // CAP config routes are only exposed on the attested TLS listener.
+            .route(
+                "/.well-known/confidential/config/{key}",
+                put(handlers::config_put).delete(handlers::config_delete),
+            )
+            .route(
+                "/config/{key}",
+                put(handlers::config_put).delete(handlers::config_delete),
+            )
+            .route(
+                "/.well-known/confidential/config",
+                get(handlers::config_list),
+            )
+            .route("/config", get(handlers::config_list))
+    } else {
+        router
+    };
+
+    router
         // CAP teardown route (JWT-authenticated, ownership-gated)
         .route(
             "/.well-known/confidential/teardown",
@@ -211,7 +227,46 @@ fn generate_tls_material(domain: &str) -> Result<TlsMaterial, Box<dyn std::error
 #[cfg(test)]
 mod main {
     mod tests {
+        use std::collections::{HashMap, VecDeque};
+        use std::sync::{Arc, Mutex};
+
+        use attestation_proxy::attestation::AaTokenCache;
+        use attestation_proxy::config::Config;
         use attestation_proxy::ownership::OwnershipGuard;
+        use attestation_proxy::receipts::ReceiptSigner;
+        use attestation_proxy::AppState;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tokio::sync::RwLock;
+        use tower::ServiceExt;
+
+        fn test_state() -> AppState {
+            let mut config = Config::from_env();
+            config.storage_ownership_mode = "password".to_string();
+            config.instance_id = "instance-test-01".to_string();
+            config.cap_api_signing_pubkey = "".to_string();
+            config.cap_api_url = "".to_string();
+            config.cap_config_dir = std::env::temp_dir()
+                .join(format!(
+                    "attestation-proxy-main-test-{}",
+                    std::process::id()
+                ))
+                .display()
+                .to_string();
+
+            let state = AppState {
+                config: Arc::new(config),
+                http_client: reqwest::Client::new(),
+                aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+                kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
+                ownership: Arc::new(OwnershipGuard::new("password".to_string())),
+                bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
+                receipt_signer: Arc::new(ReceiptSigner::ephemeral()),
+                tls_leaf_spki_sha256: [0x42; 32],
+            };
+            state.ownership.set_unlocked();
+            state
+        }
 
         #[test]
         fn ownership_gate_blocks_config_and_teardown_when_locked() {
@@ -251,6 +306,38 @@ mod main {
 
             guard.set_error("fatal");
             assert!(guard.should_gate("/cdh/resource/default/key/1"));
+        }
+
+        #[tokio::test]
+        async fn http_listener_does_not_route_config_writes() {
+            let response = super::super::http_router(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/.well-known/confidential/config/SECRET")
+                        .body(Body::from("value"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn tls_listener_routes_config_writes() {
+            let response = super::super::tls_router(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/.well-known/confidential/config/SECRET")
+                        .body(Body::from("value"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
     }
 }

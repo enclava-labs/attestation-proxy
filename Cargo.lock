@@ -149,6 +149,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tower",
  "uuid",
  "x509-cert",
  "zeroize",
