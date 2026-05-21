@@ -32,7 +32,7 @@ pub const BOOTSTRAP_CHALLENGE_MAX_ACTIVE: usize = 32;
 pub const SIGNAL_KEY_FILE: &str = "key";
 pub const SIGNAL_UNLOCKED_FILE: &str = "unlocked";
 pub const SIGNAL_ERROR_FILE: &str = "error";
-pub const HANDOFF_DEFAULT_TIMEOUT_SECONDS: u64 = 180;
+pub const HANDOFF_DEFAULT_TIMEOUT_SECONDS: u64 = 900;
 pub const SIGNAL_APP_DATA_SLOT: &str = "app-data";
 pub const SIGNAL_TLS_DATA_SLOT: &str = "tls-data";
 pub const OWNER_SEED_ENVELOPE_VERSION: &str = "enclava-owner-seed-wrap-v1";
@@ -981,6 +981,16 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn owner_handoff_timeout_covers_live_rollout_budget() {
+        const LIVE_ROLLOUT_BUDGET_SECONDS: u64 = 600;
+
+        assert!(
+            HANDOFF_DEFAULT_TIMEOUT_SECONDS >= LIVE_ROLLOUT_BUDGET_SECONDS,
+            "owner-seed handoff timeout must cover slow Kata first boot within the CAP rollout budget"
+        );
+    }
 
     #[test]
     fn state_machine_transitions() {
