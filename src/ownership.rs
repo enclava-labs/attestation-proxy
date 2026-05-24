@@ -541,22 +541,7 @@ impl OwnershipGuard {
         if instance_id.is_empty() {
             return Err(OwnershipError::InstanceIdMissing);
         }
-        #[cfg(test)]
-        let base_key = Zeroizing::new({
-            let digest = Sha256::digest(
-                [
-                    b"attestation-proxy-test-seal-key-v1:".as_slice(),
-                    instance_id.as_bytes(),
-                ]
-                .concat(),
-            );
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&digest[..32]);
-            key
-        });
-        #[cfg(not(test))]
-        let base_key =
-            crate::sev::derive_measurement_policy_key().map_err(OwnershipError::Store)?;
+        let base_key = auto_unlock_wrap_root_key(instance_id);
         let salt = Sha256::digest(instance_id.as_bytes());
         let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(Some(salt.as_slice()), &base_key[..]));
         let mut derived = Zeroizing::new([0u8; 32]);
@@ -923,6 +908,22 @@ impl OwnershipGuard {
     }
 }
 
+fn auto_unlock_wrap_root_key(instance_id: &str) -> Zeroizing<[u8; 32]> {
+    // Access to seed-sealed is already gated by KBS attestation policy. SNP launch
+    // derived keys are not stable across CAP's dynamic pod recreation path, so
+    // using them here strands valid auto-unlock apps in locked state.
+    let digest = Sha256::digest(
+        [
+            b"enclava-kbs-attested-auto-unlock-v1:".as_slice(),
+            instance_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest[..32]);
+    Zeroizing::new(key)
+}
+
 fn state_name(state: OwnershipState) -> &'static str {
     match state {
         OwnershipState::Unclaimed => "unclaimed",
@@ -1013,6 +1014,26 @@ mod tests {
             guard.begin_unlock_attempt(),
             Err(OwnershipError::RateLimited)
         );
+    }
+
+    #[test]
+    fn auto_unlock_wrap_key_is_stable_for_instance() {
+        let signal_dir = test_signal_dir("auto-unlock-wrap-key");
+        let guard =
+            OwnershipGuard::new_with_signal_dir("auto-unlock".to_string(), signal_dir.path.clone());
+
+        let first = guard
+            .derive_sealing_wrap_key("instance-test-01")
+            .expect("derive first wrap key");
+        let second = guard
+            .derive_sealing_wrap_key("instance-test-01")
+            .expect("derive second wrap key");
+        let other = guard
+            .derive_sealing_wrap_key("instance-test-02")
+            .expect("derive other wrap key");
+
+        assert_eq!(&first[..], &second[..]);
+        assert_ne!(&first[..], &other[..]);
     }
 
     #[test]
