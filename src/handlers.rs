@@ -14,7 +14,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use zeroize::Zeroizing;
 
@@ -567,6 +567,10 @@ const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 5;
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 2_000;
+#[cfg(test)]
+const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_secs(30);
 
 fn validate_bootstrap_signature(
     challenge_b64: &str,
@@ -1238,7 +1242,8 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
     }
 
     tokio::spawn(async move {
-        // Delay SEV ioctls until the AA token path has completed at least once.
+        // Give enclava-init time to bind the unlock socket and finish early setup.
+        tokio::time::sleep(AUTO_UNLOCK_STARTUP_DELAY).await;
         let _ = attestation::fetch_kbs_token_claims(&state).await;
         let material = match load_owner_seed_material(&state).await {
             Ok(material) => material,
