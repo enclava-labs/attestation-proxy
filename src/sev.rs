@@ -11,9 +11,11 @@ use zeroize::{Zeroize, Zeroizing};
 const SEV_GUEST_DEVICE: &str = "/dev/sev-guest";
 const SNP_GET_DERIVED_KEY: libc::c_ulong = 0xC0205301;
 const GUEST_FIELD_SELECT_POLICY: u64 = 1 << 0;
-const GUEST_FIELD_SELECT_MEASUREMENT: u64 = 1 << 3;
-const GUEST_FIELD_SELECT_MEASUREMENT_AND_POLICY: u64 =
-    GUEST_FIELD_SELECT_POLICY | GUEST_FIELD_SELECT_MEASUREMENT;
+fn owner_seed_seal_guest_field_select() -> u64 {
+    // KBS policy is the measurement gate for retrieving this ciphertext.
+    // The SNP-derived local wrapping key must survive pod recreation.
+    GUEST_FIELD_SELECT_POLICY
+}
 
 #[repr(C)]
 struct SnpDerivedKeyReq {
@@ -123,10 +125,10 @@ pub fn derive_measurement_policy_key() -> Result<Zeroizing<[u8; 32]>, String> {
         .map_err(|err| log_sev_internal_error("sev_guest_open_failed", err))?;
 
     let mut req = SnpDerivedKeyReq {
-        // Use the VCEK root and bind the derived bytes to guest policy + measurement.
+        // Use the VCEK root and bind the derived bytes to the guest policy.
         root_key_select: 0,
         rsvd: 0,
-        guest_field_select: GUEST_FIELD_SELECT_MEASUREMENT_AND_POLICY,
+        guest_field_select: owner_seed_seal_guest_field_select(),
         vmpl: 0,
         guest_svn: 0,
         tcb_version: 0,
@@ -169,4 +171,17 @@ pub fn derive_measurement_policy_key() -> Result<Zeroizing<[u8; 32]>, String> {
 
     derived.zeroize();
     Err("sev_guest_derived_key_zero".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_seed_seal_key_is_stable_across_recreated_pods() {
+        assert_eq!(
+            owner_seed_seal_guest_field_select(),
+            GUEST_FIELD_SELECT_POLICY
+        );
+    }
 }

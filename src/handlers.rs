@@ -4179,11 +4179,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "attestation-proxy-handlers-{prefix}-{}-{}",
-            std::process::id(),
-            nanos
-        ));
+        let path = std::env::temp_dir().join(format!("ap-{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create temp signal dir");
         TestSignalDir { path }
     }
