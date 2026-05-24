@@ -1277,7 +1277,7 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
             }
         };
 
-        match unlock_owner_seed_material(&state, &owner_seed).await {
+        match unlock_startup_auto_unlock_material(&state, &owner_seed).await {
             Ok(warning) => emit_signed_owner_audit_event(
                 &state,
                 &owner_seed,
@@ -1290,6 +1290,24 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
             Err(err) => state.ownership.set_error(err.to_string()),
         }
     });
+}
+
+async fn unlock_startup_auto_unlock_material(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    if state.ownership.is_auto_unlock_mode()
+        && !state.config.enclava_init_unlock_socket.trim().is_empty()
+    {
+        state.ownership.set_unlocked();
+        spawn_enclava_init_ready_watch(
+            state.clone(),
+            std::time::Duration::from_secs(unlock_poll_timeout_seconds()),
+        );
+        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+    }
+
+    unlock_owner_seed_material(state, owner_seed).await
 }
 
 /// POST /unlock, POST /.well-known/confidential/unlock.
@@ -3956,6 +3974,90 @@ mod tests {
         assert!(
             decode_secret_field(&secret, "seed-sealed").is_none(),
             "disable-auto-unlock should remove the sealed seed copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_auto_unlock_with_init_socket_unblocks_proxy_without_socket_handoff() {
+        let signal_dir = test_signal_dir("auto-unlock-init-socket");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("auto-unlock-init-socket-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let enable = enable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(enable.status().as_u16(), 200);
+
+        let restart_signal_dir = test_signal_dir("auto-unlock-init-socket-restart");
+        let mut restart_state = build_state_with_secret_backend(
+            &restart_signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        {
+            let config = Arc::get_mut(&mut restart_state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = restart_signal_dir
+                .path
+                .join("missing-init.sock")
+                .display()
+                .to_string();
+            config.enclava_init_ready_file = restart_signal_dir
+                .path
+                .join("init-ready")
+                .display()
+                .to_string();
+            config.enclava_init_error_file = restart_signal_dir
+                .path
+                .join("init-error")
+                .display()
+                .to_string();
+        }
+        initialize_ownership_state(&restart_state).await;
+
+        spawn_auto_unlock_if_needed(restart_state.clone());
+        sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            restart_state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unlocked")
+        );
+        assert_eq!(restart_state.ownership.health_status().0, 200);
+        assert!(
+            !restart_signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "auto mode with enclava-init should not use password handoff files"
         );
     }
 
