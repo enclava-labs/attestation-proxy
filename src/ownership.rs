@@ -982,15 +982,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn owner_handoff_timeout_covers_live_rollout_budget() {
+    const _: () = {
         const LIVE_ROLLOUT_BUDGET_SECONDS: u64 = 600;
-
         assert!(
             HANDOFF_DEFAULT_TIMEOUT_SECONDS >= LIVE_ROLLOUT_BUDGET_SECONDS,
             "owner-seed handoff timeout must cover slow Kata first boot within the CAP rollout budget"
         );
-    }
+    };
 
     #[test]
     fn state_machine_transitions() {
