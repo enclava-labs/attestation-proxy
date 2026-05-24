@@ -10,11 +10,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 const SEV_GUEST_DEVICE: &str = "/dev/sev-guest";
 const SNP_GET_DERIVED_KEY: libc::c_ulong = 0xC0205301;
-const GUEST_FIELD_SELECT_POLICY: u64 = 1 << 0;
+const GUEST_FIELD_SELECT_BASE: u64 = 0;
 fn owner_seed_seal_guest_field_select() -> u64 {
-    // KBS policy is the measurement gate for retrieving this ciphertext.
+    // KBS policy is the attested identity gate for retrieving this ciphertext.
     // The SNP-derived local wrapping key must survive pod recreation.
-    GUEST_FIELD_SELECT_POLICY
+    GUEST_FIELD_SELECT_BASE
 }
 
 #[repr(C)]
@@ -181,7 +181,7 @@ mod tests {
     fn owner_seed_seal_key_is_stable_across_recreated_pods() {
         assert_eq!(
             owner_seed_seal_guest_field_select(),
-            GUEST_FIELD_SELECT_POLICY
+            GUEST_FIELD_SELECT_BASE
         );
     }
 }
