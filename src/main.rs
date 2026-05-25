@@ -58,6 +58,7 @@ async fn main() {
         http_client,
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
+        startup_owner_seed: Arc::new(RwLock::new(None)),
         bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
         receipt_signer: Arc::new(ReceiptSigner::ephemeral()),
         tls_leaf_spki_sha256: tls_material.spki_sha256,
@@ -181,7 +182,10 @@ fn app_router(state: AppState, expose_config_routes: bool) -> Router {
             )
             .route("/config", get(handlers::config_list))
     } else {
-        router
+        router.route(
+            "/internal/owner-seed/{*path}",
+            get(handlers::internal_owner_seed),
+        )
     };
 
     router
@@ -259,6 +263,7 @@ mod main {
                 http_client: reqwest::Client::new(),
                 aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
                 kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
+                startup_owner_seed: Arc::new(RwLock::new(None)),
                 ownership: Arc::new(OwnershipGuard::new("password".to_string())),
                 bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
                 receipt_signer: Arc::new(ReceiptSigner::ephemeral()),

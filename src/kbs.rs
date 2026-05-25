@@ -697,6 +697,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(cache_map)),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "level1".to_string(),
                 signal_dir.clone(),

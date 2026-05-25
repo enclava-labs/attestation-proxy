@@ -1198,6 +1198,23 @@ pub async fn cdh_resource(State(state): State<AppState>, Path(path): Path<String
     }
 }
 
+pub async fn internal_owner_seed(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> Response {
+    let requested = path.trim_start_matches('/');
+    let expected = state.config.owner_seed_encrypted_kbs_path.trim();
+    if !state.ownership.is_auto_unlock_mode() || requested != expected {
+        return json_response(404, &json!({"error": "not_found"}));
+    }
+
+    let seed = state.startup_owner_seed.read().await;
+    let Some(seed) = seed.as_ref() else {
+        return json_response(423, &json!({"error": "owner_seed_not_ready"}));
+    };
+    bytes_response(200, seed.to_vec(), "application/octet-stream")
+}
+
 pub async fn initialize_ownership_state(state: &AppState) {
     if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
         return;
@@ -1299,6 +1316,7 @@ async fn unlock_startup_auto_unlock_material(
     if state.ownership.is_auto_unlock_mode()
         && !state.config.enclava_init_unlock_socket.trim().is_empty()
     {
+        *state.startup_owner_seed.write().await = Some(Zeroizing::new(*owner_seed));
         state.ownership.set_unlocked();
         spawn_enclava_init_ready_watch(
             state.clone(),
@@ -1653,7 +1671,10 @@ async fn wait_for_enclava_init_ready(
 
     loop {
         match tokio::fs::metadata(ready_file).await {
-            Ok(meta) if meta.is_file() => return Ok(()),
+            Ok(meta) if meta.is_file() => {
+                *state.startup_owner_seed.write().await = None;
+                return Ok(());
+            }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
@@ -4011,6 +4032,10 @@ mod tests {
         )
         .await;
         assert_eq!(enable.status().as_u16(), 200);
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        let expected_owner_seed =
+            decrypt_owner_seed_with_password(&state, &encrypted, "claim-password");
 
         let restart_signal_dir = test_signal_dir("auto-unlock-init-socket-restart");
         let mut restart_state = build_state_with_secret_backend(
@@ -4051,6 +4076,16 @@ mod tests {
             Some("unlocked")
         );
         assert_eq!(restart_state.ownership.health_status().0, 200);
+        let owner_seed_response = internal_owner_seed(
+            State(restart_state.clone()),
+            Path("default/instance-test-01-owner/seed-encrypted".to_string()),
+        )
+        .await;
+        assert_eq!(owner_seed_response.status().as_u16(), 200);
+        assert_eq!(
+            read_bytes(owner_seed_response).await.as_ref(),
+            expected_owner_seed.as_slice()
+        );
         assert!(
             !restart_signal_dir
                 .path
@@ -4215,6 +4250,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
                 signal_dir.to_path_buf(),
@@ -4254,6 +4290,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
                 signal_dir.to_path_buf(),
@@ -4269,6 +4306,12 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&body).expect("response json")
+    }
+
+    async fn read_bytes(response: Response) -> Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
     }
 
     struct TestSignalDir {
@@ -4943,6 +4986,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "password".to_string(),
                 signal_dir.path.clone(),
@@ -5092,6 +5136,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "password".to_string(),
                 signal_dir.path.clone(),

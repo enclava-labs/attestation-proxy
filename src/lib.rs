@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 use attestation::AaTokenCache;
 use config::Config;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub aa_token_cache: Arc<RwLock<AaTokenCache>>,
     pub kbs_resource_cache: Arc<RwLock<HashMap<String, KbsCacheEntry>>>,
+    pub startup_owner_seed: Arc<RwLock<Option<Zeroizing<[u8; 32]>>>>,
     pub ownership: Arc<OwnershipGuard>,
     pub bootstrap_challenges: Arc<Mutex<VecDeque<BootstrapChallenge>>>,
     pub receipt_signer: Arc<ReceiptSigner>,
