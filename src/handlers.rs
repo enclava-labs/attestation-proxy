@@ -1203,6 +1203,9 @@ pub async fn internal_owner_seed(
     Path(path): Path<String>,
 ) -> Response {
     let requested = path.trim_start_matches('/');
+    let requested = requested
+        .strip_prefix("kbs/v0/resource/")
+        .unwrap_or(requested);
     let expected = state.config.owner_seed_encrypted_kbs_path.trim();
     if !state.ownership.is_auto_unlock_mode() || requested != expected {
         return json_response(404, &json!({"error": "not_found"}));
@@ -4084,6 +4087,16 @@ mod tests {
         assert_eq!(owner_seed_response.status().as_u16(), 200);
         assert_eq!(
             read_bytes(owner_seed_response).await.as_ref(),
+            expected_owner_seed.as_slice()
+        );
+        let owner_seed_kbs_style_response = internal_owner_seed(
+            State(restart_state.clone()),
+            Path("kbs/v0/resource/default/instance-test-01-owner/seed-encrypted".to_string()),
+        )
+        .await;
+        assert_eq!(owner_seed_kbs_style_response.status().as_u16(), 200);
+        assert_eq!(
+            read_bytes(owner_seed_kbs_style_response).await.as_ref(),
             expected_owner_seed.as_slice()
         );
         assert!(
