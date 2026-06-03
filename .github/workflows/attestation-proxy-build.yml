@@ -6,6 +6,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Optional additional image tag to publish, for example v2.1.12"
+        required: false
+        type: string
 
 jobs:
   build-and-push:
@@ -30,6 +35,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/enclava-labs/attestation-proxy
+          VERSION_TAG: ${{ github.event.inputs.version_tag }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:v2"
+            if [ -n "${VERSION_TAG}" ]; then
+              echo "${IMAGE}:${VERSION_TAG}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build image locally for size gate
         uses: docker/build-push-action@v6
         with:
@@ -38,13 +58,13 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ghcr.io/enclava-ai/attestation-proxy:v2
+          tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             MUSL_TARGET=${{ env.MUSL_TARGET }}
 
       - name: Enforce image size under 16MiB
         run: |
-          SIZE_BYTES="$(docker image inspect 'ghcr.io/enclava-ai/attestation-proxy:v2' --format '{{.Size}}')"
+          SIZE_BYTES="$(docker image inspect 'ghcr.io/enclava-labs/attestation-proxy:v2' --format '{{.Size}}')"
           echo "attestation-proxy image size: ${SIZE_BYTES} bytes"
           if [ "${SIZE_BYTES}" -ge 16777216 ]; then
             echo "BUILD-03 failure: image size ${SIZE_BYTES} bytes is >= 16777216"
@@ -59,7 +79,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/enclava-ai/attestation-proxy:v2
+          tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             MUSL_TARGET=${{ env.MUSL_TARGET }}
           provenance: true
@@ -69,6 +89,6 @@ jobs:
 
       - name: Sign pushed digest
         env:
-          IMAGE: ghcr.io/enclava-ai/attestation-proxy
+          IMAGE: ghcr.io/enclava-labs/attestation-proxy
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
