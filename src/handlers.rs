@@ -2552,6 +2552,15 @@ fn cap_config_paths_for_proc_root(
         ready_marker: configured_marker.clone(),
     };
 
+    if cap_config_requires_init_ready(&configured_dir, configured_marker.as_deref()) {
+        if enclava_init_ready_file_is_present(state)? {
+            return Ok(fallback);
+        }
+        return Err(CapConfigPathError {
+            detail: format!("enclava_init_not_ready:{}", configured_dir.display()),
+        });
+    }
+
     if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
         if let Some(paths) = cap_config_paths_through_proc_root(
             proc_root,
@@ -2561,31 +2570,32 @@ fn cap_config_paths_for_proc_root(
         ) {
             return Ok(paths);
         }
-    } else if cap_config_requires_init_root(&configured_dir, configured_marker.as_deref()) {
-        return Err(CapConfigPathError {
-            detail: format!("enclava_init_pid_not_ready:{}", configured_dir.display()),
-        });
-    }
-
-    if cap_config_requires_init_root(&configured_dir, configured_marker.as_deref()) {
-        return Err(CapConfigPathError {
-            detail: format!(
-                "enclava_init_root_path_not_ready:{}",
-                configured_dir.display()
-            ),
-        });
     }
 
     Ok(fallback)
 }
 
-fn cap_config_requires_init_root(
+fn cap_config_requires_init_ready(
     configured_dir: &StdPath,
     configured_marker: Option<&StdPath>,
 ) -> bool {
     configured_marker.is_some()
         && (configured_dir.starts_with("/state")
             || configured_marker.is_some_and(|marker| marker.starts_with("/state")))
+}
+
+fn enclava_init_ready_file_is_present(state: &AppState) -> Result<bool, CapConfigPathError> {
+    let ready_file = state.config.enclava_init_ready_file.trim();
+    if ready_file.is_empty() {
+        return Ok(false);
+    }
+    match std::fs::metadata(ready_file) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(CapConfigPathError {
+            detail: format!("enclava_init_ready_file_read_failed:{err}"),
+        }),
+    }
 }
 
 fn cap_config_paths_through_proc_root(
@@ -5241,7 +5251,7 @@ mod tests {
     }
 
     #[test]
-    fn cap_config_paths_reject_luks_state_fallback_without_init_pid() {
+    fn cap_config_paths_reject_luks_state_before_init_ready() {
         let proc_root = test_config_dir("fake-proc-empty");
         fs::create_dir_all(&proc_root).unwrap();
         let state = build_config_test_state_with_marker(
@@ -5254,36 +5264,37 @@ mod tests {
 
         assert_eq!(
             error.detail,
-            "enclava_init_pid_not_ready:/state/app-data/.enclava/config"
+            "enclava_init_not_ready:/state/app-data/.enclava/config"
         );
 
         let _ = fs::remove_dir_all(&proc_root);
     }
 
     #[test]
-    fn cap_config_paths_use_luks_state_through_init_root_without_environ() {
-        let proc_root = test_config_dir("fake-proc-init-root");
-        let init = proc_root.join("202");
-        fs::create_dir_all(&init).unwrap();
-        fs::write(init.join("cmdline"), b"/usr/local/bin/enclava-init\0").unwrap();
-        let state = build_config_test_state_with_marker(
+    fn cap_config_paths_use_configured_luks_state_after_init_ready() {
+        let root = test_config_dir("fake-init-ready");
+        fs::create_dir_all(&root).unwrap();
+        let ready_file = root.join("init-ready");
+        fs::write(&ready_file, b"ready\n").unwrap();
+        let state = build_config_test_state_with_marker_and_init_ready(
             Path::new("/state/app-data/.enclava/config"),
             Some(Path::new("/state/app-data/.enclava/luks-ready")),
+            Some(&ready_file),
         );
 
-        let paths = cap_config_paths_for_proc_root(&state, &proc_root)
-            .expect("init root should resolve CAP /state config paths");
+        let paths = cap_config_paths_for_proc_root(&state, &root)
+            .expect("init-ready should allow configured CAP /state config path");
 
         assert_eq!(
             paths.config_dir,
-            proc_root.join("202/root/state/app-data/.enclava/config")
+            PathBuf::from("/state/app-data/.enclava/config")
         );
         assert_eq!(
             paths.ready_marker,
-            Some(proc_root.join("202/root/state/app-data/.enclava/luks-ready"))
+            Some(PathBuf::from("/state/app-data/.enclava/luks-ready"))
         );
 
-        let _ = fs::remove_dir_all(&proc_root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn test_api_claims(instance_id: &str, scope: &str) -> crate::jwt::ApiTokenClaims {
