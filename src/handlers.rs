@@ -14,6 +14,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::Digest;
+use std::path::{Path as StdPath, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use zeroize::Zeroizing;
@@ -833,10 +834,10 @@ pub async fn status(State(state): State<AppState>) -> Response {
     body["claims_error"] = json!(identity.claims_error);
     // Config-ready state (CONF-04): reflects whether .ready sentinel exists on
     // the configured durable config volume.
-    let ready_marker = cap_config_ready_marker_path(&state);
+    let config_paths = cap_config_paths(&state);
     let config_ready = crate::config_store::is_config_ready_with_marker(
-        std::path::Path::new(&state.config.cap_config_dir),
-        ready_marker.as_deref(),
+        config_paths.config_dir.as_path(),
+        config_paths.ready_marker.as_deref(),
     );
     body["config_ready"] = json!(config_ready);
     json_response(200, &body)
@@ -2396,20 +2397,26 @@ pub async fn config_put(
     Path(key): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    let ready_marker = cap_config_ready_marker_path(&state);
+    if let Some(detail) = cap_config_init_ready_missing(&state) {
+        return json_response(
+            423,
+            &json!({"error": "config_dir_not_ready", "detail": detail}),
+        );
+    }
+    let paths = cap_config_paths(&state);
+    let config_dir = paths.config_dir.as_path();
+    let ready_marker = paths.ready_marker.as_deref();
     match crate::config_store::write_config_existing_dir_with_marker(
         config_dir,
         &key,
         &body,
-        ready_marker.as_deref(),
+        ready_marker,
     ) {
         Ok(()) => {
             // Write config-ready sentinel after first successful config write (CONF-04).
-            if let Err(e) = crate::config_store::write_ready_sentinel_with_marker(
-                config_dir,
-                ready_marker.as_deref(),
-            ) {
+            if let Err(e) =
+                crate::config_store::write_ready_sentinel_with_marker(config_dir, ready_marker)
+            {
                 return match e {
                     crate::config_store::ConfigStoreError::DirNotFound(detail) => json_response(
                         423,
@@ -2457,7 +2464,8 @@ pub async fn config_list(
     State(state): State<AppState>,
     crate::jwt::ConfigAuth(_claims): crate::jwt::ConfigAuth,
 ) -> Response {
-    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+    let paths = cap_config_paths(&state);
+    let config_dir = paths.config_dir.as_path();
     match crate::config_store::list_config_keys(config_dir) {
         Ok(keys) => json_response(200, &json!({"keys": keys})),
         Err(e) => json_response(
@@ -2474,10 +2482,10 @@ pub async fn config_delete(
     crate::jwt::ConfigAuth(claims): crate::jwt::ConfigAuth,
     Path(key): Path<String>,
 ) -> Response {
-    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    let ready_marker = cap_config_ready_marker_path(&state);
-    match crate::config_store::delete_config_with_marker(config_dir, &key, ready_marker.as_deref())
-    {
+    let paths = cap_config_paths(&state);
+    let config_dir = paths.config_dir.as_path();
+    let ready_marker = paths.ready_marker.as_deref();
+    match crate::config_store::delete_config_with_marker(config_dir, &key, ready_marker) {
         Ok(existed) => {
             spawn_config_metadata_sync(
                 &state.http_client,
@@ -2507,12 +2515,117 @@ pub async fn config_delete(
     }
 }
 
-fn cap_config_ready_marker_path(state: &AppState) -> Option<std::path::PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapConfigPaths {
+    config_dir: PathBuf,
+    ready_marker: Option<PathBuf>,
+}
+
+fn cap_config_paths(state: &AppState) -> CapConfigPaths {
+    let configured_dir = PathBuf::from(&state.config.cap_config_dir);
+    let configured_marker = cap_config_ready_marker_path(state);
+    let fallback = CapConfigPaths {
+        config_dir: configured_dir.clone(),
+        ready_marker: configured_marker.clone(),
+    };
+
+    let ready_file = StdPath::new(&state.config.enclava_init_ready_file);
+    if !ready_file.exists() {
+        return fallback;
+    }
+
+    let Some(init_pid) = find_enclava_init_stay_alive_pid(StdPath::new("/proc")) else {
+        return fallback;
+    };
+    cap_config_paths_through_init_root(init_pid, &configured_dir, configured_marker.as_deref())
+        .unwrap_or(fallback)
+}
+
+fn cap_config_init_ready_missing(state: &AppState) -> Option<String> {
+    if state.config.cap_config_ready_marker.trim().is_empty() {
+        return None;
+    }
+    let ready_file = state.config.enclava_init_ready_file.trim();
+    if ready_file.is_empty() {
+        return None;
+    }
+    match std::fs::metadata(ready_file) {
+        Ok(metadata) if metadata.is_file() => None,
+        Ok(_) => Some(ready_file.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(ready_file.to_string()),
+        Err(err) => Some(format!("{ready_file}:{err}")),
+    }
+}
+
+fn cap_config_paths_through_init_root(
+    init_pid: u32,
+    configured_dir: &StdPath,
+    configured_marker: Option<&StdPath>,
+) -> Option<CapConfigPaths> {
+    let config_dir = path_through_proc_root(init_pid, configured_dir)?;
+    let ready_marker = configured_marker.and_then(|path| path_through_proc_root(init_pid, path));
+    Some(CapConfigPaths {
+        config_dir,
+        ready_marker,
+    })
+}
+
+fn path_through_proc_root(pid: u32, path: &StdPath) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    Some(
+        StdPath::new("/proc")
+            .join(pid.to_string())
+            .join("root")
+            .join(path.strip_prefix("/").ok()?),
+    )
+}
+
+fn find_enclava_init_stay_alive_pid(proc_root: &StdPath) -> Option<u32> {
+    let entries = std::fs::read_dir(proc_root).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        let proc_dir = entry.path();
+        let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) else {
+            continue;
+        };
+        if !cmdline
+            .split(|byte| *byte == 0)
+            .any(|part| part.ends_with(b"enclava-init"))
+        {
+            continue;
+        }
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|part| part == b"--probe-ready")
+        {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(proc_dir.join("environ")) else {
+            continue;
+        };
+        if !environ
+            .split(|byte| *byte == 0)
+            .any(|part| part == b"ENCLAVA_INIT_STAY_ALIVE=true")
+        {
+            continue;
+        }
+        candidates.push(pid);
+    }
+    candidates.sort_unstable();
+    candidates.into_iter().next()
+}
+
+fn cap_config_ready_marker_path(state: &AppState) -> Option<PathBuf> {
     let marker = state.config.cap_config_ready_marker.trim();
     if marker.is_empty() {
         None
     } else {
-        Some(std::path::PathBuf::from(marker))
+        Some(PathBuf::from(marker))
     }
 }
 
@@ -5016,6 +5129,69 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn cap_config_paths_can_target_enclava_init_luks_root() {
+        let paths = cap_config_paths_through_init_root(
+            4242,
+            Path::new("/state/app-data/.enclava/config"),
+            Some(Path::new("/state/app-data/.enclava/luks-ready")),
+        )
+        .expect("absolute paths can be resolved through init root");
+
+        assert_eq!(
+            paths.config_dir,
+            PathBuf::from("/proc/4242/root/state/app-data/.enclava/config")
+        );
+        assert_eq!(
+            paths.ready_marker,
+            Some(PathBuf::from(
+                "/proc/4242/root/state/app-data/.enclava/luks-ready"
+            ))
+        );
+    }
+
+    #[test]
+    fn cap_config_paths_do_not_proc_root_relative_paths() {
+        assert!(
+            cap_config_paths_through_init_root(
+                4242,
+                Path::new("state/app-data/.enclava/config"),
+                None,
+            )
+            .is_none(),
+            "relative config dirs must keep using their configured path"
+        );
+    }
+
+    #[test]
+    fn find_enclava_init_pid_skips_probe_processes_and_proc_metadata() {
+        let proc_root = test_config_dir("fake-proc");
+        fs::create_dir_all(proc_root.join("self")).unwrap();
+
+        let probe = proc_root.join("101");
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(
+            probe.join("cmdline"),
+            b"/usr/local/bin/enclava-init\0--probe-ready\0",
+        )
+        .unwrap();
+        fs::write(probe.join("environ"), b"ENCLAVA_INIT_STAY_ALIVE=true\0").unwrap();
+
+        let init = proc_root.join("202");
+        fs::create_dir_all(&init).unwrap();
+        fs::write(init.join("cmdline"), b"/usr/local/bin/enclava-init\0").unwrap();
+        fs::write(init.join("environ"), b"ENCLAVA_INIT_STAY_ALIVE=true\0").unwrap();
+
+        let proxy = proc_root.join("303");
+        fs::create_dir_all(&proxy).unwrap();
+        fs::write(proxy.join("cmdline"), b"/attestation-proxy\0").unwrap();
+        fs::write(proxy.join("environ"), b"ENCLAVA_INIT_STAY_ALIVE=true\0").unwrap();
+
+        assert_eq!(find_enclava_init_stay_alive_pid(&proc_root), Some(202));
+
+        let _ = fs::remove_dir_all(&proc_root);
+    }
+
     fn test_api_claims(instance_id: &str, scope: &str) -> crate::jwt::ApiTokenClaims {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5039,12 +5215,23 @@ mod tests {
         config_dir: &Path,
         ready_marker: Option<&Path>,
     ) -> AppState {
+        build_config_test_state_with_marker_and_init_ready(config_dir, ready_marker, None)
+    }
+
+    fn build_config_test_state_with_marker_and_init_ready(
+        config_dir: &Path,
+        ready_marker: Option<&Path>,
+        init_ready_file: Option<&Path>,
+    ) -> AppState {
         let signal_dir = test_signal_dir("config-test");
         let mut config = Config::from_env_for_test();
         config.storage_ownership_mode = "password".to_string();
         config.instance_id = "instance-test-01".to_string();
         config.cap_config_dir = config_dir.display().to_string();
         config.cap_config_ready_marker = ready_marker
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        config.enclava_init_ready_file = init_ready_file
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         // Empty api_url means metadata sync is a no-op
@@ -5141,6 +5328,73 @@ mod tests {
             !dir.join("DATABASE_URL").exists(),
             "config writes must not accept a same-path directory without LUKS marker"
         );
+    }
+
+    #[tokio::test]
+    async fn config_put_waits_for_enclava_init_ready_when_marker_is_configured() {
+        let root = test_config_dir("put-waits-init-ready");
+        let dir = root.join("config");
+        fs::create_dir_all(&dir).expect("config dir exists");
+        let marker = root.join("luks-ready");
+        fs::write(&marker, b"luks-ready\n").expect("write marker");
+        let init_ready_file = root.join("init-ready");
+        let state = build_config_test_state_with_marker_and_init_ready(
+            &dir,
+            Some(&marker),
+            Some(&init_ready_file),
+        );
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "config_dir_not_ready");
+        assert!(
+            !dir.join("DATABASE_URL").exists(),
+            "config writes must not land before enclava-init binds durable mounts"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn config_put_accepts_marker_after_enclava_init_ready() {
+        let root = test_config_dir("put-init-ready");
+        let dir = root.join("config");
+        fs::create_dir_all(&dir).expect("config dir exists");
+        let marker = root.join("luks-ready");
+        fs::write(&marker, b"luks-ready\n").expect("write marker");
+        let init_ready_file = root.join("init-ready");
+        fs::write(&init_ready_file, b"ready\n").expect("write init ready");
+        let state = build_config_test_state_with_marker_and_init_ready(
+            &dir,
+            Some(&marker),
+            Some(&init_ready_file),
+        );
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            fs::read(dir.join("DATABASE_URL")).expect("config file"),
+            b"postgres://localhost/mydb"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
