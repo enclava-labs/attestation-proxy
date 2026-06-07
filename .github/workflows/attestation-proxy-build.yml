@@ -49,6 +49,11 @@ jobs:
               echo "${IMAGE}:v2"
             fi
             echo "EOF"
+            if [ -n "${VERSION_TAG}" ]; then
+              echo "primary_tag=${IMAGE}:${VERSION_TAG}"
+            else
+              echo "primary_tag=${IMAGE}:v2"
+            fi
           } >> "$GITHUB_OUTPUT"
 
       - name: Build image locally for size gate
@@ -65,7 +70,7 @@ jobs:
 
       - name: Enforce image size under 16MiB
         run: |
-          SIZE_BYTES="$(docker image inspect 'ghcr.io/enclava-labs/attestation-proxy:v2' --format '{{.Size}}')"
+          SIZE_BYTES="$(docker image inspect '${{ steps.tags.outputs.primary_tag }}' --format '{{.Size}}')"
           echo "attestation-proxy image size: ${SIZE_BYTES} bytes"
           if [ "${SIZE_BYTES}" -ge 16777216 ]; then
             echo "BUILD-03 failure: image size ${SIZE_BYTES} bytes is >= 16777216"
