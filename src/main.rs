@@ -16,6 +16,9 @@ use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path as StdPath;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use x509_cert::der::{Decode, Encode};
@@ -44,6 +47,7 @@ async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next:
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    write_startup_sentinel_from_env().expect("failed to write attestation proxy startup sentinel");
     let config = Config::from_env();
     let http_addr = format!("{}:{}", config.listen_host, config.listen_port);
     let tls_addr = format!("{}:{}", config.listen_tls_host, config.listen_tls_port);
@@ -98,6 +102,88 @@ async fn main() {
             result.expect("attestation TLS server failed");
         }
     }
+}
+
+fn write_startup_sentinel_from_env() -> std::io::Result<()> {
+    let container = std::env::var("ENCLAVA_CONTAINER_NAME").unwrap_or_default();
+    if container.trim().is_empty() {
+        return Ok(());
+    }
+    let dir = std::env::var("ENCLAVA_STARTED_DIR")
+        .unwrap_or_else(|_| "/run/enclava/containers".to_string());
+    let pid = std::process::id();
+    let start_time_ticks = process_start_time_ticks(pid).ok();
+    write_startup_sentinel(
+        StdPath::new(&dir),
+        &container,
+        pid,
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        start_time_ticks,
+    )
+}
+
+fn process_start_time_ticks(pid: u32) -> std::io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let Some((_, rest)) = stat.rsplit_once(") ") else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process stat is missing command delimiter",
+        ));
+    };
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    fields
+        .get(19)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process stat is missing start_time",
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+fn write_startup_sentinel(
+    dir: &StdPath,
+    container: &str,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    start_time_ticks: Option<u64>,
+) -> std::io::Result<()> {
+    if container.is_empty()
+        || !container
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid container sentinel name",
+        ));
+    }
+
+    std::fs::create_dir_all(dir)?;
+    let target = dir.join(container);
+    let tmp = dir.join(format!(".{container}.{pid}.tmp"));
+    let mut body = format!("version=1\ncontainer={container}\npid={pid}\nuid={uid}\ngid={gid}\n");
+    if let Some(start_time_ticks) = start_time_ticks {
+        body.push_str(&format!("start_time_ticks={start_time_ticks}\n"));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .open(&tmp)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &target)?;
+    let dir_file = std::fs::OpenOptions::new().read(true).open(dir)?;
+    dir_file.sync_all()?;
+    Ok(())
 }
 
 fn build_http_client(config: &Config) -> Result<reqwest::Client, Box<dyn Error + Send + Sync>> {
@@ -232,7 +318,10 @@ fn generate_tls_material(domain: &str) -> Result<TlsMaterial, Box<dyn std::error
 mod main {
     mod tests {
         use std::collections::{HashMap, VecDeque};
+        use std::fs;
+        use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         use attestation_proxy::attestation::AaTokenCache;
         use attestation_proxy::config::Config;
@@ -243,6 +332,19 @@ mod main {
         use axum::http::{Request, StatusCode};
         use tokio::sync::RwLock;
         use tower::ServiceExt;
+
+        fn test_sentinel_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "attestation-proxy-sentinel-{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            dir
+        }
 
         fn test_state() -> AppState {
             let mut config = Config::from_env();
@@ -343,6 +445,36 @@ mod main {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[test]
+        fn startup_sentinel_writer_records_proxy_identity() {
+            let dir = test_sentinel_dir("records");
+
+            super::super::write_startup_sentinel(&dir, "attestation-proxy", 1234, 0, 0, Some(5678))
+                .expect("write sentinel");
+
+            let body = fs::read_to_string(dir.join("attestation-proxy")).unwrap();
+            assert_eq!(
+                body,
+                "version=1\ncontainer=attestation-proxy\npid=1234\nuid=0\ngid=0\nstart_time_ticks=5678\n"
+            );
+            assert!(!dir.join(".attestation-proxy.1234.tmp").exists());
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn startup_sentinel_writer_rejects_path_like_container_names() {
+            let dir = test_sentinel_dir("rejects");
+
+            let error = super::super::write_startup_sentinel(&dir, "../proxy", 1, 0, 0, None)
+                .expect_err("path-like container names must be rejected");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!dir.join("../proxy").exists());
+
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }
