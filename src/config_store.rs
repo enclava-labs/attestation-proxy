@@ -58,11 +58,51 @@ fn ensure_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
     Ok(())
 }
 
+fn require_existing_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
+    match fs::metadata(config_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(ConfigStoreError::DirNotFound(
+            config_dir.display().to_string(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ConfigStoreError::DirNotFound(
+            config_dir.display().to_string(),
+        )),
+        Err(e) => Err(ConfigStoreError::Io(format!("stat_dir:{e}"))),
+    }
+}
+
+fn sync_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .open(config_dir)
+        .map_err(|e| ConfigStoreError::Io(format!("open_dir:{e}")))?;
+    dir.sync_all()
+        .map_err(|e| ConfigStoreError::Io(format!("sync_dir:{e}")))
+}
+
 /// Write a config value atomically (write to temp file, then rename).
 pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), ConfigStoreError> {
     validate_key_name(key)?;
     ensure_config_dir(config_dir)?;
+    write_config_file(config_dir, key, value)
+}
 
+/// Write a config value only if the configured directory already exists.
+///
+/// CAP uses this path for live config writes so an early request cannot create
+/// `/state/app-data` on the pod's ephemeral mount before enclava-init has
+/// bind-mounted the decrypted LUKS path there.
+pub fn write_config_existing_dir(
+    config_dir: &Path,
+    key: &str,
+    value: &[u8],
+) -> Result<(), ConfigStoreError> {
+    validate_key_name(key)?;
+    require_existing_config_dir(config_dir)?;
+    write_config_file(config_dir, key, value)
+}
+
+fn write_config_file(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), ConfigStoreError> {
     let target = config_dir.join(key);
     let tmp = config_dir.join(format!(".{key}.tmp"));
 
@@ -81,6 +121,7 @@ pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), Co
     drop(file);
 
     fs::rename(&tmp, &target).map_err(|e| ConfigStoreError::Io(format!("rename:{e}")))?;
+    sync_config_dir(config_dir)?;
 
     Ok(())
 }
@@ -90,7 +131,12 @@ pub fn delete_config(config_dir: &Path, key: &str) -> Result<bool, ConfigStoreEr
     validate_key_name(key)?;
     let target = config_dir.join(key);
     match fs::remove_file(&target) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            if let Some(parent) = target.parent() {
+                sync_config_dir(parent)?;
+            }
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(ConfigStoreError::Io(format!("delete:{e}"))),
     }
@@ -165,6 +211,7 @@ pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
 
     fs::rename(&tmp_path, &ready_path)
         .map_err(|e| ConfigStoreError::Io(format!("rename_ready:{e}")))?;
+    sync_config_dir(config_dir)?;
     Ok(())
 }
 

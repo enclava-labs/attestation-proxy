@@ -2393,7 +2393,7 @@ pub async fn config_put(
     body: axum::body::Bytes,
 ) -> Response {
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    match crate::config_store::write_config(config_dir, &key, &body) {
+    match crate::config_store::write_config_existing_dir(config_dir, &key, &body) {
         Ok(()) => {
             // Write config-ready sentinel after first successful config write (CONF-04)
             if let Err(e) = crate::config_store::write_ready_sentinel(config_dir) {
@@ -2413,6 +2413,10 @@ pub async fn config_put(
         Err(crate::config_store::ConfigStoreError::InvalidKeyName(detail)) => {
             json_response(400, &json!({"error": "invalid_key_name", "detail": detail}))
         }
+        Err(crate::config_store::ConfigStoreError::DirNotFound(detail)) => json_response(
+            423,
+            &json!({"error": "config_dir_not_ready", "detail": detail}),
+        ),
         Err(e) => json_response(
             500,
             &json!({"error": "config_write_failed", "detail": e.to_string()}),
@@ -5018,6 +5022,7 @@ mod tests {
     #[tokio::test]
     async fn config_put_writes_to_filesystem() {
         let dir = test_config_dir("put-writes");
+        fs::create_dir_all(&dir).expect("config dir exists after LUKS bind");
         let state = build_config_test_state(&dir);
         let claims = test_api_claims("instance-test-01", "config:write");
 
@@ -5038,6 +5043,28 @@ mod tests {
         assert_eq!(content, b"postgres://localhost/mydb");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_rejects_missing_config_dir_instead_of_creating_ephemeral_path() {
+        let dir = test_config_dir("put-missing-dir");
+        let state = build_config_test_state(&dir);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "config_dir_not_ready");
+        assert!(
+            !dir.exists(),
+            "config writes must not create a pre-bind ephemeral directory"
+        );
     }
 
     #[tokio::test]
@@ -5187,6 +5214,7 @@ mod tests {
     #[tokio::test]
     async fn config_put_writes_ready_sentinel() {
         let dir = test_config_dir("put-sentinel");
+        fs::create_dir_all(&dir).expect("config dir exists after LUKS bind");
         let state = build_config_test_state(&dir);
         let claims = test_api_claims("instance-test-01", "config:write");
 
