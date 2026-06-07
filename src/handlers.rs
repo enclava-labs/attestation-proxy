@@ -831,9 +831,13 @@ pub async fn status(State(state): State<AppState>) -> Response {
     body["tenant_instance_identity_hash"] = json!(identity.tenant_instance_identity_hash);
     body["claims_verified"] = json!(identity.claims_verified);
     body["claims_error"] = json!(identity.claims_error);
-    // Config-ready state (CONF-04): reflects whether .ready sentinel exists
-    let config_ready =
-        crate::config_store::is_config_ready(std::path::Path::new(&state.config.cap_config_dir));
+    // Config-ready state (CONF-04): reflects whether .ready sentinel exists on
+    // the configured durable config volume.
+    let ready_marker = cap_config_ready_marker_path(&state);
+    let config_ready = crate::config_store::is_config_ready_with_marker(
+        std::path::Path::new(&state.config.cap_config_dir),
+        ready_marker.as_deref(),
+    );
     body["config_ready"] = json!(config_ready);
     json_response(200, &body)
 }
@@ -2393,11 +2397,34 @@ pub async fn config_put(
     body: axum::body::Bytes,
 ) -> Response {
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    match crate::config_store::write_config_existing_dir(config_dir, &key, &body) {
+    let ready_marker = cap_config_ready_marker_path(&state);
+    match crate::config_store::write_config_existing_dir_with_marker(
+        config_dir,
+        &key,
+        &body,
+        ready_marker.as_deref(),
+    ) {
         Ok(()) => {
-            // Write config-ready sentinel after first successful config write (CONF-04)
-            if let Err(e) = crate::config_store::write_ready_sentinel(config_dir) {
-                eprintln!("{{\"event\":\"config_ready_sentinel_failed\",\"error\":\"{e}\"}}");
+            // Write config-ready sentinel after first successful config write (CONF-04).
+            if let Err(e) = crate::config_store::write_ready_sentinel_with_marker(
+                config_dir,
+                ready_marker.as_deref(),
+            ) {
+                return match e {
+                    crate::config_store::ConfigStoreError::DirNotFound(detail) => json_response(
+                        423,
+                        &json!({"error": "config_dir_not_ready", "detail": detail}),
+                    ),
+                    other => {
+                        eprintln!(
+                            "{{\"event\":\"config_ready_sentinel_failed\",\"error\":\"{other}\"}}"
+                        );
+                        json_response(
+                            500,
+                            &json!({"error": "config_write_failed", "detail": other.to_string()}),
+                        )
+                    }
+                };
             }
             spawn_config_metadata_sync(
                 &state.http_client,
@@ -2448,7 +2475,9 @@ pub async fn config_delete(
     Path(key): Path<String>,
 ) -> Response {
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    match crate::config_store::delete_config(config_dir, &key) {
+    let ready_marker = cap_config_ready_marker_path(&state);
+    match crate::config_store::delete_config_with_marker(config_dir, &key, ready_marker.as_deref())
+    {
         Ok(existed) => {
             spawn_config_metadata_sync(
                 &state.http_client,
@@ -2467,10 +2496,23 @@ pub async fn config_delete(
         Err(crate::config_store::ConfigStoreError::InvalidKeyName(detail)) => {
             json_response(400, &json!({"error": "invalid_key_name", "detail": detail}))
         }
+        Err(crate::config_store::ConfigStoreError::DirNotFound(detail)) => json_response(
+            423,
+            &json!({"error": "config_dir_not_ready", "detail": detail}),
+        ),
         Err(e) => json_response(
             500,
             &json!({"error": "config_delete_failed", "detail": e.to_string()}),
         ),
+    }
+}
+
+fn cap_config_ready_marker_path(state: &AppState) -> Option<std::path::PathBuf> {
+    let marker = state.config.cap_config_ready_marker.trim();
+    if marker.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(marker))
     }
 }
 
@@ -4990,11 +5032,21 @@ mod tests {
     }
 
     fn build_config_test_state(config_dir: &Path) -> AppState {
+        build_config_test_state_with_marker(config_dir, None)
+    }
+
+    fn build_config_test_state_with_marker(
+        config_dir: &Path,
+        ready_marker: Option<&Path>,
+    ) -> AppState {
         let signal_dir = test_signal_dir("config-test");
         let mut config = Config::from_env_for_test();
         config.storage_ownership_mode = "password".to_string();
         config.instance_id = "instance-test-01".to_string();
         config.cap_config_dir = config_dir.display().to_string();
+        config.cap_config_ready_marker = ready_marker
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         // Empty api_url means metadata sync is a no-op
         config.cap_api_url = "".to_string();
 
@@ -5064,6 +5116,30 @@ mod tests {
         assert!(
             !dir.exists(),
             "config writes must not create a pre-bind ephemeral directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_put_rejects_missing_luks_ready_marker() {
+        let dir = test_config_dir("put-missing-marker");
+        fs::create_dir_all(&dir).expect("config dir exists but is not proven durable");
+        let marker = dir.parent().unwrap().join("luks-ready");
+        let state = build_config_test_state_with_marker(&dir, Some(&marker));
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "config_dir_not_ready");
+        assert!(
+            !dir.join("DATABASE_URL").exists(),
+            "config writes must not accept a same-path directory without LUKS marker"
         );
     }
 
@@ -5166,6 +5242,7 @@ mod tests {
         config.storage_ownership_mode = "password".to_string();
         config.instance_id = "instance-test-01".to_string();
         config.cap_config_dir = dir.display().to_string();
+        config.cap_config_ready_marker = dir.join("luks-ready").display().to_string();
         config.owner_seed_encrypted_kbs_path =
             "default/instance-test-01-owner/seed-encrypted".to_string();
         config.owner_seed_sealed_kbs_path =
@@ -5200,6 +5277,7 @@ mod tests {
             &state.config.cap_config_dir,
         ))
         .unwrap();
+        fs::write(&state.config.cap_config_ready_marker, b"ready\n").unwrap();
         let response = status(State(state)).await;
         let body = read_json(response).await;
         assert_eq!(

@@ -56,6 +56,7 @@ pub struct Config {
     pub cap_api_signing_pubkey: String,
     pub cap_api_url: String,
     pub cap_config_dir: String,
+    pub cap_config_ready_marker: String,
 }
 
 impl Config {
@@ -189,6 +190,7 @@ impl Config {
             cap_api_signing_pubkey: env_or("CAP_API_SIGNING_PUBKEY", ""),
             cap_api_url: env_or("CAP_API_URL", ""),
             cap_config_dir: env_or("CAP_CONFIG_DIR", "/data/.enclava/config"),
+            cap_config_ready_marker: env_or("CAP_CONFIG_READY_MARKER", ""),
         }
     }
 }
@@ -252,6 +254,7 @@ impl Config {
             cap_api_signing_pubkey: "".into(),
             cap_api_url: "".into(),
             cap_config_dir: "/data/.enclava/config".into(),
+            cap_config_ready_marker: "".into(),
         }
     }
 }
@@ -307,6 +310,7 @@ mod tests {
         "CAP_API_SIGNING_PUBKEY",
         "CAP_API_URL",
         "CAP_CONFIG_DIR",
+        "CAP_CONFIG_READY_MARKER",
     ];
 
     fn clear_env() {
@@ -432,6 +436,7 @@ mod tests {
         assert_eq!(config.cap_api_signing_pubkey, "");
         assert_eq!(config.cap_api_url, "");
         assert_eq!(config.cap_config_dir, "/data/.enclava/config");
+        assert_eq!(config.cap_config_ready_marker, "");
     }
 
     #[test]
@@ -442,10 +447,12 @@ mod tests {
         std::env::set_var("CAP_API_SIGNING_PUBKEY", "dGVzdC1rZXk");
         std::env::set_var("CAP_API_URL", "https://api.enclava.dev");
         std::env::set_var("CAP_CONFIG_DIR", "/custom/config");
+        std::env::set_var("CAP_CONFIG_READY_MARKER", "/custom/luks-ready");
         let config = Config::from_env();
         assert_eq!(config.cap_api_signing_pubkey, "dGVzdC1rZXk");
         assert_eq!(config.cap_api_url, "https://api.enclava.dev");
         assert_eq!(config.cap_config_dir, "/custom/config");
+        assert_eq!(config.cap_config_ready_marker, "/custom/luks-ready");
     }
 
     #[test]

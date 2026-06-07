@@ -71,6 +71,22 @@ fn require_existing_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError
     }
 }
 
+fn require_ready_marker(ready_marker: Option<&Path>) -> Result<(), ConfigStoreError> {
+    let Some(ready_marker) = ready_marker else {
+        return Ok(());
+    };
+    match fs::metadata(ready_marker) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(ConfigStoreError::DirNotFound(
+            ready_marker.display().to_string(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ConfigStoreError::DirNotFound(
+            ready_marker.display().to_string(),
+        )),
+        Err(e) => Err(ConfigStoreError::Io(format!("stat_ready_marker:{e}"))),
+    }
+}
+
 fn sync_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
     let dir = fs::OpenOptions::new()
         .read(true)
@@ -97,8 +113,18 @@ pub fn write_config_existing_dir(
     key: &str,
     value: &[u8],
 ) -> Result<(), ConfigStoreError> {
+    write_config_existing_dir_with_marker(config_dir, key, value, None)
+}
+
+pub fn write_config_existing_dir_with_marker(
+    config_dir: &Path,
+    key: &str,
+    value: &[u8],
+    ready_marker: Option<&Path>,
+) -> Result<(), ConfigStoreError> {
     validate_key_name(key)?;
     require_existing_config_dir(config_dir)?;
+    require_ready_marker(ready_marker)?;
     write_config_file(config_dir, key, value)
 }
 
@@ -128,7 +154,16 @@ fn write_config_file(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), C
 
 /// Delete a config key. Returns Ok(true) if the key existed, Ok(false) if not.
 pub fn delete_config(config_dir: &Path, key: &str) -> Result<bool, ConfigStoreError> {
+    delete_config_with_marker(config_dir, key, None)
+}
+
+pub fn delete_config_with_marker(
+    config_dir: &Path,
+    key: &str,
+    ready_marker: Option<&Path>,
+) -> Result<bool, ConfigStoreError> {
     validate_key_name(key)?;
+    require_ready_marker(ready_marker)?;
     let target = config_dir.join(key);
     match fs::remove_file(&target) {
         Ok(()) => {
@@ -183,11 +218,19 @@ pub fn read_config(config_dir: &Path, key: &str) -> Result<Option<Vec<u8>>, Conf
 /// rename to `.ready`) with mode 0o644 so bootstrap.sh (potentially running as
 /// a different user) can read it.
 pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
+    write_ready_sentinel_with_marker(config_dir, None)
+}
+
+pub fn write_ready_sentinel_with_marker(
+    config_dir: &Path,
+    ready_marker: Option<&Path>,
+) -> Result<(), ConfigStoreError> {
     let ready_path = config_dir.join(".ready");
     if ready_path.exists() {
         return Ok(());
     }
     ensure_config_dir(config_dir)?;
+    require_ready_marker(ready_marker)?;
 
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -217,7 +260,11 @@ pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
 
 /// Check whether the `.ready` sentinel file exists.
 pub fn is_config_ready(config_dir: &Path) -> bool {
-    config_dir.join(".ready").exists()
+    is_config_ready_with_marker(config_dir, None)
+}
+
+pub fn is_config_ready_with_marker(config_dir: &Path, ready_marker: Option<&Path>) -> bool {
+    config_dir.join(".ready").exists() && require_ready_marker(ready_marker).is_ok()
 }
 
 #[cfg(test)]
