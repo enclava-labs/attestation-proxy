@@ -2397,12 +2397,6 @@ pub async fn config_put(
     Path(key): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(detail) = cap_config_init_ready_missing(&state) {
-        return json_response(
-            423,
-            &json!({"error": "config_dir_not_ready", "detail": detail}),
-        );
-    }
     let paths = cap_config_paths(&state);
     let config_dir = paths.config_dir.as_path();
     let ready_marker = paths.ready_marker.as_deref();
@@ -2529,32 +2523,17 @@ fn cap_config_paths(state: &AppState) -> CapConfigPaths {
         ready_marker: configured_marker.clone(),
     };
 
-    let ready_file = StdPath::new(&state.config.enclava_init_ready_file);
-    if !ready_file.exists() {
-        return fallback;
+    if let Some(init_pid) = find_enclava_init_stay_alive_pid(StdPath::new("/proc")) {
+        if let Some(paths) = cap_config_paths_through_init_root(
+            init_pid,
+            &configured_dir,
+            configured_marker.as_deref(),
+        ) {
+            return paths;
+        }
     }
 
-    let Some(init_pid) = find_enclava_init_stay_alive_pid(StdPath::new("/proc")) else {
-        return fallback;
-    };
-    cap_config_paths_through_init_root(init_pid, &configured_dir, configured_marker.as_deref())
-        .unwrap_or(fallback)
-}
-
-fn cap_config_init_ready_missing(state: &AppState) -> Option<String> {
-    if state.config.cap_config_ready_marker.trim().is_empty() {
-        return None;
-    }
-    let ready_file = state.config.enclava_init_ready_file.trim();
-    if ready_file.is_empty() {
-        return None;
-    }
-    match std::fs::metadata(ready_file) {
-        Ok(metadata) if metadata.is_file() => None,
-        Ok(_) => Some(ready_file.to_string()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(ready_file.to_string()),
-        Err(err) => Some(format!("{ready_file}:{err}")),
-    }
+    fallback
 }
 
 fn cap_config_paths_through_init_root(
@@ -5331,8 +5310,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_put_waits_for_enclava_init_ready_when_marker_is_configured() {
-        let root = test_config_dir("put-waits-init-ready");
+    async fn config_put_accepts_luks_marker_before_enclava_init_ready() {
+        let root = test_config_dir("put-before-init-ready");
         let dir = root.join("config");
         fs::create_dir_all(&dir).expect("config dir exists");
         let marker = root.join("luks-ready");
@@ -5354,10 +5333,10 @@ mod tests {
         .await;
 
         let body = read_json(response).await;
-        assert_eq!(body["error"], "config_dir_not_ready");
-        assert!(
-            !dir.join("DATABASE_URL").exists(),
-            "config writes must not land before enclava-init binds durable mounts"
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            fs::read(dir.join("DATABASE_URL")).expect("config file"),
+            b"postgres://localhost/mydb"
         );
 
         let _ = fs::remove_dir_all(&root);
