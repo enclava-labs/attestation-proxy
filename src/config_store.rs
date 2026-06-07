@@ -70,7 +70,7 @@ pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), Co
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(0o640)
         .open(&tmp)
         .map_err(|e| ConfigStoreError::Io(format!("write_tmp:{e}")))?;
 
@@ -253,6 +253,24 @@ mod tests {
         write_config(&dir, "KEY", b"val").unwrap();
         assert!(dir.exists());
         assert_eq!(read_config(&dir, "KEY").unwrap(), Some(b"val".to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_creates_group_readable_file() {
+        let dir = test_dir("write-group-readable");
+        write_config(&dir, "KEY", b"val").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("KEY")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o640,
+                "config values must be readable by the app group"
+            );
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
