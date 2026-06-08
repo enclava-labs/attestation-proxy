@@ -2561,6 +2561,18 @@ fn cap_config_paths_for_proc_root(
                 detail: format!("enclava_init_not_ready:{}", configured_dir.display()),
             });
         }
+        if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
+            if let Some(paths) = cap_config_paths_through_proc_root(
+                proc_root,
+                init_pid,
+                &configured_dir,
+                configured_marker.as_deref(),
+            ) {
+                if cap_config_ready_marker_exists(paths.ready_marker.as_deref()) {
+                    return Ok(paths);
+                }
+            }
+        }
         return Ok(fallback);
     }
 
@@ -2664,6 +2676,12 @@ fn cap_config_ready_marker_path(state: &AppState) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(marker))
     }
+}
+
+fn cap_config_ready_marker_exists(ready_marker: Option<&StdPath>) -> bool {
+    ready_marker
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.is_file())
 }
 
 /// POST /teardown -- delete owner ciphertext from KBS (seed-encrypted and seed-sealed).
@@ -5299,6 +5317,43 @@ mod tests {
         assert_eq!(
             paths.ready_marker,
             Some(PathBuf::from("/state/app-data/.enclava/luks-ready"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cap_config_paths_use_init_luks_path_when_state_bind_is_not_visible() {
+        let root = test_config_dir("fake-init-ready-proc-root");
+        fs::create_dir_all(&root).unwrap();
+        let ready_file = root.join("init-ready");
+        fs::write(&ready_file, b"ready\n").unwrap();
+        let init = root.join("202");
+        let init_config = init.join("root/state/app-data/.enclava/config");
+        fs::create_dir_all(&init_config).unwrap();
+        fs::write(
+            init.join("root/state/app-data/.enclava/luks-ready"),
+            b"luks-ready\n",
+        )
+        .unwrap();
+        fs::write(init.join("cmdline"), b"/usr/local/bin/enclava-init\0").unwrap();
+        let state = build_config_test_state_with_marker_and_init_ready(
+            Path::new("/state/app-data/.enclava/config"),
+            Some(Path::new("/state/app-data/.enclava/luks-ready")),
+            Some(&ready_file),
+        );
+
+        let paths = cap_config_paths_for_proc_root(&state, &root)
+            .expect("init LUKS root should be used when workload bind is not visible");
+
+        assert_eq!(
+            paths.config_dir,
+            init_config,
+            "CAP config writes must target init's LUKS mount rather than the workload emptyDir view"
+        );
+        assert_eq!(
+            paths.ready_marker,
+            Some(root.join("202/root/state/app-data/.enclava/luks-ready"))
         );
 
         let _ = fs::remove_dir_all(&root);
