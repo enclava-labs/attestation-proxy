@@ -2561,19 +2561,35 @@ fn cap_config_paths_for_proc_root(
                 detail: format!("enclava_init_not_ready:{}", configured_dir.display()),
             });
         }
-        if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
-            if let Some(paths) = cap_config_paths_through_proc_root(
-                proc_root,
-                init_pid,
-                &configured_dir,
-                configured_marker.as_deref(),
-            ) {
-                if cap_config_ready_marker_exists(paths.ready_marker.as_deref()) {
-                    return Ok(paths);
-                }
-            }
+        let init_pid =
+            find_enclava_init_stay_alive_pid(proc_root).ok_or_else(|| CapConfigPathError {
+                detail: format!("enclava_init_pid_not_found:{}", configured_dir.display()),
+            })?;
+        let paths = cap_config_paths_through_proc_root(
+            proc_root,
+            init_pid,
+            &configured_dir,
+            configured_marker.as_deref(),
+        )
+        .ok_or_else(|| CapConfigPathError {
+            detail: format!(
+                "enclava_init_proc_root_unavailable:{}",
+                configured_dir.display()
+            ),
+        })?;
+        if cap_config_ready_marker_exists(paths.ready_marker.as_deref()) {
+            return Ok(paths);
         }
-        return Ok(fallback);
+        return Err(CapConfigPathError {
+            detail: format!(
+                "luks_ready_marker_not_found:{}",
+                paths
+                    .ready_marker
+                    .as_deref()
+                    .unwrap_or(configured_marker.as_deref().unwrap_or(&configured_dir))
+                    .display()
+            ),
+        });
     }
 
     if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
@@ -5292,8 +5308,8 @@ mod tests {
     }
 
     #[test]
-    fn cap_config_paths_use_bound_luks_path_after_init_ready() {
-        let root = test_config_dir("fake-init-ready");
+    fn cap_config_paths_reject_luks_state_when_init_marker_is_missing() {
+        let root = test_config_dir("fake-init-ready-missing-marker");
         fs::create_dir_all(&root).unwrap();
         let ready_file = root.join("init-ready");
         fs::write(&ready_file, b"ready\n").unwrap();
@@ -5306,17 +5322,16 @@ mod tests {
             Some(&ready_file),
         );
 
-        let paths = cap_config_paths_for_proc_root(&state, &root)
-            .expect("init-ready should allow CAP /state config on the bound path");
+        let error = cap_config_paths_for_proc_root(&state, &root)
+            .expect_err("CAP /state config must not fall back without init LUKS marker");
 
         assert_eq!(
-            paths.config_dir,
-            PathBuf::from("/state/app-data/.enclava/config"),
-            "CAP config writes must use the workload namespace path that enclava-init already bind-mounted from LUKS"
-        );
-        assert_eq!(
-            paths.ready_marker,
-            Some(PathBuf::from("/state/app-data/.enclava/luks-ready"))
+            error.detail,
+            format!(
+                "luks_ready_marker_not_found:{}",
+                root.join("202/root/state/app-data/.enclava/luks-ready")
+                    .display()
+            )
         );
 
         let _ = fs::remove_dir_all(&root);
