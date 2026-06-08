@@ -8,6 +8,8 @@
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -100,7 +102,35 @@ fn sync_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
         .open(config_dir)
         .map_err(|e| ConfigStoreError::Io(format!("open_dir:{e}")))?;
     dir.sync_all()
-        .map_err(|e| ConfigStoreError::Io(format!("sync_dir:{e}")))
+        .map_err(|e| ConfigStoreError::Io(format!("sync_dir:{e}")))?;
+    sync_config_filesystem_fd(&dir)
+}
+
+pub fn sync_config_filesystem(config_dir: &Path) -> Result<(), ConfigStoreError> {
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .open(config_dir)
+        .map_err(|e| ConfigStoreError::Io(format!("open_dir:{e}")))?;
+    sync_config_filesystem_fd(&dir)
+}
+
+#[cfg(unix)]
+fn sync_config_filesystem_fd(dir: &fs::File) -> Result<(), ConfigStoreError> {
+    let rc = unsafe { libc::syncfs(dir.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(ConfigStoreError::Io(format!(
+            "syncfs:{}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_config_filesystem_fd(dir: &fs::File) -> Result<(), ConfigStoreError> {
+    dir.sync_all()
+        .map_err(|e| ConfigStoreError::Io(format!("syncfs_fallback:{e}")))
 }
 
 /// Write a config value atomically (write to temp file, then rename).
@@ -418,6 +448,16 @@ mod tests {
                 "config values must be readable by the app group"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_syncs_containing_filesystem() {
+        let dir = test_dir("write-syncfs");
+        write_config(&dir, "KEY", b"val").unwrap();
+
+        sync_config_filesystem(&dir).expect("config filesystem sync should succeed");
 
         let _ = fs::remove_dir_all(&dir);
     }
