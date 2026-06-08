@@ -2404,11 +2404,14 @@ pub async fn config_put(
     };
     let config_dir = paths.config_dir.as_path();
     let ready_marker = paths.ready_marker.as_deref();
-    match crate::config_store::write_config_existing_dir_with_marker(
+    match crate::config_store::write_config_existing_dir_with_marker_and_options(
         config_dir,
         &key,
         &body,
         ready_marker,
+        crate::config_store::ConfigFileOptions {
+            gid: state.config.cap_config_file_gid,
+        },
     ) {
         Ok(()) => {
             // Write config-ready sentinel after first successful config write (CONF-04).

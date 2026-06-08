@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -20,6 +22,11 @@ pub enum ConfigStoreError {
     DirNotFound(String),
     #[error("io_error:{0}")]
     Io(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfigFileOptions {
+    pub gid: Option<u32>,
 }
 
 /// Validate that a config key name is safe for filesystem use and env-var injection.
@@ -100,7 +107,7 @@ fn sync_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
 pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), ConfigStoreError> {
     validate_key_name(key)?;
     ensure_config_dir(config_dir)?;
-    write_config_file(config_dir, key, value)
+    write_config_file(config_dir, key, value, ConfigFileOptions::default())
 }
 
 /// Write a config value only if the configured directory already exists.
@@ -122,13 +129,34 @@ pub fn write_config_existing_dir_with_marker(
     value: &[u8],
     ready_marker: Option<&Path>,
 ) -> Result<(), ConfigStoreError> {
+    write_config_existing_dir_with_marker_and_options(
+        config_dir,
+        key,
+        value,
+        ready_marker,
+        ConfigFileOptions::default(),
+    )
+}
+
+pub fn write_config_existing_dir_with_marker_and_options(
+    config_dir: &Path,
+    key: &str,
+    value: &[u8],
+    ready_marker: Option<&Path>,
+    options: ConfigFileOptions,
+) -> Result<(), ConfigStoreError> {
     validate_key_name(key)?;
     require_existing_config_dir(config_dir)?;
     require_ready_marker(ready_marker)?;
-    write_config_file(config_dir, key, value)
+    write_config_file(config_dir, key, value, options)
 }
 
-fn write_config_file(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), ConfigStoreError> {
+fn write_config_file(
+    config_dir: &Path,
+    key: &str,
+    value: &[u8],
+    options: ConfigFileOptions,
+) -> Result<(), ConfigStoreError> {
     let target = config_dir.join(key);
     let tmp = config_dir.join(format!(".{key}.tmp"));
 
@@ -146,10 +174,36 @@ fn write_config_file(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), C
         .map_err(|e| ConfigStoreError::Io(format!("sync:{e}")))?;
     drop(file);
 
+    if let Some(gid) = options.gid {
+        set_file_gid(&tmp, gid)?;
+    }
+
     fs::rename(&tmp, &target).map_err(|e| ConfigStoreError::Io(format!("rename:{e}")))?;
     sync_config_dir(config_dir)?;
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_gid(path: &Path, gid: u32) -> Result<(), ConfigStoreError> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ConfigStoreError::Io("chown_gid:path_contains_nul".to_string()))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), !0 as libc::uid_t, gid as libc::gid_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(ConfigStoreError::Io(format!(
+            "chown_gid:{}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn set_file_gid(_path: &Path, _gid: u32) -> Result<(), ConfigStoreError> {
+    Err(ConfigStoreError::Io(
+        "chown_gid:unsupported_platform".to_string(),
+    ))
 }
 
 /// Delete a config key. Returns Ok(true) if the key existed, Ok(false) if not.
@@ -364,6 +418,32 @@ mod tests {
                 "config values must be readable by the app group"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_config_can_set_configured_file_gid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = test_dir("write-configured-gid");
+        fs::create_dir_all(&dir).unwrap();
+        let expected_gid = fs::metadata(&dir).unwrap().gid();
+        write_config_existing_dir_with_marker_and_options(
+            &dir,
+            "KEY",
+            b"val",
+            None,
+            ConfigFileOptions {
+                gid: Some(expected_gid),
+            },
+        )
+        .unwrap();
+
+        let metadata = fs::metadata(dir.join("KEY")).unwrap();
+        assert_eq!(metadata.gid(), expected_gid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
 
         let _ = fs::remove_dir_all(&dir);
     }

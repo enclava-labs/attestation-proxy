@@ -57,6 +57,7 @@ pub struct Config {
     pub cap_api_url: String,
     pub cap_config_dir: String,
     pub cap_config_ready_marker: String,
+    pub cap_config_file_gid: Option<u32>,
 }
 
 impl Config {
@@ -77,6 +78,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
+        }
+
+        fn env_optional_u32(key: &str) -> Option<u32> {
+            std::env::var(key).ok().and_then(|v| v.parse().ok())
         }
 
         fn env_bool(key: &str, default: bool) -> bool {
@@ -191,6 +196,7 @@ impl Config {
             cap_api_url: env_or("CAP_API_URL", ""),
             cap_config_dir: env_or("CAP_CONFIG_DIR", "/data/.enclava/config"),
             cap_config_ready_marker: env_or("CAP_CONFIG_READY_MARKER", ""),
+            cap_config_file_gid: env_optional_u32("CAP_CONFIG_FILE_GID"),
         }
     }
 }
@@ -255,6 +261,7 @@ impl Config {
             cap_api_url: "".into(),
             cap_config_dir: "/data/.enclava/config".into(),
             cap_config_ready_marker: "".into(),
+            cap_config_file_gid: None,
         }
     }
 }
@@ -311,6 +318,7 @@ mod tests {
         "CAP_API_URL",
         "CAP_CONFIG_DIR",
         "CAP_CONFIG_READY_MARKER",
+        "CAP_CONFIG_FILE_GID",
     ];
 
     fn clear_env() {
@@ -437,6 +445,7 @@ mod tests {
         assert_eq!(config.cap_api_url, "");
         assert_eq!(config.cap_config_dir, "/data/.enclava/config");
         assert_eq!(config.cap_config_ready_marker, "");
+        assert_eq!(config.cap_config_file_gid, None);
     }
 
     #[test]
@@ -448,11 +457,13 @@ mod tests {
         std::env::set_var("CAP_API_URL", "https://api.enclava.dev");
         std::env::set_var("CAP_CONFIG_DIR", "/custom/config");
         std::env::set_var("CAP_CONFIG_READY_MARKER", "/custom/luks-ready");
+        std::env::set_var("CAP_CONFIG_FILE_GID", "10001");
         let config = Config::from_env();
         assert_eq!(config.cap_api_signing_pubkey, "dGVzdC1rZXk");
         assert_eq!(config.cap_api_url, "https://api.enclava.dev");
         assert_eq!(config.cap_config_dir, "/custom/config");
         assert_eq!(config.cap_config_ready_marker, "/custom/luks-ready");
+        assert_eq!(config.cap_config_file_gid, Some(10001));
     }
 
     #[test]
