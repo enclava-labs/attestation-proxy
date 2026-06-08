@@ -2561,22 +2561,7 @@ fn cap_config_paths_for_proc_root(
                 detail: format!("enclava_init_not_ready:{}", configured_dir.display()),
             });
         }
-        if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
-            if let Some(paths) = cap_config_paths_through_proc_root(
-                proc_root,
-                init_pid,
-                &configured_dir,
-                configured_marker.as_deref(),
-            ) {
-                return Ok(paths);
-            }
-        }
-        return Err(CapConfigPathError {
-            detail: format!(
-                "enclava_init_proc_root_not_found:{}",
-                configured_dir.display()
-            ),
-        });
+        return Ok(fallback);
     }
 
     if let Some(init_pid) = find_enclava_init_stay_alive_pid(proc_root) {
@@ -5289,7 +5274,7 @@ mod tests {
     }
 
     #[test]
-    fn cap_config_paths_use_init_proc_root_for_luks_state_after_init_ready() {
+    fn cap_config_paths_use_bound_luks_path_after_init_ready() {
         let root = test_config_dir("fake-init-ready");
         fs::create_dir_all(&root).unwrap();
         let ready_file = root.join("init-ready");
@@ -5304,15 +5289,16 @@ mod tests {
         );
 
         let paths = cap_config_paths_for_proc_root(&state, &root)
-            .expect("init-ready should allow CAP /state config through init root");
+            .expect("init-ready should allow CAP /state config on the bound path");
 
         assert_eq!(
             paths.config_dir,
-            root.join("202/root/state/app-data/.enclava/config")
+            PathBuf::from("/state/app-data/.enclava/config"),
+            "CAP config writes must use the workload namespace path that enclava-init already bind-mounted from LUKS"
         );
         assert_eq!(
             paths.ready_marker,
-            Some(root.join("202/root/state/app-data/.enclava/luks-ready"))
+            Some(PathBuf::from("/state/app-data/.enclava/luks-ready"))
         );
 
         let _ = fs::remove_dir_all(&root);
