@@ -748,6 +748,11 @@ pub fn extract_instance_id(claims: &Value) -> Option<String> {
     extract_init_data_claim_field(claims, "instance_id")
 }
 
+pub fn extract_e2ee_public_key_sha256(claims: &Value) -> Option<String> {
+    extract_init_data_claim_field(claims, "e2ee_public_key_sha256")
+        .map(|value| value.to_lowercase())
+}
+
 /// Extract measurement from claims.
 pub fn extract_measurement_from_claims(claims: &Value) -> Option<String> {
     let paths: &[&[&str]] = &[
@@ -873,6 +878,7 @@ pub fn extract_claims(
 
     let workload = extract_attested_workload(&claims_root, workload_container);
     let init_data_hash = extract_init_data_hash(&claims_root);
+    let e2ee_public_key_sha256 = extract_e2ee_public_key_sha256(&claims_root);
     let measurement = report
         .and_then(|r| r.get("measurement"))
         .and_then(to_hex_bytes);
@@ -900,6 +906,7 @@ pub fn extract_claims(
             "namespace": workload.get("namespace"),
             "service_account": workload.get("service_account"),
             "init_data_hash": init_data_hash,
+            "e2ee_public_key_sha256": e2ee_public_key_sha256,
         },
         "source": claims_source,
     })
@@ -1092,6 +1099,7 @@ mod tests {
                             "identity.toml": r#"
 bootstrap_owner_pubkey_hash = "bootstrap-hash"
 tenant_instance_identity_hash = "identity-hash"
+e2ee_public_key_sha256 = "AABB"
 "#
                         },
                         "init_data_claims": {
@@ -1122,6 +1130,10 @@ tenant_instance_identity_hash = "identity-hash"
         assert_eq!(
             extract_tenant_instance_identity_hash(&claims).as_deref(),
             Some("identity-hash")
+        );
+        assert_eq!(
+            extract_e2ee_public_key_sha256(&claims).as_deref(),
+            Some("aabb")
         );
         assert_eq!(extract_attested_containers(&claims).len(), 1);
     }

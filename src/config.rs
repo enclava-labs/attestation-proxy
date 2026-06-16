@@ -24,6 +24,7 @@ pub struct Config {
     pub attestation_profile: String,
     pub attestation_runtime_class: String,
     pub attestation_workload_image: String,
+    pub attestation_expected_init_data_hash: String,
     pub attestation_workload_container: String,
     pub attestation_pod_name: String,
     pub attestation_pod_namespace: String,
@@ -32,6 +33,8 @@ pub struct Config {
     pub attestation_policy_signature_url: String,
     pub attestation_cert_chain_url: String,
     pub attestation_tcb_info_url: String,
+    pub attestation_e2ee_public_key_sha256: String,
+    pub attestation_require_e2ee_key_binding: bool,
     pub attestation_enable_k8s_pod_lookup: bool,
     pub attestation_k8s_api_timeout_seconds: f64,
     pub storage_ownership_mode: String,
@@ -137,6 +140,7 @@ impl Config {
             attestation_profile: env_or("ATTESTATION_PROFILE", "coco-sev-snp"),
             attestation_runtime_class: env_or("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
             attestation_workload_image: env_or("ATTESTATION_WORKLOAD_IMAGE", ""),
+            attestation_expected_init_data_hash: env_or("ATTESTATION_EXPECTED_INIT_DATA_HASH", ""),
             attestation_workload_container: env_or("ATTESTATION_WORKLOAD_CONTAINER", "enclava"),
             attestation_pod_name: std::env::var("ATTESTATION_POD_NAME")
                 .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_default()),
@@ -146,6 +150,11 @@ impl Config {
             attestation_policy_signature_url: env_or("ATTESTATION_POLICY_SIGNATURE_URL", ""),
             attestation_cert_chain_url: env_or("ATTESTATION_CERT_CHAIN_URL", ""),
             attestation_tcb_info_url: env_or("ATTESTATION_TCB_INFO_URL", ""),
+            attestation_e2ee_public_key_sha256: env_or("ATTESTATION_E2EE_PUBLIC_KEY_SHA256", ""),
+            attestation_require_e2ee_key_binding: env_bool(
+                "ATTESTATION_REQUIRE_E2EE_KEY_BINDING",
+                false,
+            ),
             attestation_enable_k8s_pod_lookup: env_bool("ATTESTATION_ENABLE_K8S_POD_LOOKUP", false),
             attestation_k8s_api_timeout_seconds: env_f64(
                 "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
@@ -229,6 +238,7 @@ impl Config {
             attestation_profile: "coco-sev-snp".into(),
             attestation_runtime_class: "kata-qemu-snp".into(),
             attestation_workload_image: "".into(),
+            attestation_expected_init_data_hash: "".into(),
             attestation_workload_container: "enclava".into(),
             attestation_pod_name: "".into(),
             attestation_pod_namespace: "".into(),
@@ -237,6 +247,8 @@ impl Config {
             attestation_policy_signature_url: "".into(),
             attestation_cert_chain_url: "".into(),
             attestation_tcb_info_url: "".into(),
+            attestation_e2ee_public_key_sha256: "".into(),
+            attestation_require_e2ee_key_binding: false,
             attestation_enable_k8s_pod_lookup: false,
             attestation_k8s_api_timeout_seconds: 6.0,
             storage_ownership_mode: "legacy".into(),
@@ -297,6 +309,7 @@ mod tests {
         "ATTESTATION_PROFILE",
         "ATTESTATION_RUNTIME_CLASS",
         "ATTESTATION_WORKLOAD_IMAGE",
+        "ATTESTATION_EXPECTED_INIT_DATA_HASH",
         "ATTESTATION_WORKLOAD_CONTAINER",
         "ATTESTATION_POD_NAME",
         "ATTESTATION_POD_NAMESPACE",
@@ -305,6 +318,8 @@ mod tests {
         "ATTESTATION_POLICY_SIGNATURE_URL",
         "ATTESTATION_CERT_CHAIN_URL",
         "ATTESTATION_TCB_INFO_URL",
+        "ATTESTATION_E2EE_PUBLIC_KEY_SHA256",
+        "ATTESTATION_REQUIRE_E2EE_KEY_BINDING",
         "ATTESTATION_ENABLE_K8S_POD_LOOKUP",
         "ATTESTATION_K8S_API_TIMEOUT_SECONDS",
         "STORAGE_OWNERSHIP_MODE",
@@ -361,6 +376,7 @@ mod tests {
         assert_eq!(config.attestation_profile, "coco-sev-snp");
         assert_eq!(config.attestation_runtime_class, "kata-qemu-snp");
         assert_eq!(config.attestation_workload_image, "");
+        assert_eq!(config.attestation_expected_init_data_hash, "");
         assert_eq!(config.attestation_workload_container, "enclava");
         assert_eq!(config.attestation_pod_name, "");
         assert_eq!(config.attestation_pod_namespace, "");
@@ -369,6 +385,8 @@ mod tests {
         assert_eq!(config.attestation_policy_signature_url, "");
         assert_eq!(config.attestation_cert_chain_url, "");
         assert_eq!(config.attestation_tcb_info_url, "");
+        assert_eq!(config.attestation_e2ee_public_key_sha256, "");
+        assert!(!config.attestation_require_e2ee_key_binding);
         assert!(!config.attestation_enable_k8s_pod_lookup);
         assert_eq!(config.attestation_k8s_api_timeout_seconds, 6.0);
         assert_eq!(config.storage_ownership_mode, "legacy");

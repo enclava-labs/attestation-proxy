@@ -331,47 +331,120 @@ fn build_server_verification(
         .get("workload")
         .and_then(|w| w.get("image_digest_attested"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
 
     let configured_digest = identity
         .get("configured")
         .and_then(|c| c.get("image_digest"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let attested_init_data_hash = claims
+        .get("workload")
+        .and_then(|w| w.get("init_data_hash"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let configured_init_data_hash = identity
+        .get("configured")
+        .and_then(|c| c.get("init_data_hash"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let attested_e2ee_public_key_sha256 = claims
+        .get("workload")
+        .and_then(|w| w.get("e2ee_public_key_sha256"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let configured_e2ee_public_key_sha256 = identity
+        .get("configured")
+        .and_then(|c| c.get("e2ee_public_key_sha256"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let configured_require_e2ee_key_binding = identity
+        .get("configured")
+        .and_then(|c| c.get("require_e2ee_key_binding"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let e2ee_key_binding_required =
+        configured_require_e2ee_key_binding || configured_e2ee_public_key_sha256.is_some();
 
     let nonce_supplied = nonce.is_some();
     let attested_digest_present = attested_digest.is_some();
     let configured_digest_present = configured_digest.is_some();
+    let attested_init_data_hash_present = attested_init_data_hash.is_some();
+    let configured_init_data_hash_present = configured_init_data_hash.is_some();
+    let attested_e2ee_public_key_present = attested_e2ee_public_key_sha256.is_some();
+    let configured_e2ee_public_key_present = configured_e2ee_public_key_sha256.is_some();
 
-    let attested_matches_configured = match (attested_digest, configured_digest) {
+    let attested_matches_configured = match (&attested_digest, &configured_digest) {
         (Some(a), Some(c)) => Value::Bool(a == c),
         _ => Value::Null,
     };
+    let init_data_matches_configured = match (&attested_init_data_hash, &configured_init_data_hash)
+    {
+        (Some(a), Some(c)) => Value::Bool(a == c),
+        _ => Value::Null,
+    };
+    let e2ee_public_key_matches_configured = match (
+        &attested_e2ee_public_key_sha256,
+        &configured_e2ee_public_key_sha256,
+    ) {
+        (Some(a), Some(c)) => Value::Bool(a == c),
+        _ => Value::Null,
+    };
+
+    let direct_digest_identity = attested_matches_configured.as_bool() == Some(true);
+    let init_data_identity = init_data_matches_configured.as_bool() == Some(true);
 
     let mut reasons: Vec<String> = Vec::new();
     if !nonce_supplied {
         reasons.push("nonce_supplied".to_string());
     }
-    if attested_matches_configured == Value::Bool(false) {
+    if !configured_digest_present {
+        reasons.push("configured_digest_missing".to_string());
+    }
+    if attested_matches_configured.as_bool() == Some(false) {
         reasons.push("attested_matches_configured".to_string());
+    }
+    if configured_init_data_hash_present && !attested_init_data_hash_present {
+        reasons.push("init_data_hash_missing".to_string());
+    }
+    if init_data_matches_configured.as_bool() == Some(false) {
+        reasons.push("init_data_hash_mismatch".to_string());
+    }
+    if !direct_digest_identity && !init_data_identity {
+        reasons.push("attested_workload_identity_missing".to_string());
+    }
+    if e2ee_key_binding_required && !configured_e2ee_public_key_present {
+        reasons.push("e2ee_public_key_config_missing".to_string());
+    }
+    if e2ee_key_binding_required && !attested_e2ee_public_key_present {
+        reasons.push("e2ee_public_key_missing".to_string());
+    }
+    if e2ee_key_binding_required && e2ee_public_key_matches_configured.as_bool() == Some(false) {
+        reasons.push("e2ee_public_key_mismatch".to_string());
     }
 
     let mut warnings: Vec<String> = Vec::new();
-    if !attested_digest_present {
-        warnings.push("attested_digest_missing".to_string());
+    if !attested_digest_present && init_data_identity {
+        warnings.push("attested_digest_missing_using_cc_init_data_identity".to_string());
     }
 
     let verdict = if !reasons.is_empty() {
         "fail"
-    } else if !attested_digest_present {
-        "inconclusive"
-    } else if attested_digest_present
-        && (attested_matches_configured == Value::Bool(true)
-            || attested_matches_configured == Value::Null)
-    {
+    } else if direct_digest_identity || init_data_identity {
         "pass"
     } else {
-        "inconclusive"
+        "fail"
     };
 
     json!({
@@ -382,6 +455,13 @@ fn build_server_verification(
             "attested_digest_present": attested_digest_present,
             "configured_digest_present": configured_digest_present,
             "attested_matches_configured": attested_matches_configured,
+            "attested_init_data_hash_present": attested_init_data_hash_present,
+            "configured_init_data_hash_present": configured_init_data_hash_present,
+            "init_data_matches_configured": init_data_matches_configured,
+            "e2ee_key_binding_required": e2ee_key_binding_required,
+            "attested_e2ee_public_key_present": attested_e2ee_public_key_present,
+            "configured_e2ee_public_key_present": configured_e2ee_public_key_present,
+            "e2ee_public_key_matches_configured": e2ee_public_key_matches_configured,
         },
         "reasons": reasons,
         "warnings": warnings,
@@ -861,7 +941,10 @@ pub async fn attestation_info(State(state): State<AppState>) -> Response {
         "policy": build_policy_metadata(config),
         "endorsements": build_endorsement_metadata(config),
         "trust": {
-            "authoritative_identity_source": "attested_claims",
+            "authoritative_identity_source": "cc_init_data_hash",
+            "expected_init_data_hash": or_null(&config.attestation_expected_init_data_hash),
+            "e2ee_key_binding_required": config.attestation_require_e2ee_key_binding
+                || !config.attestation_e2ee_public_key_sha256.trim().is_empty(),
             "operational_identity_sources": [],
         },
     });
@@ -1131,16 +1214,22 @@ pub async fn attestation(
             "namespace": workload.get("namespace"),
             "service_account": workload.get("service_account"),
             "init_data_hash": workload.get("init_data_hash"),
+            "e2ee_public_key_sha256": workload.get("e2ee_public_key_sha256"),
             "source": claims.get("source"),
         },
         "configured": {
             "image_reference": or_null(&state.config.attestation_workload_image),
             "image_digest": attestation::digest_from_image_ref(&state.config.attestation_workload_image),
+            "init_data_hash": or_null(&state.config.attestation_expected_init_data_hash),
+            "e2ee_public_key_sha256": or_null(&state.config.attestation_e2ee_public_key_sha256),
+            "require_e2ee_key_binding": state.config.attestation_require_e2ee_key_binding
+                || !state.config.attestation_e2ee_public_key_sha256.trim().is_empty(),
         },
     });
 
     let identity = json!({
         "attested": full_identity.get("attested"),
+        "configured": full_identity.get("configured"),
     });
 
     let server_verification = build_server_verification(
@@ -2867,6 +2956,105 @@ mod tests {
         assert!(!is_optional_sealed_owner_seed_resource_missing(&json!({
             "upstream_status": 401
         })));
+    }
+
+    #[test]
+    fn server_verification_accepts_cc_init_data_identity_without_direct_digest() {
+        let init_data_hash = "ab".repeat(32);
+        let configured_digest = "cd".repeat(32);
+        let identity = json!({
+            "attested": {
+                "image_digest": null,
+                "init_data_hash": init_data_hash,
+            },
+            "configured": {
+                "image_digest": configured_digest,
+                "init_data_hash": init_data_hash,
+                "require_e2ee_key_binding": false,
+            },
+        });
+        let claims = json!({
+            "workload": {
+                "image_digest_attested": null,
+                "init_data_hash": init_data_hash,
+            },
+        });
+
+        let verdict =
+            build_server_verification(&identity, &claims, &Some("nonce".to_string()), "policy-sha");
+
+        assert_eq!(verdict["verdict"], json!("pass"));
+        assert_eq!(
+            verdict["checks"]["init_data_matches_configured"],
+            json!(true)
+        );
+        assert_eq!(
+            verdict["warnings"],
+            json!(["attested_digest_missing_using_cc_init_data_identity"])
+        );
+    }
+
+    #[test]
+    fn server_verification_fails_when_no_attested_workload_identity_is_available() {
+        let configured_digest = "cd".repeat(32);
+        let identity = json!({
+            "attested": {
+                "image_digest": null,
+                "init_data_hash": null,
+            },
+            "configured": {
+                "image_digest": configured_digest,
+                "init_data_hash": null,
+                "require_e2ee_key_binding": false,
+            },
+        });
+        let claims = json!({
+            "workload": {
+                "image_digest_attested": null,
+                "init_data_hash": null,
+            },
+        });
+
+        let verdict =
+            build_server_verification(&identity, &claims, &Some("nonce".to_string()), "policy-sha");
+
+        assert_eq!(verdict["verdict"], json!("fail"));
+        assert_eq!(
+            verdict["reasons"],
+            json!(["attested_workload_identity_missing"])
+        );
+    }
+
+    #[test]
+    fn server_verification_fails_when_required_e2ee_binding_is_missing() {
+        let init_data_hash = "ab".repeat(32);
+        let configured_digest = "cd".repeat(32);
+        let identity = json!({
+            "attested": {
+                "image_digest": null,
+                "init_data_hash": init_data_hash,
+                "e2ee_public_key_sha256": null,
+            },
+            "configured": {
+                "image_digest": configured_digest,
+                "init_data_hash": init_data_hash,
+                "e2ee_public_key_sha256": "ef".repeat(32),
+                "require_e2ee_key_binding": true,
+            },
+        });
+        let claims = json!({
+            "workload": {
+                "image_digest_attested": null,
+                "init_data_hash": init_data_hash,
+                "e2ee_public_key_sha256": null,
+            },
+        });
+
+        let verdict =
+            build_server_verification(&identity, &claims, &Some("nonce".to_string()), "policy-sha");
+
+        assert_eq!(verdict["verdict"], json!("fail"));
+        assert_eq!(verdict["reasons"], json!(["e2ee_public_key_missing"]));
     }
 
     #[tokio::test]
