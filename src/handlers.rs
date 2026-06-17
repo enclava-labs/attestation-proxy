@@ -2516,10 +2516,11 @@ pub async fn config_put(
         },
     ) {
         Ok(()) => {
-            // Write config-ready sentinel after first successful config write (CONF-04).
-            if let Err(e) =
-                crate::config_store::write_ready_sentinel_with_marker(config_dir, ready_marker)
-            {
+            if let Err(e) = write_ready_sentinel_if_config_complete(
+                config_dir,
+                ready_marker,
+                &state.config.cap_config_required_keys,
+            ) {
                 return match e {
                     crate::config_store::ConfigStoreError::DirNotFound(detail) => json_response(
                         423,
@@ -2559,6 +2560,29 @@ pub async fn config_put(
             &json!({"error": "config_write_failed", "detail": e.to_string()}),
         ),
     }
+}
+
+fn write_ready_sentinel_if_config_complete(
+    config_dir: &StdPath,
+    ready_marker: Option<&StdPath>,
+    required_keys: &[String],
+) -> Result<(), crate::config_store::ConfigStoreError> {
+    if !required_config_keys_present(config_dir, required_keys)? {
+        return Ok(());
+    }
+    crate::config_store::write_ready_sentinel_with_marker(config_dir, ready_marker)
+}
+
+fn required_config_keys_present(
+    config_dir: &StdPath,
+    required_keys: &[String],
+) -> Result<bool, crate::config_store::ConfigStoreError> {
+    for key in required_keys {
+        if crate::config_store::read_config(config_dir, key)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// GET /config -- list all config key names (never values).
@@ -5661,6 +5685,17 @@ mod tests {
         build_config_test_state_with_marker(config_dir, None)
     }
 
+    fn build_config_test_state_with_required_keys(
+        config_dir: &Path,
+        required_keys: &[&str],
+    ) -> AppState {
+        let mut state = build_config_test_state(config_dir);
+        Arc::get_mut(&mut state.config)
+            .expect("test state should own config")
+            .cap_config_required_keys = required_keys.iter().map(|key| key.to_string()).collect();
+        state
+    }
+
     fn build_config_test_state_with_marker(
         config_dir: &Path,
         ready_marker: Option<&Path>,
@@ -6023,6 +6058,47 @@ mod tests {
         assert!(
             content.starts_with("ready_at="),
             "sentinel should start with ready_at="
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_waits_for_required_keys_before_ready_sentinel() {
+        let dir = test_config_dir("put-required-sentinel");
+        fs::create_dir_all(&dir).expect("config dir exists after LUKS bind");
+        let state =
+            build_config_test_state_with_required_keys(&dir, &["ADMIN_EMAIL", "ADMIN_PASSWORD"]);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state.clone()),
+            crate::jwt::ConfigAuth(claims.clone()),
+            Path("ADMIN_EMAIL".to_string()),
+            Bytes::from_static(b"admin@example.invalid"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert!(
+            !dir.join(".ready").exists(),
+            ".ready must not exist before every required config key has been delivered"
+        );
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("ADMIN_PASSWORD".to_string()),
+            Bytes::from_static(b"secret"),
+        )
+        .await;
+
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert!(
+            dir.join(".ready").exists(),
+            ".ready should exist after all required config keys are present"
         );
 
         let _ = fs::remove_dir_all(&dir);

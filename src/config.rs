@@ -60,6 +60,7 @@ pub struct Config {
     pub cap_api_url: String,
     pub cap_config_dir: String,
     pub cap_config_ready_marker: String,
+    pub cap_config_required_keys: Vec<String>,
     pub cap_config_file_gid: Option<u32>,
 }
 
@@ -108,6 +109,16 @@ impl Config {
             } else {
                 slots
             }
+        }
+
+        fn env_csv(key: &str) -> Vec<String> {
+            std::env::var(key)
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
         }
 
         Self {
@@ -205,6 +216,7 @@ impl Config {
             cap_api_url: env_or("CAP_API_URL", ""),
             cap_config_dir: env_or("CAP_CONFIG_DIR", "/data/.enclava/config"),
             cap_config_ready_marker: env_or("CAP_CONFIG_READY_MARKER", ""),
+            cap_config_required_keys: env_csv("CAP_CONFIG_REQUIRED_KEYS"),
             cap_config_file_gid: env_optional_u32("CAP_CONFIG_FILE_GID"),
         }
     }
@@ -273,6 +285,7 @@ impl Config {
             cap_api_url: "".into(),
             cap_config_dir: "/data/.enclava/config".into(),
             cap_config_ready_marker: "".into(),
+            cap_config_required_keys: Vec::new(),
             cap_config_file_gid: None,
         }
     }
@@ -333,6 +346,7 @@ mod tests {
         "CAP_API_URL",
         "CAP_CONFIG_DIR",
         "CAP_CONFIG_READY_MARKER",
+        "CAP_CONFIG_REQUIRED_KEYS",
         "CAP_CONFIG_FILE_GID",
     ];
 
@@ -463,6 +477,7 @@ mod tests {
         assert_eq!(config.cap_api_url, "");
         assert_eq!(config.cap_config_dir, "/data/.enclava/config");
         assert_eq!(config.cap_config_ready_marker, "");
+        assert!(config.cap_config_required_keys.is_empty());
         assert_eq!(config.cap_config_file_gid, None);
     }
 
@@ -475,12 +490,20 @@ mod tests {
         std::env::set_var("CAP_API_URL", "https://api.enclava.dev");
         std::env::set_var("CAP_CONFIG_DIR", "/custom/config");
         std::env::set_var("CAP_CONFIG_READY_MARKER", "/custom/luks-ready");
+        std::env::set_var(
+            "CAP_CONFIG_REQUIRED_KEYS",
+            "ADMIN_EMAIL, ADMIN_PASSWORD,,TINFOIL_API_KEY",
+        );
         std::env::set_var("CAP_CONFIG_FILE_GID", "10001");
         let config = Config::from_env();
         assert_eq!(config.cap_api_signing_pubkey, "dGVzdC1rZXk");
         assert_eq!(config.cap_api_url, "https://api.enclava.dev");
         assert_eq!(config.cap_config_dir, "/custom/config");
         assert_eq!(config.cap_config_ready_marker, "/custom/luks-ready");
+        assert_eq!(
+            config.cap_config_required_keys,
+            vec!["ADMIN_EMAIL", "ADMIN_PASSWORD", "TINFOIL_API_KEY"]
+        );
         assert_eq!(config.cap_config_file_gid, Some(10001));
     }
 
