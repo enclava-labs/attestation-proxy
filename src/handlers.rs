@@ -1414,16 +1414,23 @@ async fn unlock_startup_auto_unlock_material(
     if state.ownership.is_auto_unlock_mode()
         && !state.config.enclava_init_unlock_socket.trim().is_empty()
     {
-        *state.startup_owner_seed.write().await = Some(Zeroizing::new(*owner_seed));
-        state.ownership.set_unlocked();
-        spawn_enclava_init_ready_watch(
-            state.clone(),
-            std::time::Duration::from_secs(unlock_poll_timeout_seconds()),
-        );
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+        return unlock_auto_owner_seed_via_startup_handoff(state, owner_seed).await;
     }
 
     unlock_owner_seed_material(state, owner_seed).await
+}
+
+async fn unlock_auto_owner_seed_via_startup_handoff(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<Option<String>, OwnershipError> {
+    *state.startup_owner_seed.write().await = Some(Zeroizing::new(*owner_seed));
+    state.ownership.set_unlocked();
+    spawn_enclava_init_ready_watch(
+        state.clone(),
+        std::time::Duration::from_secs(unlock_poll_timeout_seconds()),
+    );
+    maybe_refresh_auto_unlock_seal(state, owner_seed).await
 }
 
 /// POST /unlock, POST /.well-known/confidential/unlock.
@@ -1666,6 +1673,12 @@ async fn unlock_owner_seed_material(
     state: &AppState,
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
+    if state.ownership.is_auto_unlock_mode()
+        && !state.config.enclava_init_unlock_socket.trim().is_empty()
+    {
+        return unlock_auto_owner_seed_via_startup_handoff(state, owner_seed).await;
+    }
+
     if !state.config.enclava_init_unlock_socket.trim().is_empty() {
         return unlock_owner_seed_via_init_socket(state, owner_seed).await;
     }
@@ -4524,6 +4537,73 @@ mod tests {
                 .join(SIGNAL_KEY_FILE)
                 .exists(),
             "auto mode with enclava-init should not use password handoff files"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_auto_unlock_with_init_socket_uses_startup_seed_handoff() {
+        let signal_dir = test_signal_dir("auto-bootstrap-init-socket");
+        let signing_key = SigningKey::from_bytes(&[14u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("auto-bootstrap-init-socket-token", "test-token");
+        let mut state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = signal_dir
+                .path
+                .join("missing-init.sock")
+                .display()
+                .to_string();
+            config.enclava_init_ready_file =
+                signal_dir.path.join("init-ready").display().to_string();
+            config.enclava_init_error_file =
+                signal_dir.path.join("init-error").display().to_string();
+        }
+        initialize_ownership_state(&state).await;
+
+        let response = claim_owner(&state, &signing_key, "claim-password").await;
+        assert_eq!(response["state"], "unlocked");
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unlocked")
+        );
+
+        let secret = api_server.secret_json();
+        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
+        let expected_owner_seed =
+            decrypt_owner_seed_with_password(&state, &encrypted, "claim-password");
+        let owner_seed_response = internal_owner_seed(
+            State(state.clone()),
+            Path("default/instance-test-01-owner/seed-encrypted".to_string()),
+        )
+        .await;
+        assert_eq!(owner_seed_response.status().as_u16(), 200);
+        assert_eq!(
+            read_bytes(owner_seed_response).await.as_ref(),
+            expected_owner_seed.as_slice()
+        );
+        assert!(
+            !signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_KEY_FILE)
+                .exists(),
+            "auto bootstrap with enclava-init must not use password handoff files"
         );
     }
 
