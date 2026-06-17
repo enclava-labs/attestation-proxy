@@ -901,9 +901,9 @@ pub async fn status(State(state): State<AppState>) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    maybe_refresh_unclaimed_state(&state).await;
+    maybe_refresh_unclaimed_state_for_status(&state).await;
     let mut body = state.ownership.state_json();
-    let identity = fetch_ownership_identity(&state).await;
+    let identity = fetch_ownership_identity_for_status(&state).await;
     body["instance_id"] = json!(state.config.instance_id);
     body["ciphertext_backend"] = json!(state.config.owner_ciphertext_backend);
     body["tenant_id"] = json!(identity.tenant_id);
@@ -922,6 +922,40 @@ pub async fn status(State(state): State<AppState>) -> Response {
     });
     body["config_ready"] = json!(config_ready);
     json_response(200, &body)
+}
+
+fn status_lookup_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
+async fn maybe_refresh_unclaimed_state_for_status(state: &AppState) {
+    if !state.ownership.is_unclaimed() {
+        return;
+    }
+    match tokio::time::timeout(
+        status_lookup_timeout(),
+        refresh_ownership_state(state, true),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => state.ownership.set_error(err.to_string()),
+        Err(_) => state.ownership.set_error("ownership_refresh_timeout"),
+    }
+}
+
+async fn fetch_ownership_identity_for_status(state: &AppState) -> OwnershipIdentity {
+    match tokio::time::timeout(status_lookup_timeout(), fetch_ownership_identity(state)).await {
+        Ok(identity) => identity,
+        Err(_) => OwnershipIdentity {
+            claims_error: Some("claims_fetch_timeout".to_string()),
+            ..OwnershipIdentity::default()
+        },
+    }
 }
 
 /// GET /v1/attestation/info
@@ -6026,6 +6060,36 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_returns_when_identity_fetch_hangs() {
+        let signal_dir = test_signal_dir("status-identity-timeout");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging identity test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _peer)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _socket = socket;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        let state = build_state_with_mode(&signal_dir.path, "password", base_url, None);
+
+        let response = tokio::time::timeout(Duration::from_millis(500), status(State(state)))
+            .await
+            .expect("status should not wait for identity fetch timeout");
+        let body = read_json(response).await;
+
+        assert_eq!(body["claims_verified"], json!(false));
+        assert_eq!(body["claims_error"], json!("claims_fetch_timeout"));
+        server.abort();
     }
 
     #[tokio::test]
