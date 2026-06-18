@@ -927,18 +927,38 @@ pub async fn status(State(state): State<AppState>) -> Response {
 
 fn enclava_init_status(state: &AppState) -> Value {
     json!({
-        "ready": init_file_exists(&state.config.enclava_init_ready_file),
+        "ready": init_ready_file_has_ready_content(&state.config.enclava_init_ready_file),
         "stage": read_trimmed_init_file(&state.config.enclava_init_stage_file),
         "error": read_trimmed_init_file(&state.config.enclava_init_error_file),
     })
 }
 
-fn init_file_exists(path: &str) -> bool {
+fn init_ready_file_has_ready_content(path: &str) -> bool {
+    init_ready_file_has_ready_content_result(path).unwrap_or(false)
+}
+
+fn init_ready_file_has_ready_content_result(path: &str) -> std::io::Result<bool> {
     let path = path.trim();
     if path.is_empty() {
-        return false;
+        return Ok(false);
     }
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(value.trim() == "ready"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+async fn init_ready_file_has_ready_content_async(path: &str) -> std::io::Result<bool> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(false);
+    }
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => Ok(value.trim() == "ready"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn read_trimmed_init_file(path: &str) -> Option<String> {
@@ -1771,7 +1791,7 @@ async fn unlock_owner_seed_via_init_socket(
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
     let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
-    if enclava_init_ready_file_exists(state).await? {
+    if enclava_init_ready_file_is_ready(state).await? {
         state.ownership.set_unlocked();
         return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
     }
@@ -1813,18 +1833,11 @@ async fn unlock_owner_seed_via_init_socket(
     )))
 }
 
-async fn enclava_init_ready_file_exists(state: &AppState) -> Result<bool, OwnershipError> {
+async fn enclava_init_ready_file_is_ready(state: &AppState) -> Result<bool, OwnershipError> {
     let ready_file = state.config.enclava_init_ready_file.trim();
-    if ready_file.is_empty() {
-        return Ok(false);
-    }
-    match tokio::fs::metadata(ready_file).await {
-        Ok(meta) => Ok(meta.is_file()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(OwnershipError::Store(format!(
-            "enclava_init_ready_file_read_failed:{err}"
-        ))),
-    }
+    init_ready_file_has_ready_content_async(ready_file)
+        .await
+        .map_err(|err| OwnershipError::Store(format!("enclava_init_ready_file_read_failed:{err}")))
 }
 
 fn spawn_enclava_init_ready_watch(state: AppState, timeout: std::time::Duration) {
@@ -1853,13 +1866,12 @@ async fn wait_for_enclava_init_ready(
     let deadline = Instant::now() + timeout;
 
     loop {
-        match tokio::fs::metadata(ready_file).await {
-            Ok(meta) if meta.is_file() => {
+        match init_ready_file_has_ready_content_async(ready_file).await {
+            Ok(true) => {
                 *state.startup_owner_seed.write().await = None;
                 return Ok(());
             }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(err) => {
                 return Err(OwnershipError::Store(format!(
                     "enclava_init_ready_file_read_failed:{err}"
@@ -3734,6 +3746,69 @@ mod tests {
                 .join(SIGNAL_KEY_FILE)
                 .exists(),
             "init-socket mode must not write old app-data handoff files"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlock_password_mode_not_ready_file_still_uses_enclava_init_socket() {
+        let signal_dir = test_signal_dir("unlock-password-init-not-ready-socket");
+        let owner_seed = [0x2a; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        tokio::fs::write(&ready_path, b"not-ready\n")
+            .await
+            .expect("seed not-ready file");
+        let ready_for_task = ready_path.clone();
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            tokio::fs::write(&ready_for_task, b"ready\n")
+                .await
+                .expect("write ready file");
+            line
+        });
+
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("correct-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 202);
+        let request_line = tokio::time::timeout(Duration::from_secs(5), socket_task)
+            .await
+            .expect("not-ready file must not skip the init socket")
+            .expect("socket task");
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        assert_eq!(
+            request_line.trim_end(),
+            format!(
+                "owner-seed-v1:{}",
+                BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+            )
         );
     }
 
@@ -6143,6 +6218,42 @@ mod tests {
         let error = body["enclava_init"]["error"].as_str().unwrap();
         assert!(error.ends_with("...<truncated>"));
         assert!(error.len() < 2100);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_treats_not_ready_init_file_as_not_ready() {
+        let dir = test_config_dir("status-init-not-ready");
+        fs::create_dir_all(&dir).unwrap();
+        let ready_file = dir.join("init-ready");
+        fs::write(&ready_file, b"not-ready\n").unwrap();
+
+        let signal_dir = test_signal_dir("status-init-not-ready");
+        let mut config = Config::from_env_for_test();
+        config.storage_ownership_mode = "password".to_string();
+        config.instance_id = "instance-test-01".to_string();
+        config.enclava_init_ready_file = ready_file.display().to_string();
+
+        let state = AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                "password".to_string(),
+                signal_dir.path.clone(),
+            )),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
+        };
+
+        let response = status(State(state)).await;
+        let body = read_json(response).await;
+
+        assert_eq!(body["enclava_init"]["ready"], json!(false));
 
         let _ = fs::remove_dir_all(&dir);
     }

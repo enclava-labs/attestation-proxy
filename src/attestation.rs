@@ -435,10 +435,8 @@ fn find_jwt_candidates_inner(node: &Value, out: &mut Vec<String>) {
                 find_jwt_candidates_inner(v, out);
             }
         }
-        Value::String(s) => {
-            if jwt_re().is_match(s) {
-                out.push(s.clone());
-            }
+        Value::String(s) if jwt_re().is_match(s) => {
+            out.push(s.clone());
         }
         _ => {}
     }
