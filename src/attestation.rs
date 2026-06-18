@@ -367,6 +367,27 @@ pub async fn fetch_kbs_bearer_token_with_runtime_data(
 
 /// Fetch token claims for attestation. Returns JSON with claims_root, measurement, error.
 pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
+    let (payload, payload_error) = fetch_aa_token_payload(state).await;
+    token_claims_from_payload(payload, payload_error)
+}
+
+/// Fetch token claims for public attestation, bound to the caller-specific
+/// report_data. This bypasses the generic KBS token cache so attestation cannot
+/// reuse a stale token that lacks workload identity claims.
+pub async fn fetch_kbs_token_claims_with_runtime_data(
+    state: &crate::AppState,
+    runtime_data: &[u8; 64],
+) -> Value {
+    let url = kbs_token_url_for_runtime_data(&state.config.aa_token_url, runtime_data);
+    let attempts = state.config.aa_token_fetch_attempts.max(1);
+    let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
+    let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
+    let (payload, payload_error) =
+        fetch_aa_token_payload_from_url(state, &url, attempts, timeout, retry_sleep).await;
+    token_claims_from_payload(payload, payload_error)
+}
+
+fn token_claims_from_payload(payload: Option<Value>, payload_error: Option<String>) -> Value {
     let mut result = json!({
         "claims_root": null,
         "measurement": null,
@@ -374,18 +395,14 @@ pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
         "verified": false,
     });
 
-    let (payload, payload_error) = fetch_aa_token_payload(state).await;
     if let Some(e) = payload_error {
         result["error"] = Value::String(e);
         return result;
     }
 
-    let payload = match payload {
-        Some(p) => p,
-        None => {
-            result["error"] = Value::String("aa_token_invalid_response".into());
-            return result;
-        }
+    let Some(payload) = payload else {
+        result["error"] = Value::String("aa_token_invalid_response".into());
+        return result;
     };
 
     let token = payload

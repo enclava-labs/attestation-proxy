@@ -1262,8 +1262,11 @@ pub async fn attestation(
     let mut token_measurement_mismatch = false;
 
     if let Some(ref ej) = evidence_json {
-        // Fetch KBS token claims
-        token_claims = attestation::fetch_kbs_token_claims(&state).await;
+        // Fetch claims from a token bound to this attestation transcript. Do
+        // not reuse the generic KBS token cache here; public attestation must
+        // not be affected by a stale token without workload identity claims.
+        token_claims =
+            attestation::fetch_kbs_token_claims_with_runtime_data(&state, &report_data).await;
 
         // Extract claims
         let supplemental = token_claims.get("claims_root").filter(|v| v.is_object());
@@ -3258,6 +3261,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attestation_fetches_token_claims_bound_to_report_data() {
+        let signal_dir = test_signal_dir("attestation-token-report-data-binding");
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(&signal_dir.path, "level1", api_server.base_url(), None);
+        let nonce = [0x33; 32];
+        let leaf_spki_sha256 = [0x42; 32];
+        let domain = "app.example.com";
+
+        let response = attestation(
+            State(state.clone()),
+            Query(AttestationQuery {
+                nonce: Some(BASE64_STANDARD.encode(nonce)),
+                runtime_data: None,
+                leaf_spki_sha256: Some(test_hex_lower(&leaf_spki_sha256)),
+                domain: Some(domain.to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt_pubkey_sha256 = state.receipt_signer.public_key_sha256();
+        let expected = build_report_data(domain, &nonce, &leaf_spki_sha256, &receipt_pubkey_sha256);
+        let expected_token_runtime_data = BASE64_URL_SAFE_NO_PAD.encode(expected);
+        assert_eq!(
+            api_server.aa_token_runtime_data(),
+            vec![Some(expected_token_runtime_data)]
+        );
+    }
+
+    #[tokio::test]
     async fn initialize_ownership_state_retries_transient_unclaimed_reads() {
         let signal_dir = test_signal_dir("initialize-ownership-state-retries");
         let owner_seed = [0x55; 32];
@@ -5044,6 +5082,7 @@ mod tests {
     #[derive(Clone)]
     struct TestApiState {
         aa_token_response: Value,
+        aa_token_runtime_data: Arc<Mutex<Vec<Option<String>>>>,
         aa_evidence_runtime_data: Arc<Mutex<Vec<String>>>,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
@@ -5054,6 +5093,7 @@ mod tests {
     struct TestApiServer {
         addr: SocketAddr,
         task: tokio::task::JoinHandle<()>,
+        aa_token_runtime_data: Arc<Mutex<Vec<Option<String>>>>,
         aa_evidence_runtime_data: Arc<Mutex<Vec<String>>>,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
@@ -5083,6 +5123,13 @@ mod tests {
             self.aa_evidence_runtime_data
                 .lock()
                 .expect("aa evidence runtime data lock poisoned")
+                .clone()
+        }
+
+        fn aa_token_runtime_data(&self) -> Vec<Option<String>> {
+            self.aa_token_runtime_data
+                .lock()
+                .expect("aa token runtime data lock poisoned")
                 .clone()
         }
     }
@@ -5350,7 +5397,15 @@ mod tests {
         StatusCode::OK.into_response()
     }
 
-    async fn test_aa_token_handler(AxumState(state): AxumState<TestApiState>) -> Json<Value> {
+    async fn test_aa_token_handler(
+        AxumState(state): AxumState<TestApiState>,
+        AxumQuery(query): AxumQuery<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .aa_token_runtime_data
+            .lock()
+            .expect("aa token runtime data lock poisoned")
+            .push(query.get("runtime_data").cloned());
         Json(state.aa_token_response.clone())
     }
 
@@ -5406,9 +5461,11 @@ mod tests {
     ) -> TestApiServer {
         let owner_secret = Arc::new(Mutex::new(owner_secret));
         let kbs_resources = Arc::new(Mutex::new(kbs_resources));
+        let aa_token_runtime_data = Arc::new(Mutex::new(Vec::new()));
         let aa_evidence_runtime_data = Arc::new(Mutex::new(Vec::new()));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
+            aa_token_runtime_data: aa_token_runtime_data.clone(),
             aa_evidence_runtime_data: aa_evidence_runtime_data.clone(),
             owner_secret: owner_secret.clone(),
             kbs_resources: kbs_resources.clone(),
@@ -5443,6 +5500,7 @@ mod tests {
         TestApiServer {
             addr,
             task,
+            aa_token_runtime_data,
             aa_evidence_runtime_data,
             owner_secret,
             kbs_resources,
