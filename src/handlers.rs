@@ -921,7 +921,45 @@ pub async fn status(State(state): State<AppState>) -> Response {
         )
     });
     body["config_ready"] = json!(config_ready);
+    body["enclava_init"] = json!(enclava_init_status(&state));
     json_response(200, &body)
+}
+
+fn enclava_init_status(state: &AppState) -> Value {
+    json!({
+        "ready": init_file_exists(&state.config.enclava_init_ready_file),
+        "stage": read_trimmed_init_file(&state.config.enclava_init_stage_file),
+        "error": read_trimmed_init_file(&state.config.enclava_init_error_file),
+    })
+}
+
+fn init_file_exists(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn read_trimmed_init_file(path: &str) -> Option<String> {
+    const LIMIT: usize = 2048;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let value = std::fs::read_to_string(path).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= LIMIT {
+        return Some(trimmed.to_string());
+    }
+    let mut end = LIMIT;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}...<truncated>", &trimmed[..end]))
 }
 
 fn status_lookup_timeout() -> Duration {
@@ -3325,6 +3363,7 @@ mod tests {
             "claims_verified",
             "claims_error",
             "config_ready",
+            "enclava_init",
         ]
         .into_iter()
         .map(str::to_string)
@@ -6058,6 +6097,52 @@ mod tests {
             json!(true),
             "config_ready should be true after sentinel"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_status_includes_enclava_init_diagnostics() {
+        let dir = test_config_dir("status-init-diagnostics");
+        fs::create_dir_all(&dir).unwrap();
+        let ready_file = dir.join("init-ready");
+        let stage_file = dir.join("init-stage");
+        let error_file = dir.join("init-error");
+        fs::write(&ready_file, b"ready\n").unwrap();
+        fs::write(&stage_file, b"opening luks volumes\n").unwrap();
+        fs::write(&error_file, format!("{}\n", "x".repeat(4096))).unwrap();
+
+        let signal_dir = test_signal_dir("status-init-diagnostics");
+        let mut config = Config::from_env_for_test();
+        config.storage_ownership_mode = "password".to_string();
+        config.instance_id = "instance-test-01".to_string();
+        config.enclava_init_ready_file = ready_file.display().to_string();
+        config.enclava_init_stage_file = stage_file.display().to_string();
+        config.enclava_init_error_file = error_file.display().to_string();
+
+        let state = AppState {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
+            kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
+            startup_owner_seed: Arc::new(RwLock::new(None)),
+            ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
+                "password".to_string(),
+                signal_dir.path.clone(),
+            )),
+            bootstrap_challenges: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            receipt_signer: Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0x42; 32],
+        };
+
+        let response = status(State(state)).await;
+        let body = read_json(response).await;
+
+        assert_eq!(body["enclava_init"]["ready"], json!(true));
+        assert_eq!(body["enclava_init"]["stage"], json!("opening luks volumes"));
+        let error = body["enclava_init"]["error"].as_str().unwrap();
+        assert!(error.ends_with("...<truncated>"));
+        assert!(error.len() < 2100);
 
         let _ = fs::remove_dir_all(&dir);
     }

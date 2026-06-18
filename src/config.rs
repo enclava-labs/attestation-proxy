@@ -46,6 +46,7 @@ pub struct Config {
     pub enclava_init_unlock_socket: String,
     pub enclava_init_ready_file: String,
     pub enclava_init_error_file: String,
+    pub enclava_init_stage_file: String,
     pub ownership_challenge_ttl_seconds: f64,
     // Kubernetes-secret backend fields (used when owner_ciphertext_backend = "kubernetes-secret")
     pub k8s_api_url: String,
@@ -198,6 +199,7 @@ impl Config {
             enclava_init_unlock_socket: env_or("ENCLAVA_INIT_UNLOCK_SOCKET", ""),
             enclava_init_ready_file: env_or("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             enclava_init_error_file: env_or("ENCLAVA_INIT_ERROR_FILE", "/run/enclava/init-error"),
+            enclava_init_stage_file: env_or("ENCLAVA_INIT_STAGE_FILE", "/run/enclava/init-stage"),
             ownership_challenge_ttl_seconds: env_f64("OWNERSHIP_CHALLENGE_TTL_SECONDS", 300.0),
             k8s_api_url: env_or("K8S_API_URL", "https://kubernetes.default.svc"),
             k8s_ca_cert_path: env_or(
@@ -272,6 +274,7 @@ impl Config {
             enclava_init_unlock_socket: "".into(),
             enclava_init_ready_file: "/run/enclava/init-ready".into(),
             enclava_init_error_file: "/run/enclava/init-error".into(),
+            enclava_init_stage_file: "/run/enclava/init-stage".into(),
             ownership_challenge_ttl_seconds: 300.0,
             k8s_api_url: "https://kubernetes.default.svc".into(),
             k8s_ca_cert_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".into(),
