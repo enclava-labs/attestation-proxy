@@ -951,10 +951,7 @@ fn chrono_timestamp() -> String {
 
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}+00:00",
-        year, month, day, hours, minutes, seconds, micros
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{micros:06}+00:00")
 }
 
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {

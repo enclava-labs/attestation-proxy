@@ -294,7 +294,7 @@ fn workload_resource_base(kbs_resource_url: &str) -> String {
     if let Some(stripped) = base.strip_suffix("/resource") {
         format!("{stripped}/workload-resource")
     } else {
-        format!("{}/workload-resource", base)
+        format!("{base}/workload-resource")
     }
 }
 

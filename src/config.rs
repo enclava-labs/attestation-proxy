@@ -401,8 +401,7 @@ mod tests {
             let config = Config::from_env();
             assert!(
                 config.attestation_enable_k8s_pod_lookup,
-                "expected true for {:?}",
-                value
+                "expected true for {value:?}"
             );
         }
     }
@@ -417,8 +416,7 @@ mod tests {
             let config = Config::from_env();
             assert!(
                 !config.attestation_enable_k8s_pod_lookup,
-                "expected false for {:?}",
-                value
+                "expected false for {value:?}"
             );
         }
     }

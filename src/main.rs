@@ -16,9 +16,17 @@ use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use x509_cert::der::{Decode, Encode};
+
+const DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
+const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 
 /// Ownership gate middleware: blocks non-allowed paths with 423 in level1 mode.
 async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
@@ -45,6 +53,10 @@ async fn ownership_gate(State(state): State<AppState>, req: Request<Body>, next:
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Config::from_env();
+    if let Err(err) = signal_enclava_started_if_configured() {
+        eprintln!("{{\"event\":\"enclava_started_sentinel_failed\",\"error\":\"{err}\"}}");
+        std::process::exit(127);
+    }
     let http_addr = format!("{}:{}", config.listen_host, config.listen_port);
     let tls_addr = format!("{}:{}", config.listen_tls_host, config.listen_tls_port);
     let tls_domain = config.tee_domain.clone();
@@ -98,6 +110,113 @@ async fn main() {
             result.expect("attestation TLS server failed");
         }
     }
+}
+
+fn signal_enclava_started_if_configured() -> Result<(), String> {
+    let Some(name) = std::env::var_os("ENCLAVA_CONTAINER_NAME") else {
+        return Ok(());
+    };
+    let name = name
+        .into_string()
+        .map_err(|_| "ENCLAVA_CONTAINER_NAME must be UTF-8".to_string())?;
+    validate_sentinel_name(&name)?;
+    let started_dir = std::env::var_os("ENCLAVA_STARTED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STARTED_DIR));
+    signal_started(&started_dir, &name)
+}
+
+fn validate_sentinel_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
+    }
+    if name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
+        return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
+    }
+    Ok(())
+}
+
+fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
+    validate_sentinel_name(name)?;
+    fs::create_dir_all(started_dir).map_err(|err| {
+        format!(
+            "failed to create started dir {}: {err}",
+            started_dir.display()
+        )
+    })?;
+    let sentinel = started_dir.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&sentinel) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "sentinel {} must not be a symlink",
+                sentinel.display()
+            ));
+        }
+    }
+    let body = sentinel_record(name)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o640)
+        .custom_flags(O_NOFOLLOW)
+        .open(&sentinel)
+        .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    file.write_all(body.as_bytes())
+        .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    Ok(())
+}
+
+fn sentinel_record(name: &str) -> Result<String, String> {
+    let (uid, gid) = current_uid_gid()?;
+    let start_time_ticks = current_start_time_ticks()?;
+    Ok(format!(
+        "version=1\ncontainer={name}\npid={}\nstart_time_ticks={start_time_ticks}\nuid={uid}\ngid={gid}\n",
+        process::id()
+    ))
+}
+
+fn current_uid_gid() -> Result<(u32, u32), String> {
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|err| format!("failed to read /proc/self/status: {err}"))?;
+    uid_gid_from_status(&status)
+}
+
+fn uid_gid_from_status(status: &str) -> Result<(u32, u32), String> {
+    let uid = first_status_id(status, "Uid:")?;
+    let gid = first_status_id(status, "Gid:")?;
+    Ok((uid, gid))
+}
+
+fn first_status_id(status: &str, key: &str) -> Result<u32, String> {
+    let line = status
+        .lines()
+        .find(|line| line.starts_with(key))
+        .ok_or_else(|| format!("missing {key} in process status"))?;
+    line[key.len()..]
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("missing value for {key} in process status"))?
+        .parse::<u32>()
+        .map_err(|err| format!("invalid {key} in process status: {err}"))
+}
+
+fn current_start_time_ticks() -> Result<u64, String> {
+    let stat = fs::read_to_string("/proc/self/stat")
+        .map_err(|err| format!("failed to read /proc/self/stat: {err}"))?;
+    start_time_ticks_from_stat(&stat)
+}
+
+fn start_time_ticks_from_stat(stat: &str) -> Result<u64, String> {
+    let (_, rest) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| "process stat is missing command delimiter".to_string())?;
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    fields
+        .get(19)
+        .ok_or_else(|| "process stat is missing start_time".to_string())?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid process stat start_time: {err}"))
 }
 
 fn build_http_client(config: &Config) -> Result<reqwest::Client, Box<dyn Error + Send + Sync>> {
@@ -232,7 +351,9 @@ fn generate_tls_material(domain: &str) -> Result<TlsMaterial, Box<dyn std::error
 mod main {
     mod tests {
         use std::collections::{HashMap, VecDeque};
+        use std::fs;
         use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         use attestation_proxy::attestation::AaTokenCache;
         use attestation_proxy::config::Config;
@@ -243,6 +364,17 @@ mod main {
         use axum::http::{Request, StatusCode};
         use tokio::sync::RwLock;
         use tower::ServiceExt;
+
+        fn unique_dir(label: &str) -> std::path::PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "attestation-proxy-{label}-{}-{nanos}",
+                std::process::id()
+            ))
+        }
 
         fn test_state() -> AppState {
             let mut config = Config::from_env();
@@ -311,6 +443,34 @@ mod main {
 
             guard.set_error("fatal");
             assert!(guard.should_gate("/cdh/resource/default/key/1"));
+        }
+
+        #[test]
+        fn started_sentinel_matches_enclava_init_contract() {
+            let dir = unique_dir("started-sentinel");
+            super::super::signal_started(&dir, "attestation-proxy").unwrap();
+
+            let body = fs::read_to_string(dir.join("attestation-proxy")).unwrap();
+            assert!(body.contains("version=1\n"));
+            assert!(body.contains("container=attestation-proxy\n"));
+            assert!(body.contains(&format!("pid={}\n", std::process::id())));
+            assert!(body.contains("uid="));
+            assert!(body.contains("gid="));
+            assert!(body.contains("start_time_ticks="));
+
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn started_sentinel_rejects_path_like_names() {
+            let dir = unique_dir("started-sentinel-bad-name");
+            for name in ["", ".", "..", "../attestation-proxy", "proxy/sidecar"] {
+                assert!(
+                    super::super::signal_started(&dir, name).is_err(),
+                    "{name:?}"
+                );
+            }
+            let _ = fs::remove_dir_all(dir);
         }
 
         #[tokio::test]

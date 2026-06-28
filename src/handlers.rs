@@ -1591,7 +1591,7 @@ async fn unlock_owner_seed_via_init_socket(
     owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
     let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
-    if enclava_init_ready_file_exists(state).await? {
+    if enclava_init_ready_file_is_ready(state).await? {
         state.ownership.set_unlocked();
         return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
     }
@@ -1633,13 +1633,13 @@ async fn unlock_owner_seed_via_init_socket(
     )))
 }
 
-async fn enclava_init_ready_file_exists(state: &AppState) -> Result<bool, OwnershipError> {
+async fn enclava_init_ready_file_is_ready(state: &AppState) -> Result<bool, OwnershipError> {
     let ready_file = state.config.enclava_init_ready_file.trim();
     if ready_file.is_empty() {
         return Ok(false);
     }
-    match tokio::fs::metadata(ready_file).await {
-        Ok(meta) => Ok(meta.is_file()),
+    match tokio::fs::read_to_string(ready_file).await {
+        Ok(value) => Ok(value.trim() == "ready"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(OwnershipError::Store(format!(
             "enclava_init_ready_file_read_failed:{err}"
@@ -1673,8 +1673,8 @@ async fn wait_for_enclava_init_ready(
     let deadline = Instant::now() + timeout;
 
     loop {
-        match tokio::fs::metadata(ready_file).await {
-            Ok(meta) if meta.is_file() => {
+        match tokio::fs::read_to_string(ready_file).await {
+            Ok(value) if value.trim() == "ready" => {
                 *state.startup_owner_seed.write().await = None;
                 return Ok(());
             }
@@ -3141,6 +3141,67 @@ mod tests {
                 .exists(),
             "tls-data key file should not be written when CAP owns TLS via a separate seed"
         );
+    }
+
+    #[tokio::test]
+    async fn enclava_init_ready_file_requires_ready_content() {
+        let signal_dir = test_signal_dir("init-ready-content");
+        let ready_path = signal_dir.path.join("init-ready");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+
+        tokio::fs::write(&ready_path, b"not-ready\n")
+            .await
+            .expect("write not-ready sentinel");
+        assert!(
+            !enclava_init_ready_file_is_ready(&state).await.unwrap(),
+            "the bootstrap not-ready sentinel must not be treated as ready"
+        );
+
+        tokio::fs::write(&ready_path, b"ready\n")
+            .await
+            .expect("write ready sentinel");
+        assert!(enclava_init_ready_file_is_ready(&state).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wait_for_enclava_init_ready_surfaces_error_while_not_ready() {
+        let signal_dir = test_signal_dir("init-ready-error");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        tokio::fs::write(&ready_path, b"not-ready\n")
+            .await
+            .expect("write not-ready sentinel");
+        tokio::fs::write(&error_path, b"waiting for workload containers failed\n")
+            .await
+            .expect("write init error");
+
+        let err = wait_for_enclava_init_ready(&state, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("enclava_init_failed:waiting for workload containers failed"));
     }
 
     #[tokio::test]

@@ -491,7 +491,7 @@ pub fn to_hex_bytes(value: &Value) -> Option<String> {
 /// Hex encode helper (inline, no dep needed).
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
