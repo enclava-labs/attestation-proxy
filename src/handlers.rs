@@ -2392,6 +2392,9 @@ pub async fn config_put(
     Path(key): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
+    if let Err(response) = require_config_storage_ready(&state).await {
+        return response;
+    }
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     let config_options =
         crate::config_store::ConfigStoreOptions::with_file_gid(state.config.cap_config_file_gid);
@@ -2447,6 +2450,9 @@ pub async fn config_delete(
     crate::jwt::ConfigAuth(claims): crate::jwt::ConfigAuth,
     Path(key): Path<String>,
 ) -> Response {
+    if let Err(response) = require_config_storage_ready(&state).await {
+        return response;
+    }
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     match crate::config_store::delete_config(config_dir, &key) {
         Ok(existed) => {
@@ -2471,6 +2477,29 @@ pub async fn config_delete(
             500,
             &json!({"error": "config_delete_failed", "detail": e.to_string()}),
         ),
+    }
+}
+
+async fn require_config_storage_ready(state: &AppState) -> Result<(), Response> {
+    if state.config.enclava_init_ready_file.trim().is_empty() {
+        return Ok(());
+    }
+    match enclava_init_ready_file_is_ready(state).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(json_response(
+            423,
+            &json!({
+                "error": "init_not_ready",
+                "detail": "enclava-init has not finished preparing decrypted config storage"
+            }),
+        )),
+        Err(err) => Err(json_response(
+            500,
+            &json!({
+                "error": "init_ready_check_failed",
+                "detail": err.to_string()
+            }),
+        )),
     }
 }
 
@@ -5051,11 +5080,20 @@ mod tests {
     }
 
     fn build_config_test_state(config_dir: &Path) -> AppState {
+        build_config_test_state_with_init_ready(config_dir, true)
+    }
+
+    fn build_config_test_state_with_init_ready(config_dir: &Path, init_ready: bool) -> AppState {
         let signal_dir = test_signal_dir("config-test");
+        let init_ready_file = signal_dir.path.join("init-ready");
+        if init_ready {
+            fs::write(&init_ready_file, "ready\n").expect("write init-ready file");
+        }
         let mut config = Config::from_env_for_test();
         config.storage_ownership_mode = "password".to_string();
         config.instance_id = "instance-test-01".to_string();
         config.cap_config_dir = config_dir.display().to_string();
+        config.enclava_init_ready_file = init_ready_file.display().to_string();
         // Empty api_url means metadata sync is a no-op
         config.cap_api_url = "".to_string();
 
@@ -5101,6 +5139,31 @@ mod tests {
         // Verify file was written
         let content = fs::read(dir.join("DATABASE_URL")).expect("config file should exist");
         assert_eq!(content, b"postgres://localhost/mydb");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_waits_for_enclava_init_ready() {
+        let dir = test_config_dir("put-init-not-ready");
+        let state = build_config_test_state_with_init_ready(&dir, false);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_put(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("DATABASE_URL".to_string()),
+            Bytes::from_static(b"postgres://localhost/mydb"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "init_not_ready");
+        assert!(
+            !dir.join("DATABASE_URL").exists(),
+            "config must not be written before decrypted storage is mounted"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -5152,6 +5215,31 @@ mod tests {
 
         // Verify file is gone
         assert!(!dir.join("TEMP_KEY").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_delete_waits_for_enclava_init_ready() {
+        let dir = test_config_dir("delete-init-not-ready");
+        crate::config_store::write_config(&dir, "TEMP_KEY", b"temp").unwrap();
+        let state = build_config_test_state_with_init_ready(&dir, false);
+        let claims = test_api_claims("instance-test-01", "config:write");
+
+        let response = config_delete(
+            State(state),
+            crate::jwt::ConfigAuth(claims),
+            Path("TEMP_KEY".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "init_not_ready");
+        assert!(
+            dir.join("TEMP_KEY").exists(),
+            "config must not be deleted before decrypted storage is mounted"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
