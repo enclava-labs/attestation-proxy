@@ -5,9 +5,11 @@
 //! Key names must match `^[A-Za-z_][A-Za-z0-9_]*$` (env-var-compatible).
 //! Values are written atomically via write-to-temp + rename.
 
+use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use thiserror::Error;
@@ -20,6 +22,33 @@ pub enum ConfigStoreError {
     DirNotFound(String),
     #[error("io_error:{0}")]
     Io(String),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfigStoreOptions {
+    pub file_gid: Option<u32>,
+}
+
+impl ConfigStoreOptions {
+    pub fn with_file_gid(file_gid: Option<u32>) -> Self {
+        Self { file_gid }
+    }
+
+    fn config_file_mode(self) -> u32 {
+        if self.file_gid.is_some() {
+            0o640
+        } else {
+            0o600
+        }
+    }
+
+    fn ready_file_mode(self) -> u32 {
+        if self.file_gid.is_some() {
+            0o640
+        } else {
+            0o644
+        }
+    }
 }
 
 /// Validate that a config key name is safe for filesystem use and env-var injection.
@@ -60,17 +89,27 @@ fn ensure_config_dir(config_dir: &Path) -> Result<(), ConfigStoreError> {
 
 /// Write a config value atomically (write to temp file, then rename).
 pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), ConfigStoreError> {
+    write_config_with_options(config_dir, key, value, ConfigStoreOptions::default())
+}
+
+pub fn write_config_with_options(
+    config_dir: &Path,
+    key: &str,
+    value: &[u8],
+    options: ConfigStoreOptions,
+) -> Result<(), ConfigStoreError> {
     validate_key_name(key)?;
     ensure_config_dir(config_dir)?;
 
     let target = config_dir.join(key);
     let tmp = config_dir.join(format!(".{key}.tmp"));
+    let mode = options.config_file_mode();
 
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&tmp)
         .map_err(|e| ConfigStoreError::Io(format!("write_tmp:{e}")))?;
 
@@ -79,9 +118,31 @@ pub fn write_config(config_dir: &Path, key: &str, value: &[u8]) -> Result<(), Co
     file.sync_all()
         .map_err(|e| ConfigStoreError::Io(format!("sync:{e}")))?;
     drop(file);
+    apply_file_metadata(&tmp, options.file_gid, mode)?;
 
     fs::rename(&tmp, &target).map_err(|e| ConfigStoreError::Io(format!("rename:{e}")))?;
 
+    Ok(())
+}
+
+fn apply_file_metadata(
+    path: &Path,
+    file_gid: Option<u32>,
+    mode: u32,
+) -> Result<(), ConfigStoreError> {
+    if let Some(gid) = file_gid {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| ConfigStoreError::Io("path_contains_nul".to_string()))?;
+        let rc = unsafe { libc::chown(path.as_ptr(), !0 as libc::uid_t, gid as libc::gid_t) };
+        if rc != 0 {
+            return Err(ConfigStoreError::Io(format!(
+                "chown:{}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| ConfigStoreError::Io(format!("chmod:{e}")))?;
     Ok(())
 }
 
@@ -134,9 +195,16 @@ pub fn read_config(config_dir: &Path, key: &str) -> Result<Option<Vec<u8>>, Conf
 /// Write the `.ready` sentinel file to signal that config has been delivered.
 ///
 /// No-op if `.ready` already exists. Uses atomic write (write to `.ready.tmp`,
-/// rename to `.ready`) with mode 0o644 so bootstrap.sh (potentially running as
-/// a different user) can read it.
+/// rename to `.ready`). The compatibility path uses mode 0o644; CAP-managed
+/// config uses group-readable 0o640 with the configured workload group.
 pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
+    write_ready_sentinel_with_options(config_dir, ConfigStoreOptions::default())
+}
+
+pub fn write_ready_sentinel_with_options(
+    config_dir: &Path,
+    options: ConfigStoreOptions,
+) -> Result<(), ConfigStoreError> {
     let ready_path = config_dir.join(".ready");
     if ready_path.exists() {
         return Ok(());
@@ -150,11 +218,12 @@ pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
     let content = format!("ready_at={unix_secs}\n");
 
     let tmp_path = config_dir.join(".ready.tmp");
+    let mode = options.ready_file_mode();
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o644)
+        .mode(mode)
         .open(&tmp_path)
         .map_err(|e| ConfigStoreError::Io(format!("write_ready_tmp:{e}")))?;
     file.write_all(content.as_bytes())
@@ -162,6 +231,7 @@ pub fn write_ready_sentinel(config_dir: &Path) -> Result<(), ConfigStoreError> {
     file.sync_all()
         .map_err(|e| ConfigStoreError::Io(format!("sync_ready:{e}")))?;
     drop(file);
+    apply_file_metadata(&tmp_path, options.file_gid, mode)?;
 
     fs::rename(&tmp_path, &ready_path)
         .map_err(|e| ConfigStoreError::Io(format!("rename_ready:{e}")))?;
@@ -257,6 +327,27 @@ mod tests {
     }
 
     #[test]
+    fn write_config_with_file_gid_makes_file_group_readable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = test_dir("write-config-gid");
+        let gid = unsafe { libc::getegid() } as u32;
+        write_config_with_options(
+            &dir,
+            "KEY",
+            b"val",
+            ConfigStoreOptions::with_file_gid(Some(gid)),
+        )
+        .unwrap();
+
+        let metadata = fs::metadata(dir.join("KEY")).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(metadata.gid(), gid);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_overwrites_existing() {
         let dir = test_dir("write-overwrite");
         write_config(&dir, "KEY", b"old").unwrap();
@@ -283,6 +374,22 @@ mod tests {
             let mode = fs::metadata(&ready_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o644, "sentinel file mode should be 0644");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_ready_sentinel_with_file_gid_makes_file_group_readable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = test_dir("write-ready-gid");
+        let gid = unsafe { libc::getegid() } as u32;
+        write_ready_sentinel_with_options(&dir, ConfigStoreOptions::with_file_gid(Some(gid)))
+            .unwrap();
+
+        let metadata = fs::metadata(dir.join(".ready")).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(metadata.gid(), gid);
         let _ = fs::remove_dir_all(&dir);
     }
 

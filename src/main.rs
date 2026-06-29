@@ -83,7 +83,13 @@ async fn main() {
     // immediately so bootstrap.sh does not block waiting for config that will never arrive (D-07).
     if state.config.cap_api_signing_pubkey.is_empty() {
         let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-        if let Err(e) = attestation_proxy::config_store::write_ready_sentinel(config_dir) {
+        let config_options = attestation_proxy::config_store::ConfigStoreOptions::with_file_gid(
+            state.config.cap_config_file_gid,
+        );
+        if let Err(e) = attestation_proxy::config_store::write_ready_sentinel_with_options(
+            config_dir,
+            config_options,
+        ) {
             eprintln!("{{\"event\":\"config_ready_sentinel_startup_failed\",\"error\":\"{e}\"}}");
         }
     }

@@ -2393,10 +2393,14 @@ pub async fn config_put(
     body: axum::body::Bytes,
 ) -> Response {
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    match crate::config_store::write_config(config_dir, &key, &body) {
+    let config_options =
+        crate::config_store::ConfigStoreOptions::with_file_gid(state.config.cap_config_file_gid);
+    match crate::config_store::write_config_with_options(config_dir, &key, &body, config_options) {
         Ok(()) => {
             // Write config-ready sentinel after first successful config write (CONF-04)
-            if let Err(e) = crate::config_store::write_ready_sentinel(config_dir) {
+            if let Err(e) =
+                crate::config_store::write_ready_sentinel_with_options(config_dir, config_options)
+            {
                 eprintln!("{{\"event\":\"config_ready_sentinel_failed\",\"error\":\"{e}\"}}");
             }
             spawn_config_metadata_sync(
