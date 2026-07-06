@@ -57,6 +57,7 @@ pub struct Config {
     pub cap_api_url: String,
     pub cap_config_dir: String,
     pub cap_config_file_gid: Option<u32>,
+    pub log_relay_url: String,
 }
 
 impl Config {
@@ -197,6 +198,10 @@ impl Config {
             cap_api_url: env_or("CAP_API_URL", ""),
             cap_config_dir: env_or("CAP_CONFIG_DIR", "/data/.enclava/config"),
             cap_config_file_gid: env_optional_u32("CAP_CONFIG_FILE_GID"),
+            log_relay_url: env_or(
+                "ENCLAVA_LOG_RELAY_URL",
+                "http://127.0.0.1:8082/.well-known/confidential/logs",
+            ),
         }
     }
 }
@@ -261,6 +266,7 @@ impl Config {
             cap_api_url: "".into(),
             cap_config_dir: "/data/.enclava/config".into(),
             cap_config_file_gid: None,
+            log_relay_url: "http://127.0.0.1:8082/.well-known/confidential/logs".into(),
         }
     }
 }
@@ -317,6 +323,7 @@ mod tests {
         "CAP_API_URL",
         "CAP_CONFIG_DIR",
         "CAP_CONFIG_FILE_GID",
+        "ENCLAVA_LOG_RELAY_URL",
     ];
 
     fn clear_env() {
@@ -378,6 +385,10 @@ mod tests {
         assert_eq!(config.enclava_init_unlock_socket, "");
         assert_eq!(config.enclava_init_ready_file, "/run/enclava/init-ready");
         assert_eq!(config.enclava_init_error_file, "/run/enclava/init-error");
+        assert_eq!(
+            config.log_relay_url,
+            "http://127.0.0.1:8082/.well-known/confidential/logs"
+        );
     }
 
     #[test]

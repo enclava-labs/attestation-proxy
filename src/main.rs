@@ -288,6 +288,10 @@ fn app_router(state: AppState, expose_config_routes: bool) -> Router {
         .route(
             "/.well-known/confidential/bootstrap/claim",
             post(handlers::bootstrap_claim),
+        )
+        .route(
+            "/.well-known/confidential/logs",
+            get(handlers::encrypted_logs),
         );
 
     let router = if expose_config_routes {
@@ -366,8 +370,10 @@ mod main {
         use attestation_proxy::ownership::OwnershipGuard;
         use attestation_proxy::receipts::ReceiptSigner;
         use attestation_proxy::AppState;
-        use axum::body::Body;
+        use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
         use tokio::sync::RwLock;
         use tower::ServiceExt;
 
@@ -395,6 +401,7 @@ mod main {
                 ))
                 .display()
                 .to_string();
+            config.log_relay_url = "http://127.0.0.1:9/.well-known/confidential/logs".to_string();
 
             let state = AppState {
                 config: Arc::new(config),
@@ -409,6 +416,34 @@ mod main {
             };
             state.ownership.set_unlocked();
             state
+        }
+
+        fn test_state_with_log_relay_url(log_relay_url: String) -> AppState {
+            let mut state = test_state();
+            Arc::get_mut(&mut state.config).unwrap().log_relay_url = log_relay_url;
+            state
+        }
+
+        async fn spawn_log_relay(
+            status: &'static str,
+            body: &'static str,
+        ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            (format!("http://{addr}/.well-known/confidential/logs"), rx)
         }
 
         #[test]
@@ -439,6 +474,7 @@ mod main {
             assert!(!guard.should_gate("/status"));
             assert!(!guard.should_gate("/health"));
             assert!(!guard.should_gate("/v1/attestation"));
+            assert!(!guard.should_gate("/.well-known/confidential/logs"));
             assert!(guard.should_gate("/cdh/resource/default/key/1"));
 
             assert!(guard.begin_unlock_attempt().is_ok());
@@ -509,6 +545,53 @@ mod main {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn tee_logs_route_proxies_encrypted_frames_and_query() {
+            let (relay_url, request_rx) =
+                spawn_log_relay("200 OK", "{\"ciphertext\":\"abc\"}\n").await;
+            let response = super::super::tls_router(test_state_with_log_relay_url(relay_url))
+                .oneshot(
+                    Request::builder()
+                        .uri("/.well-known/confidential/logs?tail_lines=7&container=web")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-enclava-log-format")
+                    .and_then(|value| value.to_str().ok()),
+                Some("encrypted-jsonl; version=enclava-log-frame-v1")
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], b"{\"ciphertext\":\"abc\"}\n");
+            let request = request_rx.await.unwrap();
+            assert!(request.starts_with(
+                "GET /.well-known/confidential/logs?tail_lines=7&container=web HTTP/1.1"
+            ));
+        }
+
+        #[tokio::test]
+        async fn tee_logs_route_preserves_upstream_not_ready_status() {
+            let (relay_url, _request_rx) =
+                spawn_log_relay("409 Conflict", "{\"error\":\"logs_not_ready\"}").await;
+            let response = super::super::tls_router(test_state_with_log_relay_url(relay_url))
+                .oneshot(
+                    Request::builder()
+                        .uri("/.well-known/confidential/logs")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
         }
     }
 }

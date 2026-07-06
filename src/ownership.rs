@@ -193,6 +193,7 @@ const ALLOWED_PATHS: &[&str] = &[
     "/.well-known/confidential/disable-auto-unlock",
     "/.well-known/confidential/bootstrap/challenge",
     "/.well-known/confidential/bootstrap/claim",
+    "/.well-known/confidential/logs",
     "/status",
     "/.well-known/confidential/status",
 ];

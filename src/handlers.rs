@@ -3,8 +3,8 @@
 /// All 6 GET endpoints with Python-identical response contracts.
 /// POST /unlock implements the ownership handoff protocol.
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, Response as HttpResponse};
+use axum::extract::{Path, Query, RawQuery, State};
+use axum::http::{header, HeaderValue, Response as HttpResponse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
@@ -2595,9 +2595,49 @@ pub async fn not_found(req: axum::extract::Request) -> Response {
         &json!({
             "error": "not_found",
             "path": path,
-            "supported_paths": ["/health", "/v1/attestation/info", "/v1/attestation", "/status"],
+            "supported_paths": ["/health", "/v1/attestation/info", "/v1/attestation", "/status", "/.well-known/confidential/logs"],
         }),
     )
+}
+
+/// GET /.well-known/confidential/logs -- proxy encrypted tenant log frames.
+///
+/// The TEE hostname routes to attestation-proxy so CAP can reach confidential
+/// control endpoints before tenant ingress is ready. The actual log relay runs
+/// in enclava-init on the shared pod loopback and returns encrypted frames only.
+pub async fn encrypted_logs(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    let mut url = state.config.log_relay_url.clone();
+    if let Some(query) = query.as_deref().filter(|query| !query.is_empty()) {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let upstream = match state.http_client.get(url).send().await {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            return json_response(502, &json!({"error": "encrypted_log_stream_unavailable"}));
+        }
+    };
+    let status = upstream.status();
+    if !status.is_success() {
+        return json_response(
+            status.as_u16(),
+            &json!({"error": "encrypted_log_stream_unavailable"}),
+        );
+    }
+
+    let mut response = HttpResponse::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap()
+        .into_response();
+    response.headers_mut().insert(
+        "x-enclava-log-format",
+        HeaderValue::from_static("encrypted-jsonl; version=enclava-log-frame-v1"),
+    );
+    response
 }
 
 #[cfg(test)]
