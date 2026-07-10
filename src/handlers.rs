@@ -2092,6 +2092,74 @@ pub async fn recover(
             )
         }
     };
+    let material = match load_owner_seed_material_with_revalidation(&state).await {
+        Ok(material) => material,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string()}),
+            )
+        }
+    };
+    let Some(current_encrypted) = material.encrypted.as_deref() else {
+        return json_response(
+            409,
+            &json!({"error": "recover_failed", "detail": "owner_seed_not_claimed"}),
+        );
+    };
+    let commitment = match state
+        .ownership
+        .owner_seed_public_key_commitment(current_encrypted)
+    {
+        Ok(commitment) => commitment,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string()}),
+            )
+        }
+    };
+    if let Some(expected_owner_public_key) = commitment {
+        let actual_owner_public_key = match state.ownership.owner_public_key_b64url(&owner_seed) {
+            Ok(owner_public_key) => owner_public_key,
+            Err(err) => {
+                return json_response(
+                    500,
+                    &json!({"error": "recover_failed", "detail": err.to_string()}),
+                )
+            }
+        };
+        if actual_owner_public_key != expected_owner_public_key {
+            return json_response(
+                400,
+                &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
+            );
+        }
+    } else {
+        if state.ownership.is_unlocked() {
+            return json_response(
+                409,
+                &json!({
+                    "error": "recover_verification_unavailable",
+                    "detail": "legacy_owner_seed_commitment_missing_restart_required"
+                }),
+            );
+        }
+        if let Err(err) = unlock_owner_seed_material(&state, &owner_seed).await {
+            if matches!(err, OwnershipError::WrongPassword) {
+                state.ownership.set_locked_after_retry();
+                return json_response(
+                    400,
+                    &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
+                );
+            }
+            state.ownership.set_error(err.to_string());
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}),
+            );
+        }
+    }
     let mut new_password = take_secret_bytes(&mut payload.new_password);
     let wrap_key = match state
         .ownership
@@ -3897,6 +3965,61 @@ mod tests {
         );
         assert_eq!(
             decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_valid_wrong_mnemonic_without_replacing_envelope() {
+        let signal_dir = test_signal_dir("recover-valid-wrong-mnemonic");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-valid-wrong-mnemonic-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "initial-password").await;
+        let before = api_server.secret_json();
+        let before_encrypted =
+            decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted before recover");
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+                        .to_string(),
+                ),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"})
+        );
+
+        let after = api_server.secret_json();
+        let after_encrypted =
+            decode_secret_field(&after, "seed-encrypted").expect("seed-encrypted after recover");
+        assert_eq!(after_encrypted, before_encrypted);
+        let _ = decrypt_owner_seed_with_password(&state, &after_encrypted, "initial-password");
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &after_encrypted, "recovered-password"),
             Err(OwnershipError::WrongPassword)
         );
     }

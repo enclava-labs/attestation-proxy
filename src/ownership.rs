@@ -127,6 +127,8 @@ struct OwnerSeedEnvelope {
     version: String,
     nonce: String,
     ciphertext: String,
+    #[serde(default)]
+    owner_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,12 +466,41 @@ impl OwnershipGuard {
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
+        let owner_public_key = self.owner_public_key_b64url(owner_seed)?;
         serde_json::to_vec(&json!({
             "version": OWNER_SEED_ENVELOPE_VERSION,
             "nonce": BASE64_STANDARD.encode(nonce_bytes),
             "ciphertext": BASE64_STANDARD.encode(ciphertext),
+            "owner_public_key": owner_public_key,
         }))
         .map_err(|err| OwnershipError::Envelope(err.to_string()))
+    }
+
+    pub fn owner_seed_public_key_commitment(
+        &self,
+        envelope_bytes: &[u8],
+    ) -> Result<Option<String>, OwnershipError> {
+        let envelope: OwnerSeedEnvelope = serde_json::from_slice(envelope_bytes)
+            .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
+        if envelope.version != OWNER_SEED_ENVELOPE_VERSION {
+            return Err(OwnershipError::Envelope(format!(
+                "unsupported_owner_seed_version:{}",
+                envelope.version
+            )));
+        }
+        let Some(owner_public_key) = envelope.owner_public_key else {
+            return Ok(None);
+        };
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(owner_public_key.as_bytes())
+            .map_err(|err| OwnershipError::Envelope(format!("owner_public_key_invalid:{err}")))?;
+        if decoded.len() != 32 {
+            return Err(OwnershipError::Envelope(format!(
+                "owner_public_key_length_invalid:{}",
+                decoded.len()
+            )));
+        }
+        Ok(Some(owner_public_key))
     }
 
     pub fn derive_owner_volume_keys(
@@ -1203,6 +1234,27 @@ mod tests {
                 .poll_password_handoff_result(1)
                 .expect("password handoff result"),
             HandoffOutcome::Unlocked
+        );
+    }
+
+    #[test]
+    fn encrypted_owner_seed_carries_public_key_commitment() {
+        let guard = OwnershipGuard::new("password".to_string());
+        let owner_seed = [0x2a; 32];
+        let wrap_key = [0x4b; 32];
+        let encrypted = guard
+            .encrypt_owner_seed(&owner_seed, &wrap_key)
+            .expect("encrypt owner seed");
+
+        assert_eq!(
+            guard
+                .owner_seed_public_key_commitment(&encrypted)
+                .expect("read owner public key commitment"),
+            Some(
+                guard
+                    .owner_public_key_b64url(&owner_seed)
+                    .expect("derive owner public key")
+            )
         );
     }
 
