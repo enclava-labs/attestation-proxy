@@ -503,6 +503,23 @@ impl OwnershipGuard {
         Ok(Some(owner_public_key))
     }
 
+    pub fn add_owner_seed_public_key_commitment(
+        &self,
+        envelope_bytes: &[u8],
+        owner_seed: &[u8; 32],
+    ) -> Result<Vec<u8>, OwnershipError> {
+        let mut envelope: serde_json::Value = serde_json::from_slice(envelope_bytes)
+            .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
+        let object = envelope.as_object_mut().ok_or_else(|| {
+            OwnershipError::Envelope("owner_seed_envelope_not_object".to_string())
+        })?;
+        object.insert(
+            "owner_public_key".to_string(),
+            serde_json::Value::String(self.owner_public_key_b64url(owner_seed)?),
+        );
+        serde_json::to_vec(&envelope).map_err(|err| OwnershipError::Envelope(err.to_string()))
+    }
+
     pub fn derive_owner_volume_keys(
         &self,
         owner_seed: &[u8; 32],
