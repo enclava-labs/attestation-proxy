@@ -741,6 +741,15 @@ impl OwnershipGuard {
         self.clear_slot_handoff_files(slots, &[SIGNAL_KEY_FILE, SIGNAL_ERROR_FILE])
     }
 
+    pub fn any_password_handoff_slot_unlocked(&self, slots: &[&str]) -> bool {
+        slots.iter().any(|slot| {
+            self.signal_dir
+                .join(slot)
+                .join(SIGNAL_UNLOCKED_FILE)
+                .exists()
+        })
+    }
+
     pub fn poll_handoff_result(&self, timeout_secs: u64) -> Result<HandoffOutcome, OwnershipError> {
         let timeout = if timeout_secs == 0 {
             Duration::from_secs(HANDOFF_DEFAULT_TIMEOUT_SECONDS)

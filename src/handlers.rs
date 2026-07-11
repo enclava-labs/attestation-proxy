@@ -1546,6 +1546,19 @@ async fn persist_owner_seed_commitment(
     .await
 }
 
+async fn legacy_owner_seed_can_be_verified(state: &AppState) -> Result<bool, OwnershipError> {
+    if state.ownership.is_unlocked() {
+        return Ok(false);
+    }
+    if !state.config.enclava_init_unlock_socket.trim().is_empty() {
+        return enclava_init_ready_file_is_ready(state)
+            .await
+            .map(|ready| !ready);
+    }
+    let slots = owner_seed_handoff_slots(state);
+    Ok(!state.ownership.any_password_handoff_slot_unlocked(&slots))
+}
+
 fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> Response {
     match outcome {
         HandoffOutcome::Unlocked => {
@@ -2167,13 +2180,38 @@ pub async fn recover(
             );
         }
     } else {
-        return json_response(
-            409,
-            &json!({
-                "error": "recover_verification_unavailable",
-                "detail": "legacy_owner_seed_commitment_missing_unlock_required"
-            }),
-        );
+        match legacy_owner_seed_can_be_verified(&state).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return json_response(
+                    409,
+                    &json!({
+                        "error": "recover_verification_unavailable",
+                        "detail": "legacy_owner_seed_commitment_missing_locked_verifier_required"
+                    }),
+                )
+            }
+            Err(err) => {
+                return json_response(
+                    500,
+                    &json!({"error": "recover_failed", "detail": err.to_string()}),
+                )
+            }
+        }
+        if let Err(err) = unlock_owner_seed_material(&state, &owner_seed).await {
+            if matches!(err, OwnershipError::WrongPassword) {
+                state.ownership.set_locked_after_retry();
+                return json_response(
+                    400,
+                    &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
+                );
+            }
+            state.ownership.set_error(err.to_string());
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}),
+            );
+        }
     }
     let mut new_password = take_secret_bytes(&mut payload.new_password);
     let wrap_key = match state
@@ -4088,7 +4126,7 @@ mod tests {
             read_json(response).await,
             json!({
                 "error": "recover_verification_unavailable",
-                "detail": "legacy_owner_seed_commitment_missing_unlock_required"
+                "detail": "legacy_owner_seed_commitment_missing_locked_verifier_required"
             })
         );
         assert_eq!(
@@ -4097,6 +4135,65 @@ mod tests {
                 .expect("legacy owner seed resource after recover"),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn recover_legacy_envelope_uses_locked_init_verifier_before_rewrap() {
+        let signal_dir = test_signal_dir("recover-legacy-locked-verifier");
+        let owner_seed = [0x2c; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            line
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            socket_task.await.expect("socket task").trim_end(),
+            format!(
+                "owner-seed-v1:{}",
+                BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+            )
+        );
+        let encrypted = kbs_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .expect("owner seed resource after recover");
+        let _ =
+            decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password");
+        assert!(state
+            .ownership
+            .owner_seed_public_key_commitment(encrypted.as_bytes())
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
