@@ -624,7 +624,7 @@ impl OwnershipGuard {
         keys: &OwnerVolumeKeys,
         slots: &[&str],
     ) -> Result<(), OwnershipError> {
-        self.clear_password_handoff_key_files_for_slots(slots)?;
+        self.clear_password_handoff_retry_files_for_slots(slots)?;
         for slot in slots {
             match *slot {
                 SIGNAL_APP_DATA_SLOT => self.write_slot_handoff_key(slot, &keys.app_data)?,
