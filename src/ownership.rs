@@ -624,7 +624,7 @@ impl OwnershipGuard {
         keys: &OwnerVolumeKeys,
         slots: &[&str],
     ) -> Result<(), OwnershipError> {
-        self.clear_password_handoff_retry_files_for_slots(slots)?;
+        self.clear_password_handoff_key_files_for_slots(slots)?;
         for slot in slots {
             match *slot {
                 SIGNAL_APP_DATA_SLOT => self.write_slot_handoff_key(slot, &keys.app_data)?,
@@ -701,15 +701,6 @@ impl OwnershipGuard {
         slots: &[&str],
     ) -> Result<(), OwnershipError> {
         self.clear_slot_handoff_files(slots, &[SIGNAL_KEY_FILE, SIGNAL_ERROR_FILE])
-    }
-
-    pub fn any_password_handoff_slot_unlocked(&self, slots: &[&str]) -> bool {
-        slots.iter().any(|slot| {
-            self.signal_dir
-                .join(slot)
-                .join(SIGNAL_UNLOCKED_FILE)
-                .exists()
-        })
     }
 
     pub fn poll_handoff_result(&self, timeout_secs: u64) -> Result<HandoffOutcome, OwnershipError> {
@@ -872,10 +863,6 @@ impl OwnershipGuard {
 
     pub fn is_unlocked(&self) -> bool {
         matches!(self.current_state(), OwnershipState::Unlocked)
-    }
-
-    pub fn is_locked(&self) -> bool {
-        matches!(self.current_state(), OwnershipState::Locked)
     }
 
     pub fn auto_unlock_enabled(&self) -> bool {

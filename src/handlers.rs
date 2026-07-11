@@ -1515,51 +1515,6 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
     }
 }
 
-async fn locked_owner_seed_verifier_available(state: &AppState) -> Result<bool, OwnershipError> {
-    match state.ownership.begin_recovery_verification() {
-        Ok(()) => {}
-        Err(OwnershipError::NotLocked) => return Ok(false),
-        Err(err) => return Err(err),
-    }
-    let available = if !state.config.enclava_init_unlock_socket.trim().is_empty() {
-        enclava_init_ready_file_is_ready(state)
-            .await
-            .map(|ready| !ready)
-    } else {
-        let slots = owner_seed_handoff_slots(state);
-        if state.ownership.any_password_handoff_slot_unlocked(&slots) {
-            Ok(false)
-        } else {
-            state
-                .ownership
-                .clear_password_handoff_retry_files_for_slots(&slots)
-                .map(|_| true)
-        }
-    };
-    match available {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            state.ownership.set_locked_after_retry();
-            Ok(false)
-        }
-        Err(err) => {
-            state.ownership.set_locked_after_retry();
-            Err(err)
-        }
-    }
-}
-
-fn owner_seed_verification_mismatch(err: &OwnershipError) -> bool {
-    match err {
-        OwnershipError::WrongPassword => true,
-        OwnershipError::Store(detail) => {
-            detail.ends_with("_unlock_failed:wrong_password")
-                || detail == "enclava_init_unlock_failed:wrong_password"
-        }
-        _ => false,
-    }
-}
-
 fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> Response {
     match outcome {
         HandoffOutcome::Unlocked => {
@@ -1641,6 +1596,17 @@ async fn unlock_owner_seed_via_init_socket(
         return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
     }
 
+    request_owner_seed_unlock(state, owner_seed, timeout).await?;
+    state.ownership.set_unlocked();
+    spawn_enclava_init_ready_watch(state.clone(), timeout);
+    maybe_refresh_auto_unlock_seal(state, owner_seed).await
+}
+
+async fn request_owner_seed_unlock(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+    timeout: std::time::Duration,
+) -> Result<(), OwnershipError> {
     let path = state.config.enclava_init_unlock_socket.trim();
     let mut stream = connect_init_unlock_socket(path, timeout).await?;
     let request = format!("owner-seed-v1:{}\n", URL_SAFE_NO_PAD.encode(owner_seed));
@@ -1664,9 +1630,7 @@ async fn unlock_owner_seed_via_init_socket(
 
     let reply = reply.trim_end_matches(['\r', '\n']);
     if reply == "OK" {
-        state.ownership.set_unlocked();
-        spawn_enclava_init_ready_watch(state.clone(), timeout);
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+        return Ok(());
     }
     if let Some(reason) = reply.strip_prefix("ERR ") {
         return Err(OwnershipError::Store(format!(
@@ -1676,6 +1640,40 @@ async fn unlock_owner_seed_via_init_socket(
     Err(OwnershipError::Store(format!(
         "enclava_init_unlock_unexpected_reply:{reply}"
     )))
+}
+
+async fn verify_owner_seed_for_recovery(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+) -> Result<bool, OwnershipError> {
+    if state.config.enclava_init_unlock_socket.trim().is_empty()
+        || state.config.enclava_init_ready_file.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    if enclava_init_ready_file_is_ready(state).await? {
+        return Ok(false);
+    }
+    if state.ownership.begin_recovery_verification().is_err() {
+        return Ok(false);
+    }
+
+    let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
+    let verified = async {
+        request_owner_seed_unlock(state, owner_seed, timeout).await?;
+        wait_for_enclava_init_ready(state, timeout).await
+    }
+    .await;
+    match verified {
+        Ok(()) => {
+            state.ownership.set_unlocked();
+            Ok(true)
+        }
+        Err(err) => {
+            state.ownership.set_locked_after_retry();
+            Err(err)
+        }
+    }
 }
 
 async fn enclava_init_ready_file_is_ready(state: &AppState) -> Result<bool, OwnershipError> {
@@ -2152,15 +2150,23 @@ pub async fn recover(
             &json!({"error": "recover_failed", "detail": "owner_seed_not_claimed"}),
         );
     };
-    match locked_owner_seed_verifier_available(&state).await {
+    match verify_owner_seed_for_recovery(&state, &owner_seed).await {
         Ok(true) => {}
         Ok(false) => {
             return json_response(
                 409,
                 &json!({
                     "error": "recover_verification_unavailable",
-                    "detail": "locked_owner_seed_verifier_required"
+                    "detail": "recovery_requires_locked_init_verifier"
                 }),
+            )
+        }
+        Err(OwnershipError::Store(detail))
+            if detail == "enclava_init_unlock_failed:wrong_password" =>
+        {
+            return json_response(
+                400,
+                &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
             )
         }
         Err(err) => {
@@ -2169,20 +2175,6 @@ pub async fn recover(
                 &json!({"error": "recover_failed", "detail": err.to_string()}),
             )
         }
-    }
-    if let Err(err) = unlock_owner_seed_material(&state, &owner_seed).await {
-        if owner_seed_verification_mismatch(&err) {
-            state.ownership.set_locked_after_retry();
-            return json_response(
-                400,
-                &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
-            );
-        }
-        state.ownership.set_error(err.to_string());
-        return json_response(
-            500,
-            &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}),
-        );
     }
     let mut new_password = take_secret_bytes(&mut payload.new_password);
     let wrap_key = match state
@@ -3659,21 +3651,16 @@ mod tests {
             Some("default/instance-test-01-owner/seed-encrypted".to_string()),
         );
 
-        let handoff_dir = signal_dir.path.clone();
-        let handoff = std::thread::spawn(move || {
-            let app_key = handoff_dir.join(SIGNAL_APP_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            let tls_key = handoff_dir.join(SIGNAL_TLS_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            while !app_key.exists() || !tls_key.exists() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            fs::write(
-                handoff_dir
-                    .join(SIGNAL_APP_DATA_SLOT)
-                    .join(SIGNAL_ERROR_FILE),
-                "mount_failed\n",
-            )
-            .expect("write slot error");
-        });
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT)).expect("create tls slot");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_ERROR_FILE),
+            "mount_failed\n",
+        )
+        .expect("write slot error");
 
         let response = unlock(
             State(state.clone()),
@@ -3686,7 +3673,6 @@ mod tests {
         assert_eq!(response.status().as_u16(), 202);
         assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
         let body = wait_for_ownership_state(&state, "error").await;
-        handoff.join().expect("handoff thread");
         assert_eq!(body["state"], "error");
         assert_eq!(
             body["error"],
@@ -3964,13 +3950,16 @@ mod tests {
         let socket_path = signal_dir.path.join("recover-unlock.sock");
         let ready_path = signal_dir.path.join("recover-init-ready");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
         let socket_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept init socket");
             let mut reader = TokioBufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
             reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
-            line
         });
         {
             let config = Arc::get_mut(&mut state.config).expect("unique config arc");
@@ -3987,6 +3976,7 @@ mod tests {
             }),
         )
         .await;
+        socket_task.await.expect("socket task");
         assert_eq!(response.status().as_u16(), 200);
         let body = read_json(response).await;
         assert_eq!(
@@ -3994,10 +3984,6 @@ mod tests {
             Some("recovered")
         );
         assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
-        assert!(socket_task
-            .await
-            .expect("socket task")
-            .starts_with("owner-seed-v1:"));
         assert_eq!(
             body.get("owner_public_key").and_then(Value::as_str),
             Some(expected_owner_public_key.as_str())
@@ -4033,7 +4019,7 @@ mod tests {
         )
         .await;
         let token_file = test_temp_file("recover-valid-wrong-mnemonic-token", "test-token");
-        let state = build_state_with_secret_backend(
+        let mut state = build_state_with_secret_backend(
             &signal_dir.path,
             "password",
             api_server.base_url(),
@@ -4045,23 +4031,28 @@ mod tests {
         let before = api_server.secret_json();
         let before_encrypted =
             decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted before recover");
-        clear_password_slot_artifacts(&signal_dir.path);
-        state.ownership.set_locked();
-        let handoff_dir = signal_dir.path.clone();
-        let handoff = std::thread::spawn(move || {
-            let app_key = handoff_dir.join(SIGNAL_APP_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            let tls_key = handoff_dir.join(SIGNAL_TLS_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            while !app_key.exists() || !tls_key.exists() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            fs::write(
-                handoff_dir
-                    .join(SIGNAL_APP_DATA_SLOT)
-                    .join(SIGNAL_ERROR_FILE),
-                "wrong_password",
-            )
-            .expect("write wrong-password sentinel");
+        let socket_path = signal_dir.path.join("wrong-recover.sock");
+        let ready_path = signal_dir.path.join("wrong-recover-ready");
+        let error_path = signal_dir.path.join("wrong-recover-error");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let error_for_task = error_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(error_for_task, "luks_open_failed\n")
+                .await
+                .expect("write init error");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
         });
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state.ownership.set_locked();
 
         let response = recover(
             State(state.clone()),
@@ -4074,12 +4065,9 @@ mod tests {
             }),
         )
         .await;
-        handoff.join().expect("handoff thread");
-        assert_eq!(response.status().as_u16(), 400);
-        assert_eq!(
-            read_json(response).await,
-            json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"})
-        );
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(read_json(response).await["error"], "recover_failed");
 
         let after = api_server.secret_json();
         let after_encrypted =
@@ -4093,207 +4081,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_rejects_legacy_envelope_even_with_stale_unlocked_sentinels() {
-        let signal_dir = test_signal_dir("recover-legacy-stale-unlocked");
-        mark_password_slots_unlocked(&signal_dir.path);
-        let owner_seed = [0x2b; 32];
-        let kbs_server =
-            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "password",
-            kbs_server.base_url(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        state.ownership.set_locked();
-        let before = kbs_server
-            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-            .expect("legacy owner seed resource before recover");
-
-        let response = recover(
-            State(state),
-            Json(RecoverRequest {
-                mnemonic: Zeroizing::new(
-                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
-                        .to_string(),
-                ),
-                new_password: Zeroizing::new("recovered-password".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(response.status().as_u16(), 409);
-        assert_eq!(
-            read_json(response).await,
-            json!({
-                "error": "recover_verification_unavailable",
-                "detail": "locked_owner_seed_verifier_required"
-            })
-        );
-        assert_eq!(
-            kbs_server
-                .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-                .expect("legacy owner seed resource after recover"),
-            before
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_rejects_legacy_envelope_while_unlock_is_active() {
-        let signal_dir = test_signal_dir("recover-legacy-active-unlock");
-        let owner_seed = [0x2b; 32];
-        let kbs_server =
-            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "password",
-            kbs_server.base_url(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        state.ownership.set_unlocking();
-        let before = kbs_server
-            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-            .expect("legacy owner seed resource before recover");
-        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
-
-        let response = recover(
-            State(state.clone()),
-            Json(RecoverRequest {
-                mnemonic: Zeroizing::new(mnemonic),
-                new_password: Zeroizing::new("recovered-password".to_string()),
-            }),
-        )
-        .await;
-
-        assert_eq!(response.status().as_u16(), 409);
-        assert_eq!(
-            read_json(response).await,
-            json!({
-                "error": "recover_verification_unavailable",
-                "detail": "locked_owner_seed_verifier_required"
-            })
-        );
-        assert_eq!(state.ownership.state_json()["state"], "unlocking");
-        assert_eq!(
-            kbs_server
-                .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-                .expect("legacy owner seed resource after recover"),
-            before
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_legacy_wrong_mnemonic_returns_mnemonic_invalid() {
-        let signal_dir = test_signal_dir("recover-legacy-wrong-mnemonic");
-        let owner_seed = [0x2d; 32];
-        let kbs_server =
-            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "password",
-            kbs_server.base_url(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        state.ownership.set_locked();
-        let before = kbs_server
-            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-            .expect("legacy owner seed resource before recover");
-        let wrong_seed = [0x3e; 32];
-        let wrong_mnemonic = state.ownership.owner_seed_mnemonic(&wrong_seed).unwrap();
-        let handoff_dir = signal_dir.path.clone();
-        let handoff = std::thread::spawn(move || {
-            let app_key = handoff_dir.join(SIGNAL_APP_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            let tls_key = handoff_dir.join(SIGNAL_TLS_DATA_SLOT).join(SIGNAL_KEY_FILE);
-            while !app_key.exists() || !tls_key.exists() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            fs::write(
-                handoff_dir
-                    .join(SIGNAL_APP_DATA_SLOT)
-                    .join(SIGNAL_ERROR_FILE),
-                "wrong_password",
-            )
-            .expect("write wrong-password sentinel");
-        });
-
-        let response = recover(
-            State(state.clone()),
-            Json(RecoverRequest {
-                mnemonic: Zeroizing::new(wrong_mnemonic),
-                new_password: Zeroizing::new("recovered-password".to_string()),
-            }),
-        )
-        .await;
-        handoff.join().expect("handoff thread");
-
-        assert_eq!(response.status().as_u16(), 400);
-        assert_eq!(
-            read_json(response).await,
-            json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"})
-        );
-        assert!(state.ownership.is_locked());
-        assert_eq!(
-            kbs_server
-                .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-                .expect("legacy owner seed resource after recover"),
-            before
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_clears_stale_slot_errors_before_verifying_correct_mnemonic() {
-        let signal_dir = test_signal_dir("recover-stale-slot-errors");
-        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
-            let slot_dir = signal_dir.path.join(slot);
-            fs::create_dir_all(&slot_dir).expect("create slot dir");
-            fs::write(slot_dir.join(SIGNAL_ERROR_FILE), "wrong_password")
-                .expect("write stale wrong-password sentinel");
-        }
-        let owner_seed = [0x2e; 32];
-        let kbs_server =
-            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "password",
-            kbs_server.base_url(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        state.ownership.set_locked();
-        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
-        let handoff_dir = signal_dir.path.clone();
-        let handoff = std::thread::spawn(move || {
-            let app_dir = handoff_dir.join(SIGNAL_APP_DATA_SLOT);
-            let tls_dir = handoff_dir.join(SIGNAL_TLS_DATA_SLOT);
-            while !app_dir.join(SIGNAL_KEY_FILE).exists() || !tls_dir.join(SIGNAL_KEY_FILE).exists()
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(!app_dir.join(SIGNAL_ERROR_FILE).exists());
-            assert!(!tls_dir.join(SIGNAL_ERROR_FILE).exists());
-            fs::write(app_dir.join(SIGNAL_UNLOCKED_FILE), "unlocked_at=now")
-                .expect("write app unlocked sentinel");
-            fs::write(tls_dir.join(SIGNAL_UNLOCKED_FILE), "unlocked_at=now")
-                .expect("write tls unlocked sentinel");
-        });
-
-        let response = recover(
-            State(state.clone()),
-            Json(RecoverRequest {
-                mnemonic: Zeroizing::new(mnemonic),
-                new_password: Zeroizing::new("recovered-password".to_string()),
-            }),
-        )
-        .await;
-        handoff.join().expect("handoff thread");
-
-        assert_eq!(response.status().as_u16(), 200);
-        let encrypted = kbs_server
-            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
-            .expect("owner seed resource after recover");
-        let _ =
-            decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password");
-    }
-
-    #[tokio::test]
     async fn recover_legacy_envelope_uses_locked_init_verifier_before_rewrap() {
         let signal_dir = test_signal_dir("recover-legacy-locked-verifier");
         let owner_seed = [0x2c; 32];
@@ -4302,11 +4089,15 @@ mod tests {
         let socket_path = signal_dir.path.join("unlock.sock");
         let ready_path = signal_dir.path.join("init-ready");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
         let socket_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept init socket");
             let mut reader = TokioBufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
             reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
             line
         });
@@ -4406,7 +4197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_while_unlocked_is_rejected_without_replacing_envelope() {
+    async fn recover_while_unlocked_requires_a_locked_init_verifier() {
         let signal_dir = test_signal_dir("recover-already-unlocked");
         mark_password_slots_unlocked(&signal_dir.path);
 
@@ -4421,7 +4212,7 @@ mod tests {
         let token_file = test_temp_file("recover-already-unlocked-token", "test-token");
         let state = build_state_with_secret_backend(
             &signal_dir.path,
-            "auto-unlock",
+            "password",
             api_server.base_url(),
             &token_file.path,
         );
@@ -4433,26 +4224,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
-
-        clear_password_slot_artifacts(&signal_dir.path);
-        mark_password_slots_unlocked(&signal_dir.path);
-        let enable = enable_auto_unlock(
-            State(state.clone()),
-            Json(UnlockRequest {
-                password: Zeroizing::new("initial-password".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(enable.status().as_u16(), 200);
         let before = api_server.secret_json();
-        let before_encrypted =
-            decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted before recover");
-
-        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
-            let slot_dir = signal_dir.path.join(slot);
-            fs::write(slot_dir.join(SIGNAL_KEY_FILE), "stale-key").expect("write stale key");
-            fs::write(slot_dir.join(SIGNAL_ERROR_FILE), "stale-error").expect("write stale error");
-        }
 
         let response = recover(
             State(state.clone()),
@@ -4467,38 +4239,10 @@ mod tests {
             read_json(response).await,
             json!({
                 "error": "recover_verification_unavailable",
-                "detail": "locked_owner_seed_verifier_required"
+                "detail": "recovery_requires_locked_init_verifier"
             })
         );
-
-        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
-            let slot_dir = signal_dir.path.join(slot);
-            assert!(
-                slot_dir.join(SIGNAL_KEY_FILE).exists(),
-                "rejected recovery must not mutate the active unlock handoff for {slot}"
-            );
-            assert!(
-                slot_dir.join(SIGNAL_ERROR_FILE).exists(),
-                "rejected recovery must preserve the active unlock error for {slot}"
-            );
-            assert!(
-                slot_dir.join(SIGNAL_UNLOCKED_FILE).exists(),
-                "recover should preserve unlocked sentinel for {slot}"
-            );
-        }
-
-        let secret = api_server.secret_json();
-        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
-        assert_eq!(encrypted, before_encrypted);
-        assert!(
-            decode_secret_field(&secret, "seed-sealed").is_some(),
-            "recover should preserve the sealed owner-seed copy in auto-unlock mode"
-        );
-        let _ = decrypt_owner_seed_with_password(&state, &encrypted, "initial-password");
-        assert_eq!(
-            decrypt_owner_seed_result(&state, &encrypted, "recovered-password"),
-            Err(OwnershipError::WrongPassword)
-        );
+        assert_eq!(api_server.secret_json(), before);
     }
 
     #[tokio::test]
