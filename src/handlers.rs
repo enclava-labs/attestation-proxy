@@ -1681,6 +1681,12 @@ async fn verify_owner_seed_for_recovery(
             spawn_recovery_init_ready_watch(state.clone(), timeout);
             Err(OwnershipError::Timeout)
         }
+        Err(OwnershipError::Store(detail))
+            if detail.starts_with("enclava_init_ready_file_read_failed:")
+                || detail.starts_with("enclava_init_error_file_read_failed:") =>
+        {
+            Err(OwnershipError::UnlockAmbiguous(detail))
+        }
         Err(err) => {
             if restore_unclaimed_on_failure {
                 state.ownership.restore_unclaimed_after_recovery_failure();
@@ -3412,6 +3418,48 @@ mod tests {
         assert!(err
             .to_string()
             .contains("enclava_init_failed:waiting for workload containers failed"));
+    }
+
+    #[tokio::test]
+    async fn recovery_ready_observation_failure_stays_reserved() {
+        let signal_dir = test_signal_dir("recover-ready-observation-failure");
+        let owner_seed = [0x35; 32];
+        let socket_path = signal_dir.path.join("recover-ready-observation.sock");
+        let ready_path = signal_dir.path.join("recover-ready-observation-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::create_dir(ready_for_task)
+                .await
+                .expect("replace missing ready file with directory");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            // Reading a directory as the ready sentinel produces a deterministic
+            // observation error after init has acknowledged the seed.
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        let err = verify_owner_seed_for_recovery(&state, &owner_seed, false)
+            .await
+            .expect_err("ready observation failure must be ambiguous");
+
+        socket_task.await.expect("socket task");
+        assert!(matches!(err, OwnershipError::UnlockAmbiguous(_)));
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
     }
 
     #[tokio::test]
