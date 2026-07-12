@@ -1611,19 +1611,21 @@ async fn request_owner_seed_unlock(
     let mut stream = connect_init_unlock_socket(path, timeout).await?;
     let request = format!("owner-seed-v1:{}\n", URL_SAFE_NO_PAD.encode(owner_seed));
     stream.write_all(request.as_bytes()).await.map_err(|err| {
-        OwnershipError::Store(format!("enclava_init_unlock_socket_write_failed:{err}"))
+        OwnershipError::UnlockAmbiguous(format!("enclava_init_unlock_socket_write_failed:{err}"))
     })?;
 
     let mut reader = TokioBufReader::new(stream);
     let mut reply = String::new();
     let read = tokio::time::timeout(timeout, reader.read_line(&mut reply))
         .await
-        .map_err(|_| OwnershipError::Timeout)?
+        .map_err(|_| {
+            OwnershipError::UnlockAmbiguous("enclava_init_unlock_socket_read_timeout".to_string())
+        })?
         .map_err(|err| {
-            OwnershipError::Store(format!("enclava_init_unlock_socket_read_failed:{err}"))
+            OwnershipError::UnlockAmbiguous(format!("enclava_init_unlock_socket_read_failed:{err}"))
         })?;
     if read == 0 {
-        return Err(OwnershipError::Store(
+        return Err(OwnershipError::UnlockAmbiguous(
             "enclava_init_unlock_socket_closed".to_string(),
         ));
     }
@@ -1645,6 +1647,7 @@ async fn request_owner_seed_unlock(
 async fn verify_owner_seed_for_recovery(
     state: &AppState,
     owner_seed: &[u8; 32],
+    restore_unclaimed_on_failure: bool,
 ) -> Result<bool, OwnershipError> {
     if state.config.enclava_init_unlock_socket.trim().is_empty()
         || state.config.enclava_init_ready_file.trim().is_empty()
@@ -1660,7 +1663,13 @@ async fn verify_owner_seed_for_recovery(
 
     let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
     if let Err(err) = request_owner_seed_unlock(state, owner_seed, timeout).await {
-        state.ownership.set_locked_after_retry();
+        if !matches!(err, OwnershipError::UnlockAmbiguous(_)) {
+            if restore_unclaimed_on_failure {
+                state.ownership.restore_unclaimed_after_recovery_failure();
+            } else {
+                state.ownership.set_locked_after_retry();
+            }
+        }
         return Err(err);
     }
 
@@ -1673,7 +1682,11 @@ async fn verify_owner_seed_for_recovery(
             Err(OwnershipError::Timeout)
         }
         Err(err) => {
-            state.ownership.set_locked_after_retry();
+            if restore_unclaimed_on_failure {
+                state.ownership.restore_unclaimed_after_recovery_failure();
+            } else {
+                state.ownership.set_locked_after_retry();
+            }
             Err(err)
         }
     }
@@ -2185,16 +2198,16 @@ pub async fn recover(
     };
 
     let restore_unclaimed_on_verification_failure = state.ownership.is_unclaimed() && !had_envelope;
-    if state.ownership.is_unclaimed() {
-        state.ownership.set_locked();
-    }
 
-    match verify_owner_seed_for_recovery(&state, &owner_seed).await {
+    match verify_owner_seed_for_recovery(
+        &state,
+        &owner_seed,
+        restore_unclaimed_on_verification_failure,
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
-            if restore_unclaimed_on_verification_failure {
-                state.ownership.set_unclaimed();
-            }
             return json_response(
                 409,
                 &json!({
@@ -2206,18 +2219,25 @@ pub async fn recover(
         Err(OwnershipError::Store(detail))
             if detail == "enclava_init_unlock_failed:wrong_password" =>
         {
-            if restore_unclaimed_on_verification_failure {
-                state.ownership.set_unclaimed();
-            }
             return json_response(
                 400,
                 &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
             );
         }
+        Err(OwnershipError::UnlockAmbiguous(detail)) => {
+            state
+                .ownership
+                .set_error("recovery_verification_ambiguous_restart_required");
+            return json_response(
+                500,
+                &json!({
+                    "error": "recover_failed",
+                    "detail": detail,
+                    "retry": "restart_required"
+                }),
+            );
+        }
         Err(err) => {
-            if restore_unclaimed_on_verification_failure && !state.ownership.is_unlocking() {
-                state.ownership.set_unclaimed();
-            }
             return json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string()}),
@@ -4352,6 +4372,67 @@ mod tests {
         assert_eq!(
             state.ownership.state_json()["error"],
             "recovery_persistence_requires_restart"
+        );
+        assert_eq!(api_server.kbs_resource(resource_path), Some(old_encrypted));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_socket_close_requires_restart() {
+        let signal_dir = test_signal_dir("recover-ambiguous-socket");
+        let owner_seed = [0x34; 32];
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let old_encrypted =
+            owner_seed_envelope_json(owner_seed, "initial-password", "instance-test-01");
+        let mut resources = HashMap::new();
+        resources.insert(resource_path.to_string(), old_encrypted.clone());
+        let api_server =
+            spawn_test_api_server(owner_escrow_secret_json(None, None), json!({}), resources).await;
+
+        let socket_path = signal_dir.path.join("recover-ambiguous-socket.sock");
+        let ready_path = signal_dir.path.join("recover-ambiguous-socket-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            // Drop the connection without a response after consuming the seed.
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["retry"], "restart_required");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("enclava_init_unlock_socket_closed"));
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert_eq!(
+            state.ownership.state_json()["error"],
+            "recovery_verification_ambiguous_restart_required"
         );
         assert_eq!(api_server.kbs_resource(resource_path), Some(old_encrypted));
     }
