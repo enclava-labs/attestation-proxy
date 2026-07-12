@@ -1665,14 +1665,11 @@ async fn verify_owner_seed_for_recovery(
     }
 
     match wait_for_enclava_init_ready(state, timeout).await {
-        Ok(()) => {
-            state.ownership.set_unlocked();
-            Ok(true)
-        }
+        Ok(()) => Ok(true),
         Err(OwnershipError::Timeout) => {
             // Init accepted this request's seed. Keep the attempt reserved and
             // observe a late ready result instead of making recovery retryable.
-            spawn_enclava_init_ready_watch(state.clone(), timeout);
+            spawn_recovery_init_ready_watch(state.clone(), timeout);
             Err(OwnershipError::Timeout)
         }
         Err(err) => {
@@ -1706,6 +1703,17 @@ fn spawn_enclava_init_ready_watch(state: AppState, timeout: std::time::Duration)
     tokio::spawn(async move {
         match wait_for_enclava_init_ready(&state, timeout).await {
             Ok(()) => state.ownership.set_unlocked(),
+            Err(err) => state.ownership.set_error(err.to_string()),
+        }
+    });
+}
+
+fn spawn_recovery_init_ready_watch(state: AppState, timeout: std::time::Duration) {
+    tokio::spawn(async move {
+        match wait_for_enclava_init_ready(&state, timeout).await {
+            Ok(()) => state
+                .ownership
+                .set_error("recovery_persistence_requires_restart"),
             Err(err) => state.ownership.set_error(err.to_string()),
         }
     });
@@ -2223,6 +2231,9 @@ pub async fn recover(
     )
     .await
     {
+        state
+            .ownership
+            .set_error("recovery_persistence_requires_restart");
         return json_response(
             500,
             &json!({
@@ -4197,7 +4208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_recovery_timeout_keeps_watching_without_rewrap() {
+    async fn accepted_recovery_timeout_keeps_gate_closed_without_rewrap() {
         let signal_dir = test_signal_dir("recover-late-ready");
         mark_password_slots_unlocked(&signal_dir.path);
 
@@ -4264,8 +4275,9 @@ mod tests {
         assert_eq!(api_server.secret_json(), before);
 
         socket_task.await.expect("socket task");
-        let body = wait_for_ownership_state(&state, "unlocked").await;
-        assert_eq!(body["state"], "unlocked");
+        let body = wait_for_ownership_state(&state, "error").await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["error"], "recovery_persistence_requires_restart");
 
         let encrypted = decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted");
         let _ = decrypt_owner_seed_with_password(&state, &encrypted, "initial-password");
@@ -4273,6 +4285,75 @@ mod tests {
             decrypt_owner_seed_result(&state, &encrypted, "recovered-password"),
             Err(OwnershipError::WrongPassword)
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_persistence_failure_keeps_gate_closed() {
+        let signal_dir = test_signal_dir("recover-persist-failure");
+        let owner_seed = [0x33; 32];
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let old_encrypted =
+            owner_seed_envelope_json(owner_seed, "initial-password", "instance-test-01");
+        let mut resources = HashMap::new();
+        resources.insert(resource_path.to_string(), old_encrypted.clone());
+        let mut workload_resource_status_sequences = HashMap::new();
+        workload_resource_status_sequences.insert(format!("PUT {resource_path}"), vec![500]);
+        let api_server = spawn_test_api_server_with_all_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            resources,
+            HashMap::new(),
+            workload_resource_status_sequences,
+        )
+        .await;
+
+        let socket_path = signal_dir.path.join("recover-persist-failure.sock");
+        let ready_path = signal_dir.path.join("recover-persist-failure-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["retry"], "restart_required");
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert_eq!(
+            state.ownership.state_json()["error"],
+            "recovery_persistence_requires_restart"
+        );
+        assert_eq!(api_server.kbs_resource(resource_path), Some(old_encrypted));
     }
 
     #[tokio::test]
