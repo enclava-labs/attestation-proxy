@@ -2142,19 +2142,15 @@ pub async fn recover(
             )
         }
     };
-    match load_owner_seed_material_with_revalidation(&state).await {
-        Ok(_) => {}
+    let had_envelope = match load_owner_seed_material_with_revalidation(&state).await {
+        Ok(material) => material.encrypted.is_some(),
         Err(err) => {
             return json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string()}),
             )
         }
-    }
-    if state.ownership.is_unclaimed() {
-        state.ownership.set_locked();
-    }
-
+    };
     // Validate and build the replacement envelope before asking init to unlock.
     // Configuration or KDF failures must not have workload side effects.
     let mut new_password = take_secret_bytes(&mut payload.new_password);
@@ -2180,30 +2176,44 @@ pub async fn recover(
         }
     };
 
+    let restore_unclaimed_on_verification_failure = state.ownership.is_unclaimed() && !had_envelope;
+    if state.ownership.is_unclaimed() {
+        state.ownership.set_locked();
+    }
+
     match verify_owner_seed_for_recovery(&state, &owner_seed).await {
         Ok(true) => {}
         Ok(false) => {
+            if restore_unclaimed_on_verification_failure {
+                state.ownership.set_unclaimed();
+            }
             return json_response(
                 409,
                 &json!({
                     "error": "recover_verification_unavailable",
                     "detail": "recovery_requires_locked_init_verifier"
                 }),
-            )
+            );
         }
         Err(OwnershipError::Store(detail))
             if detail == "enclava_init_unlock_failed:wrong_password" =>
         {
+            if restore_unclaimed_on_verification_failure {
+                state.ownership.set_unclaimed();
+            }
             return json_response(
                 400,
                 &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
-            )
+            );
         }
         Err(err) => {
+            if restore_unclaimed_on_verification_failure && !state.ownership.is_unlocking() {
+                state.ownership.set_unclaimed();
+            }
             return json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string()}),
-            )
+            );
         }
     }
     if let Err(err) = update_owner_seed_material(
@@ -4082,6 +4092,45 @@ mod tests {
             *decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password"),
             owner_seed
         );
+    }
+
+    #[tokio::test]
+    async fn missing_envelope_without_verifier_remains_unclaimed() {
+        let signal_dir = test_signal_dir("recover-unclaimed-no-verifier");
+        let owner_seed = [0x32; 32];
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_unclaimed();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(
+            read_json(response).await["error"],
+            "recover_verification_unavailable"
+        );
+        assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        assert!(api_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .is_none());
     }
 
     #[tokio::test]

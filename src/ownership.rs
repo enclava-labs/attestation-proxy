@@ -861,6 +861,10 @@ impl OwnershipGuard {
         matches!(self.current_state(), OwnershipState::Unclaimed)
     }
 
+    pub fn is_unlocking(&self) -> bool {
+        matches!(self.current_state(), OwnershipState::Unlocking)
+    }
+
     pub fn is_unlocked(&self) -> bool {
         matches!(self.current_state(), OwnershipState::Unlocked)
     }
