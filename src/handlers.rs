@@ -678,6 +678,9 @@ async fn refresh_ownership_state(
         } else {
             state.ownership.set_locked();
         }
+    } else if state.ownership.is_unlocking() {
+        // Preserve an active unlock/recovery reservation while KBS still has no
+        // visible envelope; the in-flight operation owns the state transition.
     } else if state.ownership.is_unclaimed() {
         state.ownership.set_unclaimed_preserving_attempts();
     } else {
@@ -4294,6 +4297,43 @@ mod tests {
         assert!(api_server
             .kbs_resource("default/instance-test-01-owner/seed-encrypted")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn revalidation_preserves_active_unclaimed_recovery_reservation() {
+        let signal_dir = test_signal_dir("recover-revalidation-reservation");
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_unclaimed();
+        state
+            .ownership
+            .begin_secret_operation_attempt()
+            .expect("record recovery attempt");
+        state
+            .ownership
+            .begin_recovery_verification()
+            .expect("reserve unclaimed recovery");
+
+        refresh_ownership_state(&state, true)
+            .await
+            .expect("refresh missing KBS envelope");
+
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+        assert_eq!(
+            state.ownership.begin_recovery_verification(),
+            Err(OwnershipError::NotLocked),
+            "revalidation must not release the active recovery reservation"
+        );
     }
 
     #[tokio::test]
