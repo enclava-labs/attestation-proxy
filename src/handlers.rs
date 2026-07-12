@@ -1664,6 +1664,14 @@ async fn verify_owner_seed_for_recovery(
     }
 
     let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
+    if let Err(err) = clear_enclava_init_error_for_recovery(state).await {
+        if restore_unclaimed_on_failure {
+            state.ownership.set_unclaimed_preserving_attempts();
+        } else {
+            state.ownership.set_locked_after_retry();
+        }
+        return Err(err);
+    }
     if let Err(err) = request_owner_seed_unlock(state, owner_seed, timeout).await {
         if !matches!(err, OwnershipError::UnlockAmbiguous(_)) {
             if restore_unclaimed_on_failure {
@@ -1697,6 +1705,20 @@ async fn verify_owner_seed_for_recovery(
             }
             Err(err)
         }
+    }
+}
+
+async fn clear_enclava_init_error_for_recovery(state: &AppState) -> Result<(), OwnershipError> {
+    let error_file = state.config.enclava_init_error_file.trim();
+    if error_file.is_empty() {
+        return Ok(());
+    }
+    match tokio::fs::remove_file(error_file).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(OwnershipError::Store(format!(
+            "enclava_init_error_file_clear_failed:{err}"
+        ))),
     }
 }
 
@@ -3461,6 +3483,54 @@ mod tests {
 
         socket_task.await.expect("socket task");
         assert!(matches!(err, OwnershipError::UnlockAmbiguous(_)));
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+    }
+
+    #[tokio::test]
+    async fn recovery_clears_stale_init_error_before_sending_seed() {
+        let signal_dir = test_signal_dir("recover-clears-stale-init-error");
+        let owner_seed = [0x36; 32];
+        let socket_path = signal_dir.path.join("recover-clears-error.sock");
+        let ready_path = signal_dir.path.join("recover-clears-error-ready");
+        let error_path = signal_dir.path.join("recover-clears-error-stale");
+        tokio::fs::write(&error_path, "luks_open_failed\n")
+            .await
+            .expect("write stale init error");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let error_for_task = error_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert!(
+                !error_for_task.exists(),
+                "stale init error must be removed before the new seed is sent"
+            );
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        assert!(verify_owner_seed_for_recovery(&state, &owner_seed, false)
+            .await
+            .expect("recovery verification"));
+        socket_task.await.expect("socket task");
         assert_eq!(state.ownership.state_json()["state"], "unlocking");
     }
 
