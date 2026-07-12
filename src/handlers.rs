@@ -678,6 +678,8 @@ async fn refresh_ownership_state(
         } else {
             state.ownership.set_locked();
         }
+    } else if state.ownership.is_unclaimed() {
+        state.ownership.set_unclaimed_preserving_attempts();
     } else {
         state.ownership.set_unclaimed();
     }
@@ -1665,7 +1667,7 @@ async fn verify_owner_seed_for_recovery(
     if let Err(err) = request_owner_seed_unlock(state, owner_seed, timeout).await {
         if !matches!(err, OwnershipError::UnlockAmbiguous(_)) {
             if restore_unclaimed_on_failure {
-                state.ownership.restore_unclaimed_after_recovery_failure();
+                state.ownership.set_unclaimed_preserving_attempts();
             } else {
                 state.ownership.set_locked_after_retry();
             }
@@ -1689,7 +1691,7 @@ async fn verify_owner_seed_for_recovery(
         }
         Err(err) => {
             if restore_unclaimed_on_failure {
-                state.ownership.restore_unclaimed_after_recovery_failure();
+                state.ownership.set_unclaimed_preserving_attempts();
             } else {
                 state.ownership.set_locked_after_retry();
             }
@@ -4192,7 +4194,25 @@ mod tests {
         state.ownership.set_unclaimed();
         let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
 
-        let response = recover(
+        for _ in 0..5 {
+            let response = recover(
+                State(state.clone()),
+                Json(RecoverRequest {
+                    mnemonic: Zeroizing::new(mnemonic.clone()),
+                    new_password: Zeroizing::new("recovered-password".to_string()),
+                }),
+            )
+            .await;
+
+            assert_eq!(response.status().as_u16(), 409);
+            assert_eq!(
+                read_json(response).await["error"],
+                "recover_verification_unavailable"
+            );
+            assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        }
+
+        let limited = recover(
             State(state.clone()),
             Json(RecoverRequest {
                 mnemonic: Zeroizing::new(mnemonic),
@@ -4200,13 +4220,7 @@ mod tests {
             }),
         )
         .await;
-
-        assert_eq!(response.status().as_u16(), 409);
-        assert_eq!(
-            read_json(response).await["error"],
-            "recover_verification_unavailable"
-        );
-        assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        assert_eq!(limited.status().as_u16(), 429);
         assert!(api_server
             .kbs_resource("default/instance-test-01-owner/seed-encrypted")
             .is_none());

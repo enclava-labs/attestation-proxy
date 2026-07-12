@@ -330,7 +330,7 @@ impl OwnershipGuard {
         }
     }
 
-    pub fn restore_unclaimed_after_recovery_failure(&self) {
+    pub fn set_unclaimed_preserving_attempts(&self) {
         if let Ok(mut machine) = self.machine.lock() {
             machine.state = OwnershipState::Unclaimed;
             machine.error = None;
@@ -1056,7 +1056,7 @@ mod tests {
                 Err(OwnershipError::NotLocked),
                 "a second recovery must not replace the active reservation"
             );
-            guard.restore_unclaimed_after_recovery_failure();
+            guard.set_unclaimed_preserving_attempts();
         }
 
         assert_eq!(
