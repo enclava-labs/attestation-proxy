@@ -2142,21 +2142,15 @@ pub async fn recover(
             )
         }
     };
-    let material = match load_owner_seed_material_with_revalidation(&state).await {
-        Ok(material) => material,
+    match load_owner_seed_material_with_revalidation(&state).await {
+        Ok(_) => {}
         Err(err) => {
             return json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string()}),
             )
         }
-    };
-    let Some(_) = material.encrypted.as_deref() else {
-        return json_response(
-            409,
-            &json!({"error": "recover_failed", "detail": "owner_seed_not_claimed"}),
-        );
-    };
+    }
     if state.ownership.is_unclaimed() {
         state.ownership.set_locked();
     }
@@ -2221,7 +2215,11 @@ pub async fn recover(
     {
         return json_response(
             500,
-            &json!({"error": "recover_failed", "detail": err.to_string()}),
+            &json!({
+                "error": "recover_failed",
+                "detail": err.to_string(),
+                "retry": "restart_required"
+            }),
         );
     }
 
@@ -4018,6 +4016,71 @@ mod tests {
         assert_eq!(
             decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
             Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_recreates_a_missing_envelope_after_init_verification() {
+        let signal_dir = test_signal_dir("recover-missing-envelope");
+        let owner_seed = [0x31; 32];
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let socket_path = signal_dir.path.join("recover-missing-envelope.sock");
+        let ready_path = signal_dir.path.join("recover-missing-envelope-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert_eq!(
+                line.trim_end(),
+                format!(
+                    "owner-seed-v1:{}",
+                    BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+                )
+            );
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_unclaimed();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 200);
+        let encrypted = api_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .expect("recreated owner seed resource");
+        assert_eq!(
+            *decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password"),
+            owner_seed
         );
     }
 
