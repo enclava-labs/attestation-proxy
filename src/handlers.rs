@@ -678,6 +678,11 @@ async fn refresh_ownership_state(
         } else {
             state.ownership.set_locked();
         }
+    } else if state.ownership.is_unlocking() {
+        // Preserve an active unlock/recovery reservation while KBS still has no
+        // visible envelope; the in-flight operation owns the state transition.
+    } else if state.ownership.is_unclaimed() {
+        state.ownership.set_unclaimed_preserving_attempts();
     } else {
         state.ownership.set_unclaimed();
     }
@@ -1596,32 +1601,43 @@ async fn unlock_owner_seed_via_init_socket(
         return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
     }
 
+    request_owner_seed_unlock(state, owner_seed, timeout).await?;
+    state.ownership.set_unlocked();
+    spawn_enclava_init_ready_watch(state.clone(), timeout);
+    maybe_refresh_auto_unlock_seal(state, owner_seed).await
+}
+
+async fn request_owner_seed_unlock(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+    timeout: std::time::Duration,
+) -> Result<(), OwnershipError> {
     let path = state.config.enclava_init_unlock_socket.trim();
     let mut stream = connect_init_unlock_socket(path, timeout).await?;
     let request = format!("owner-seed-v1:{}\n", URL_SAFE_NO_PAD.encode(owner_seed));
     stream.write_all(request.as_bytes()).await.map_err(|err| {
-        OwnershipError::Store(format!("enclava_init_unlock_socket_write_failed:{err}"))
+        OwnershipError::UnlockAmbiguous(format!("enclava_init_unlock_socket_write_failed:{err}"))
     })?;
 
     let mut reader = TokioBufReader::new(stream);
     let mut reply = String::new();
     let read = tokio::time::timeout(timeout, reader.read_line(&mut reply))
         .await
-        .map_err(|_| OwnershipError::Timeout)?
+        .map_err(|_| {
+            OwnershipError::UnlockAmbiguous("enclava_init_unlock_socket_read_timeout".to_string())
+        })?
         .map_err(|err| {
-            OwnershipError::Store(format!("enclava_init_unlock_socket_read_failed:{err}"))
+            OwnershipError::UnlockAmbiguous(format!("enclava_init_unlock_socket_read_failed:{err}"))
         })?;
     if read == 0 {
-        return Err(OwnershipError::Store(
+        return Err(OwnershipError::UnlockAmbiguous(
             "enclava_init_unlock_socket_closed".to_string(),
         ));
     }
 
     let reply = reply.trim_end_matches(['\r', '\n']);
     if reply == "OK" {
-        state.ownership.set_unlocked();
-        spawn_enclava_init_ready_watch(state.clone(), timeout);
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+        return Ok(());
     }
     if let Some(reason) = reply.strip_prefix("ERR ") {
         return Err(OwnershipError::Store(format!(
@@ -1631,6 +1647,82 @@ async fn unlock_owner_seed_via_init_socket(
     Err(OwnershipError::Store(format!(
         "enclava_init_unlock_unexpected_reply:{reply}"
     )))
+}
+
+async fn verify_owner_seed_for_recovery(
+    state: &AppState,
+    owner_seed: &[u8; 32],
+    restore_unclaimed_on_failure: bool,
+) -> Result<bool, OwnershipError> {
+    if state.config.enclava_init_unlock_socket.trim().is_empty()
+        || state.config.enclava_init_ready_file.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    if enclava_init_ready_file_is_ready(state).await? {
+        return Ok(false);
+    }
+    if state.ownership.begin_recovery_verification().is_err() {
+        return Ok(false);
+    }
+
+    let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
+    if let Err(err) = clear_enclava_init_error_for_recovery(state).await {
+        if restore_unclaimed_on_failure {
+            state.ownership.set_unclaimed_preserving_attempts();
+        } else {
+            state.ownership.set_locked_after_retry();
+        }
+        return Err(err);
+    }
+    if let Err(err) = request_owner_seed_unlock(state, owner_seed, timeout).await {
+        if !matches!(err, OwnershipError::UnlockAmbiguous(_)) {
+            if restore_unclaimed_on_failure {
+                state.ownership.set_unclaimed_preserving_attempts();
+            } else {
+                state.ownership.set_locked_after_retry();
+            }
+        }
+        return Err(err);
+    }
+
+    match wait_for_enclava_init_ready(state, timeout).await {
+        Ok(()) => Ok(true),
+        Err(OwnershipError::Timeout) => {
+            // Init accepted this request's seed. Keep the attempt reserved and
+            // observe a late ready result instead of making recovery retryable.
+            spawn_recovery_init_ready_watch(state.clone(), timeout);
+            Err(OwnershipError::Timeout)
+        }
+        Err(OwnershipError::Store(detail))
+            if detail.starts_with("enclava_init_ready_file_read_failed:")
+                || detail.starts_with("enclava_init_error_file_read_failed:") =>
+        {
+            Err(OwnershipError::UnlockAmbiguous(detail))
+        }
+        Err(err) => {
+            if restore_unclaimed_on_failure {
+                state.ownership.set_unclaimed_preserving_attempts();
+            } else {
+                state.ownership.set_locked_after_retry();
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn clear_enclava_init_error_for_recovery(state: &AppState) -> Result<(), OwnershipError> {
+    let error_file = state.config.enclava_init_error_file.trim();
+    if error_file.is_empty() {
+        return Ok(());
+    }
+    match tokio::fs::remove_file(error_file).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(OwnershipError::Store(format!(
+            "enclava_init_error_file_clear_failed:{err}"
+        ))),
+    }
 }
 
 async fn enclava_init_ready_file_is_ready(state: &AppState) -> Result<bool, OwnershipError> {
@@ -1655,8 +1747,20 @@ fn spawn_enclava_init_ready_watch(state: AppState, timeout: std::time::Duration)
     }
 
     tokio::spawn(async move {
-        if let Err(err) = wait_for_enclava_init_ready(&state, timeout).await {
-            state.ownership.set_error(err.to_string());
+        match wait_for_enclava_init_ready(&state, timeout).await {
+            Ok(()) => state.ownership.set_unlocked(),
+            Err(err) => state.ownership.set_error(err.to_string()),
+        }
+    });
+}
+
+fn spawn_recovery_init_ready_watch(state: AppState, timeout: std::time::Duration) {
+    tokio::spawn(async move {
+        match wait_for_enclava_init_ready(&state, timeout).await {
+            Ok(()) => state
+                .ownership
+                .set_error("recovery_persistence_requires_restart"),
+            Err(err) => state.ownership.set_error(err.to_string()),
         }
     });
 }
@@ -2092,6 +2196,17 @@ pub async fn recover(
             )
         }
     };
+    let had_envelope = match load_owner_seed_material_with_revalidation(&state).await {
+        Ok(material) => material.encrypted.is_some(),
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string()}),
+            )
+        }
+    };
+    // Validate and build the replacement envelope before asking init to unlock.
+    // Configuration or KDF failures must not have workload side effects.
     let mut new_password = take_secret_bytes(&mut payload.new_password);
     let wrap_key = match state
         .ownership
@@ -2114,6 +2229,54 @@ pub async fn recover(
             )
         }
     };
+
+    let restore_unclaimed_on_verification_failure = state.ownership.is_unclaimed() && !had_envelope;
+
+    match verify_owner_seed_for_recovery(
+        &state,
+        &owner_seed,
+        restore_unclaimed_on_verification_failure,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_response(
+                409,
+                &json!({
+                    "error": "recover_verification_unavailable",
+                    "detail": "recovery_requires_locked_init_verifier"
+                }),
+            );
+        }
+        Err(OwnershipError::Store(detail))
+            if detail == "enclava_init_unlock_failed:wrong_password" =>
+        {
+            return json_response(
+                400,
+                &json!({"error": "mnemonic_invalid", "detail": "owner_seed_mismatch"}),
+            );
+        }
+        Err(OwnershipError::UnlockAmbiguous(detail)) => {
+            state
+                .ownership
+                .set_error("recovery_verification_ambiguous_restart_required");
+            return json_response(
+                500,
+                &json!({
+                    "error": "recover_failed",
+                    "detail": detail,
+                    "retry": "restart_required"
+                }),
+            );
+        }
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "recover_failed", "detail": err.to_string()}),
+            );
+        }
+    }
     if let Err(err) = update_owner_seed_material(
         &state,
         EscrowValueUpdate::Set(&encrypted),
@@ -2121,9 +2284,16 @@ pub async fn recover(
     )
     .await
     {
+        state
+            .ownership
+            .set_error("recovery_persistence_requires_restart");
         return json_response(
             500,
-            &json!({"error": "recover_failed", "detail": err.to_string()}),
+            &json!({
+                "error": "recover_failed",
+                "detail": err.to_string(),
+                "retry": "restart_required"
+            }),
         );
     }
 
@@ -3278,6 +3448,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_ready_observation_failure_stays_reserved() {
+        let signal_dir = test_signal_dir("recover-ready-observation-failure");
+        let owner_seed = [0x35; 32];
+        let socket_path = signal_dir.path.join("recover-ready-observation.sock");
+        let ready_path = signal_dir.path.join("recover-ready-observation-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::create_dir(ready_for_task)
+                .await
+                .expect("replace missing ready file with directory");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            // Reading a directory as the ready sentinel produces a deterministic
+            // observation error after init has acknowledged the seed.
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        let err = verify_owner_seed_for_recovery(&state, &owner_seed, false)
+            .await
+            .expect_err("ready observation failure must be ambiguous");
+
+        socket_task.await.expect("socket task");
+        assert!(matches!(err, OwnershipError::UnlockAmbiguous(_)));
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+    }
+
+    #[tokio::test]
+    async fn recovery_clears_stale_init_error_before_sending_seed() {
+        let signal_dir = test_signal_dir("recover-clears-stale-init-error");
+        let owner_seed = [0x36; 32];
+        let socket_path = signal_dir.path.join("recover-clears-error.sock");
+        let ready_path = signal_dir.path.join("recover-clears-error-ready");
+        let error_path = signal_dir.path.join("recover-clears-error-stale");
+        tokio::fs::write(&error_path, "luks_open_failed\n")
+            .await
+            .expect("write stale init error");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let error_for_task = error_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert!(
+                !error_for_task.exists(),
+                "stale init error must be removed before the new seed is sent"
+            );
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        assert!(verify_owner_seed_for_recovery(&state, &owner_seed, false)
+            .await
+            .expect("recovery verification"));
+        socket_task.await.expect("socket task");
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+    }
+
+    #[tokio::test]
     async fn unlock_password_mode_uses_enclava_init_socket_when_configured() {
         let signal_dir = test_signal_dir("unlock-password-init-socket");
         let owner_seed = [0x25; 32];
@@ -3829,7 +4089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_rewraps_seed_from_mnemonic_and_unlocks() {
+    async fn recover_refreshes_stale_unclaimed_state_and_rewraps_seed() {
         let signal_dir = test_signal_dir("recover");
         mark_password_slots_unlocked(&signal_dir.path);
 
@@ -3842,7 +4102,7 @@ mod tests {
         )
         .await;
         let token_file = test_temp_file("recover-token", "test-token");
-        let state = build_state_with_secret_backend(
+        let mut state = build_state_with_secret_backend(
             &signal_dir.path,
             "password",
             api_server.base_url(),
@@ -3863,7 +4123,28 @@ mod tests {
             .to_string();
 
         clear_password_slot_artifacts(&signal_dir.path);
-        mark_password_slots_unlocked(&signal_dir.path);
+        let socket_path = signal_dir.path.join("recover-unlock.sock");
+        let ready_path = signal_dir.path.join("recover-init-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        // Model a process that exhausted its startup KBS rechecks before the
+        // already-persisted envelope became visible.
+        state.ownership.set_unclaimed();
 
         let response = recover(
             State(state.clone()),
@@ -3873,6 +4154,7 @@ mod tests {
             }),
         )
         .await;
+        socket_task.await.expect("socket task");
         assert_eq!(response.status().as_u16(), 200);
         let body = read_json(response).await;
         assert_eq!(
@@ -3899,6 +4181,565 @@ mod tests {
             decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
             Err(OwnershipError::WrongPassword)
         );
+    }
+
+    #[tokio::test]
+    async fn recover_recreates_a_missing_envelope_after_init_verification() {
+        let signal_dir = test_signal_dir("recover-missing-envelope");
+        let owner_seed = [0x31; 32];
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let socket_path = signal_dir.path.join("recover-missing-envelope.sock");
+        let ready_path = signal_dir.path.join("recover-missing-envelope-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert_eq!(
+                line.trim_end(),
+                format!(
+                    "owner-seed-v1:{}",
+                    BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+                )
+            );
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_unclaimed();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 200);
+        let encrypted = api_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .expect("recreated owner seed resource");
+        assert_eq!(
+            *decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password"),
+            owner_seed
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_envelope_without_verifier_remains_unclaimed() {
+        let signal_dir = test_signal_dir("recover-unclaimed-no-verifier");
+        let owner_seed = [0x32; 32];
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_unclaimed();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        for _ in 0..5 {
+            let response = recover(
+                State(state.clone()),
+                Json(RecoverRequest {
+                    mnemonic: Zeroizing::new(mnemonic.clone()),
+                    new_password: Zeroizing::new("recovered-password".to_string()),
+                }),
+            )
+            .await;
+
+            assert_eq!(response.status().as_u16(), 409);
+            assert_eq!(
+                read_json(response).await["error"],
+                "recover_verification_unavailable"
+            );
+            assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        }
+
+        let limited = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(limited.status().as_u16(), 429);
+        assert!(api_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn revalidation_preserves_active_unclaimed_recovery_reservation() {
+        let signal_dir = test_signal_dir("recover-revalidation-reservation");
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_unclaimed();
+        state
+            .ownership
+            .begin_secret_operation_attempt()
+            .expect("record recovery attempt");
+        state
+            .ownership
+            .begin_recovery_verification()
+            .expect("reserve unclaimed recovery");
+
+        refresh_ownership_state(&state, true)
+            .await
+            .expect("refresh missing KBS envelope");
+
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+        assert_eq!(
+            state.ownership.begin_recovery_verification(),
+            Err(OwnershipError::NotLocked),
+            "revalidation must not release the active recovery reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_validates_new_wrap_before_contacting_init() {
+        let signal_dir = test_signal_dir("recover-invalid-wrap");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-invalid-wrap-token", "test-token");
+        let mut state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "initial-password").await;
+        let mnemonic = claim
+            .get("owner_seed_mnemonic")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let before = api_server.secret_json();
+
+        clear_password_slot_artifacts(&signal_dir.path);
+        let socket_path = signal_dir.path.join("recover-invalid-wrap.sock");
+        let ready_path = signal_dir.path.join("recover-invalid-wrap-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.instance_id.clear();
+        }
+        state.ownership.set_locked();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(read_json(response).await["detail"], "instance_id_missing");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "invalid replacement wrap must fail before init receives the seed"
+        );
+        assert_eq!(api_server.secret_json(), before);
+        assert_eq!(state.ownership.state_json()["state"], "locked");
+    }
+
+    #[tokio::test]
+    async fn accepted_recovery_timeout_keeps_gate_closed_without_rewrap() {
+        let signal_dir = test_signal_dir("recover-late-ready");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[22u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-late-ready-token", "test-token");
+        let mut state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "initial-password").await;
+        let mnemonic = claim
+            .get("owner_seed_mnemonic")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let before = api_server.secret_json();
+
+        clear_password_slot_artifacts(&signal_dir.path);
+        let socket_path = signal_dir.path.join("recover-late-ready.sock");
+        let ready_path = signal_dir.path.join("recover-late-ready-file");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            tokio::time::sleep(Duration::from_millis(1_300)).await;
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready after response timeout");
+        });
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(read_json(response).await["detail"], "timeout");
+        assert_eq!(state.ownership.state_json()["state"], "unlocking");
+        assert_eq!(api_server.secret_json(), before);
+
+        socket_task.await.expect("socket task");
+        let body = wait_for_ownership_state(&state, "error").await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(body["error"], "recovery_persistence_requires_restart");
+
+        let encrypted = decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted");
+        let _ = decrypt_owner_seed_with_password(&state, &encrypted, "initial-password");
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &encrypted, "recovered-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_persistence_failure_keeps_gate_closed() {
+        let signal_dir = test_signal_dir("recover-persist-failure");
+        let owner_seed = [0x33; 32];
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let old_encrypted =
+            owner_seed_envelope_json(owner_seed, "initial-password", "instance-test-01");
+        let mut resources = HashMap::new();
+        resources.insert(resource_path.to_string(), old_encrypted.clone());
+        let mut workload_resource_status_sequences = HashMap::new();
+        workload_resource_status_sequences.insert(format!("PUT {resource_path}"), vec![500]);
+        let api_server = spawn_test_api_server_with_all_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            resources,
+            HashMap::new(),
+            workload_resource_status_sequences,
+        )
+        .await;
+
+        let socket_path = signal_dir.path.join("recover-persist-failure.sock");
+        let ready_path = signal_dir.path.join("recover-persist-failure-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["retry"], "restart_required");
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert_eq!(
+            state.ownership.state_json()["error"],
+            "recovery_persistence_requires_restart"
+        );
+        assert_eq!(api_server.kbs_resource(resource_path), Some(old_encrypted));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_socket_close_requires_restart() {
+        let signal_dir = test_signal_dir("recover-ambiguous-socket");
+        let owner_seed = [0x34; 32];
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let old_encrypted =
+            owner_seed_envelope_json(owner_seed, "initial-password", "instance-test-01");
+        let mut resources = HashMap::new();
+        resources.insert(resource_path.to_string(), old_encrypted.clone());
+        let api_server =
+            spawn_test_api_server(owner_escrow_secret_json(None, None), json!({}), resources).await;
+
+        let socket_path = signal_dir.path.join("recover-ambiguous-socket.sock");
+        let ready_path = signal_dir.path.join("recover-ambiguous-socket-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            // Drop the connection without a response after consuming the seed.
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["retry"], "restart_required");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("enclava_init_unlock_socket_closed"));
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert_eq!(
+            state.ownership.state_json()["error"],
+            "recovery_verification_ambiguous_restart_required"
+        );
+        assert_eq!(api_server.kbs_resource(resource_path), Some(old_encrypted));
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_valid_wrong_mnemonic_without_replacing_envelope() {
+        let signal_dir = test_signal_dir("recover-valid-wrong-mnemonic");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("recover-valid-wrong-mnemonic-token", "test-token");
+        let mut state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "initial-password").await;
+        let before = api_server.secret_json();
+        let before_encrypted =
+            decode_secret_field(&before, "seed-encrypted").expect("seed-encrypted before recover");
+        let socket_path = signal_dir.path.join("wrong-recover.sock");
+        let ready_path = signal_dir.path.join("wrong-recover-ready");
+        let error_path = signal_dir.path.join("wrong-recover-error");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let error_for_task = error_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(error_for_task, "luks_open_failed\n")
+                .await
+                .expect("write init error");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+                        .to_string(),
+                ),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        socket_task.await.expect("socket task");
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(read_json(response).await["error"], "recover_failed");
+
+        let after = api_server.secret_json();
+        let after_encrypted =
+            decode_secret_field(&after, "seed-encrypted").expect("seed-encrypted after recover");
+        assert_eq!(after_encrypted, before_encrypted);
+        let _ = decrypt_owner_seed_with_password(&state, &after_encrypted, "initial-password");
+        assert_eq!(
+            decrypt_owner_seed_result(&state, &after_encrypted, "recovered-password"),
+            Err(OwnershipError::WrongPassword)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_legacy_envelope_uses_locked_init_verifier_before_rewrap() {
+        let signal_dir = test_signal_dir("recover-legacy-locked-verifier");
+        let owner_seed = [0x2c; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "initial-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let ready_for_task = ready_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            tokio::fs::write(ready_for_task, "ready\n")
+                .await
+                .expect("mark init ready");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            line
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+        }
+        state.ownership.set_locked();
+        let mnemonic = state.ownership.owner_seed_mnemonic(&owner_seed).unwrap();
+
+        let response = recover(
+            State(state.clone()),
+            Json(RecoverRequest {
+                mnemonic: Zeroizing::new(mnemonic),
+                new_password: Zeroizing::new("recovered-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            socket_task.await.expect("socket task").trim_end(),
+            format!(
+                "owner-seed-v1:{}",
+                BASE64_URL_SAFE_NO_PAD.encode(owner_seed)
+            )
+        );
+        let encrypted = kbs_server
+            .kbs_resource("default/instance-test-01-owner/seed-encrypted")
+            .expect("owner seed resource after recover");
+        let _ =
+            decrypt_owner_seed_with_password(&state, encrypted.as_bytes(), "recovered-password");
     }
 
     #[tokio::test]
@@ -3960,7 +4801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_while_unlocked_clears_stale_password_handoff_files() {
+    async fn recover_while_unlocked_requires_a_locked_init_verifier() {
         let signal_dir = test_signal_dir("recover-already-unlocked");
         mark_password_slots_unlocked(&signal_dir.path);
 
@@ -3975,7 +4816,7 @@ mod tests {
         let token_file = test_temp_file("recover-already-unlocked-token", "test-token");
         let state = build_state_with_secret_backend(
             &signal_dir.path,
-            "auto-unlock",
+            "password",
             api_server.base_url(),
             &token_file.path,
         );
@@ -3987,23 +4828,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
-
-        clear_password_slot_artifacts(&signal_dir.path);
-        mark_password_slots_unlocked(&signal_dir.path);
-        let enable = enable_auto_unlock(
-            State(state.clone()),
-            Json(UnlockRequest {
-                password: Zeroizing::new("initial-password".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(enable.status().as_u16(), 200);
-
-        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
-            let slot_dir = signal_dir.path.join(slot);
-            fs::write(slot_dir.join(SIGNAL_KEY_FILE), "stale-key").expect("write stale key");
-            fs::write(slot_dir.join(SIGNAL_ERROR_FILE), "stale-error").expect("write stale error");
-        }
+        let before = api_server.secret_json();
 
         let response = recover(
             State(state.clone()),
@@ -4013,41 +4838,15 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status().as_u16(), 200);
-        let body = read_json(response).await;
+        assert_eq!(response.status().as_u16(), 409);
         assert_eq!(
-            body.get("status").and_then(Value::as_str),
-            Some("recovered")
+            read_json(response).await,
+            json!({
+                "error": "recover_verification_unavailable",
+                "detail": "recovery_requires_locked_init_verifier"
+            })
         );
-        assert_eq!(body.get("state").and_then(Value::as_str), Some("unlocked"));
-
-        for slot in [SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT] {
-            let slot_dir = signal_dir.path.join(slot);
-            assert!(
-                !slot_dir.join(SIGNAL_KEY_FILE).exists(),
-                "recover should clear stale key file for {slot}"
-            );
-            assert!(
-                !slot_dir.join(SIGNAL_ERROR_FILE).exists(),
-                "recover should clear stale error file for {slot}"
-            );
-            assert!(
-                slot_dir.join(SIGNAL_UNLOCKED_FILE).exists(),
-                "recover should preserve unlocked sentinel for {slot}"
-            );
-        }
-
-        let secret = api_server.secret_json();
-        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
-        assert!(
-            decode_secret_field(&secret, "seed-sealed").is_some(),
-            "recover should preserve the sealed owner-seed copy in auto-unlock mode"
-        );
-        assert_eq!(
-            decrypt_owner_seed_result(&state, &encrypted, "initial-password"),
-            Err(OwnershipError::WrongPassword)
-        );
-        let _ = decrypt_owner_seed_with_password(&state, &encrypted, "recovered-password");
+        assert_eq!(api_server.secret_json(), before);
     }
 
     #[tokio::test]

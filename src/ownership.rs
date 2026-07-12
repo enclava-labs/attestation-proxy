@@ -152,6 +152,8 @@ pub enum OwnershipError {
     InstanceIdMissing,
     #[error("timeout")]
     Timeout,
+    #[error("unlock_ambiguous: {0}")]
+    UnlockAmbiguous(String),
     #[error("filesystem_error: {0}")]
     Filesystem(String),
     #[error("kdf_error: {0}")]
@@ -292,6 +294,19 @@ impl OwnershipGuard {
         Ok(())
     }
 
+    pub fn begin_recovery_verification(&self) -> Result<(), OwnershipError> {
+        let mut machine = self.machine.lock().expect("ownership lock poisoned");
+        if !matches!(
+            machine.state,
+            OwnershipState::Locked | OwnershipState::Unclaimed
+        ) {
+            return Err(OwnershipError::NotLocked);
+        }
+        machine.state = OwnershipState::Unlocking;
+        machine.error = None;
+        Ok(())
+    }
+
     pub fn set_locked_after_retry(&self) {
         if let Ok(mut machine) = self.machine.lock() {
             machine.state = OwnershipState::Locked;
@@ -311,6 +326,14 @@ impl OwnershipGuard {
             machine.state = OwnershipState::Unclaimed;
             machine.error = None;
             machine.attempts.clear();
+            machine.auto_unlock_enabled = false;
+        }
+    }
+
+    pub fn set_unclaimed_preserving_attempts(&self) {
+        if let Ok(mut machine) = self.machine.lock() {
+            machine.state = OwnershipState::Unclaimed;
+            machine.error = None;
             machine.auto_unlock_enabled = false;
         }
     }
@@ -851,6 +874,10 @@ impl OwnershipGuard {
         matches!(self.current_state(), OwnershipState::Unclaimed)
     }
 
+    pub fn is_unlocking(&self) -> bool {
+        matches!(self.current_state(), OwnershipState::Unlocking)
+    }
+
     pub fn is_unlocked(&self) -> bool {
         matches!(self.current_state(), OwnershipState::Unlocked)
     }
@@ -1011,6 +1038,31 @@ mod tests {
         assert_eq!(
             guard.begin_unlock_attempt(),
             Err(OwnershipError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn unclaimed_recovery_reservation_is_atomic_and_preserves_attempts() {
+        let signal_dir = test_signal_dir("unclaimed-recovery-reservation");
+        let guard =
+            OwnershipGuard::new_with_signal_dir("password".to_string(), signal_dir.path.clone());
+        guard.set_unclaimed();
+
+        for _ in 0..UNLOCK_MAX_ATTEMPTS {
+            assert!(guard.begin_secret_operation_attempt().is_ok());
+            assert!(guard.begin_recovery_verification().is_ok());
+            assert_eq!(
+                guard.begin_recovery_verification(),
+                Err(OwnershipError::NotLocked),
+                "a second recovery must not replace the active reservation"
+            );
+            guard.set_unclaimed_preserving_attempts();
+        }
+
+        assert_eq!(
+            guard.begin_secret_operation_attempt(),
+            Err(OwnershipError::RateLimited),
+            "restoring unclaimed state must retain recovery attempts"
         );
     }
 
