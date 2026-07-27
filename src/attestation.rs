@@ -239,7 +239,7 @@ pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, 
     let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
     let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
     let (payload, error) = fetch_aa_token_payload_from_url(
-        state,
+        &state.http_client,
         &state.config.aa_token_url,
         attempts,
         timeout,
@@ -261,7 +261,7 @@ pub async fn fetch_aa_token_payload(state: &crate::AppState) -> (Option<Value>, 
 }
 
 async fn fetch_aa_token_payload_from_url(
-    state: &crate::AppState,
+    http_client: &reqwest::Client,
     url: &str,
     attempts: u32,
     timeout: Duration,
@@ -270,8 +270,7 @@ async fn fetch_aa_token_payload_from_url(
     let mut last_error = String::new();
 
     for attempt in 1..=attempts {
-        let result = state
-            .http_client
+        let result = http_client
             .get(url)
             .header("Accept", "application/json")
             .timeout(timeout)
@@ -280,29 +279,58 @@ async fn fetch_aa_token_payload_from_url(
 
         match result {
             Ok(resp) => {
-                match resp.json::<Value>().await {
-                    Ok(payload) => {
-                        // Validate response has a non-empty token string
-                        let has_token = payload
-                            .as_object()
-                            .and_then(|o| o.get("token"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false);
+                let status = resp.status();
+                if !status.is_success() {
+                    last_error = format!("http_status_{}", status.as_u16());
+                } else {
+                    let content_type_is_json = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| {
+                            value.split(';').next().is_some_and(|media_type| {
+                                media_type.trim().eq_ignore_ascii_case("application/json")
+                                    || media_type.trim().to_ascii_lowercase().ends_with("+json")
+                            })
+                        });
+                    match resp.json::<Value>().await {
+                        Ok(payload) => {
+                            // Validate response has a non-empty token string
+                            let has_token = payload
+                                .as_object()
+                                .and_then(|o| o.get("token"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
 
-                        if has_token {
-                            return (Some(payload), None);
-                        } else {
-                            return (None, Some("aa_token_invalid_response".to_string()));
+                            if has_token {
+                                return (Some(payload), None);
+                            } else {
+                                return (None, Some("aa_token_invalid_response".to_string()));
+                            }
                         }
-                    }
-                    Err(e) => {
-                        last_error = e.to_string();
+                        Err(_) if content_type_is_json => {
+                            last_error = "invalid_json".to_string();
+                        }
+                        Err(_) => {
+                            last_error = "unexpected_content_type".to_string();
+                        }
                     }
                 }
             }
             Err(e) => {
-                last_error = e.to_string();
+                last_error = if e.is_timeout() {
+                    "request_timeout"
+                } else if e.is_connect() {
+                    "connect_failed"
+                } else if e.is_redirect() {
+                    "redirect_rejected"
+                } else if e.is_builder() {
+                    "request_build_failed"
+                } else {
+                    "transport_failed"
+                }
+                .to_string();
             }
         }
 
@@ -351,7 +379,8 @@ pub async fn fetch_kbs_bearer_token_with_runtime_data(
     let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
     let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
     let (payload, error) =
-        fetch_aa_token_payload_from_url(state, &url, attempts, timeout, retry_sleep).await;
+        fetch_aa_token_payload_from_url(&state.http_client, &url, attempts, timeout, retry_sleep)
+            .await;
     if let Some(e) = error {
         return Err(e);
     }
@@ -912,6 +941,11 @@ pub fn extract_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        http::{header, StatusCode},
+        routing::get,
+        Json, Router,
+    };
     use jsonwebtoken::jwk::{
         AlgorithmParameters, CommonParameters, Jwk, KeyAlgorithm, OctetKeyParameters, OctetKeyType,
     };
@@ -933,6 +967,95 @@ mod tests {
             }),
         });
         encode(&header, claims, &encoding_key).expect("encode signed jwt")
+    }
+
+    #[tokio::test]
+    async fn aa_token_fetch_reports_sanitized_transport_shape() {
+        let app = Router::new()
+            .route(
+                "/upstream-error",
+                get(|| async {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        [(header::CONTENT_TYPE, "text/html")],
+                        "sensitive upstream response body",
+                    )
+                }),
+            )
+            .route(
+                "/wrong-content-type",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        "sensitive non-JSON response body",
+                    )
+                }),
+            )
+            .route(
+                "/invalid-json",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{not-json",
+                    )
+                }),
+            )
+            .route(
+                "/valid",
+                get(|| async { Json(json!({ "token": "header.payload.signature" })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token diagnostic test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("token diagnostic test server");
+        });
+        let client = reqwest::Client::new();
+
+        for (path, expected) in [
+            ("/upstream-error", "aa_token_fetch_failed:http_status_502"),
+            (
+                "/wrong-content-type",
+                "aa_token_fetch_failed:unexpected_content_type",
+            ),
+            ("/invalid-json", "aa_token_fetch_failed:invalid_json"),
+        ] {
+            let (payload, error) = fetch_aa_token_payload_from_url(
+                &client,
+                &format!("http://{address}{path}"),
+                1,
+                Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .await;
+            assert!(payload.is_none());
+            let error = error.expect("diagnostic error");
+            assert_eq!(error, expected);
+            assert!(!error.contains("sensitive"));
+        }
+
+        let (payload, error) = fetch_aa_token_payload_from_url(
+            &client,
+            &format!("http://{address}/valid"),
+            1,
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(
+            payload
+                .as_ref()
+                .and_then(|value| value.get("token"))
+                .and_then(Value::as_str),
+            Some("header.payload.signature")
+        );
+        server.abort();
     }
 
     #[test]
