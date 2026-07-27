@@ -293,44 +293,42 @@ async fn fetch_aa_token_payload_from_url(
                                     || media_type.trim().to_ascii_lowercase().ends_with("+json")
                             })
                         });
-                    match resp.json::<Value>().await {
-                        Ok(payload) => {
-                            // Validate response has a non-empty token string
-                            let has_token = payload
-                                .as_object()
-                                .and_then(|o| o.get("token"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false);
+                    if !content_type_is_json {
+                        last_error = "unexpected_content_type".to_string();
+                    } else {
+                        match resp.bytes().await {
+                            Ok(body) => match serde_json::from_slice::<Value>(&body) {
+                                Ok(payload) => {
+                                    // Validate response has a non-empty token string
+                                    let has_token = payload
+                                        .as_object()
+                                        .and_then(|o| o.get("token"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| !s.is_empty())
+                                        .unwrap_or(false);
 
-                            if has_token {
-                                return (Some(payload), None);
-                            } else {
-                                return (None, Some("aa_token_invalid_response".to_string()));
+                                    if has_token {
+                                        return (Some(payload), None);
+                                    } else {
+                                        return (
+                                            None,
+                                            Some("aa_token_invalid_response".to_string()),
+                                        );
+                                    }
+                                }
+                                Err(_) => {
+                                    last_error = "invalid_json".to_string();
+                                }
+                            },
+                            Err(error) => {
+                                last_error = classify_reqwest_error(&error).to_string();
                             }
-                        }
-                        Err(_) if content_type_is_json => {
-                            last_error = "invalid_json".to_string();
-                        }
-                        Err(_) => {
-                            last_error = "unexpected_content_type".to_string();
                         }
                     }
                 }
             }
             Err(e) => {
-                last_error = if e.is_timeout() {
-                    "request_timeout"
-                } else if e.is_connect() {
-                    "connect_failed"
-                } else if e.is_redirect() {
-                    "redirect_rejected"
-                } else if e.is_builder() {
-                    "request_build_failed"
-                } else {
-                    "transport_failed"
-                }
-                .to_string();
+                last_error = classify_reqwest_error(&e).to_string();
             }
         }
 
@@ -341,6 +339,20 @@ async fn fetch_aa_token_payload_from_url(
 
     let error = format!("aa_token_fetch_failed:{last_error}");
     (None, Some(error))
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "request_timeout"
+    } else if error.is_connect() {
+        "connect_failed"
+    } else if error.is_redirect() {
+        "redirect_rejected"
+    } else if error.is_builder() {
+        "request_build_failed"
+    } else {
+        "transport_failed"
+    }
 }
 
 /// Fetch a bearer token string for KBS requests.
@@ -940,7 +952,9 @@ pub fn extract_claims(
 mod tests {
     use super::*;
     use axum::{
+        body::Body,
         http::{header, StatusCode},
+        response::Response,
         routing::get,
         Json, Router,
     };
@@ -948,6 +962,7 @@ mod tests {
         AlgorithmParameters, CommonParameters, Jwk, KeyAlgorithm, OctetKeyParameters, OctetKeyType,
     };
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn signed_test_jwt(claims: &Value) -> String {
         let secret = b"attestation-proxy-attestation-tests";
@@ -986,8 +1001,19 @@ mod tests {
                     (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, "text/plain")],
-                        "sensitive non-JSON response body",
+                        r#"{"token":"header.payload.signature","detail":"sensitive"}"#,
                     )
+                }),
+            )
+            .route(
+                "/missing-content-type",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(
+                            r#"{"token":"header.payload.signature","detail":"sensitive"}"#,
+                        ))
+                        .expect("response")
                 }),
             )
             .route(
@@ -1019,6 +1045,10 @@ mod tests {
             ("/upstream-error", "aa_token_fetch_failed:http_status_502"),
             (
                 "/wrong-content-type",
+                "aa_token_fetch_failed:unexpected_content_type",
+            ),
+            (
+                "/missing-content-type",
                 "aa_token_fetch_failed:unexpected_content_type",
             ),
             ("/invalid-json", "aa_token_fetch_failed:invalid_json"),
@@ -1054,6 +1084,67 @@ mod tests {
             Some("header.payload.signature")
         );
         server.abort();
+    }
+
+    async fn spawn_partial_json_server(
+        hold_open: bool,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial token response server");
+        let address = listener.local_addr().expect("partial server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept token request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\n{\"token\":\"partial",
+                )
+                .await
+                .expect("write partial token response");
+            if hold_open {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn aa_token_fetch_preserves_body_transport_failures() {
+        let client = reqwest::Client::new();
+
+        let (disconnect_address, disconnect_server) = spawn_partial_json_server(false).await;
+        let (payload, error) = fetch_aa_token_payload_from_url(
+            &client,
+            &format!("http://{disconnect_address}/token"),
+            1,
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(payload.is_none());
+        assert_eq!(
+            error.as_deref(),
+            Some("aa_token_fetch_failed:transport_failed")
+        );
+        disconnect_server.await.expect("disconnect server");
+
+        let (timeout_address, timeout_server) = spawn_partial_json_server(true).await;
+        let (payload, error) = fetch_aa_token_payload_from_url(
+            &client,
+            &format!("http://{timeout_address}/token"),
+            1,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(payload.is_none());
+        assert_eq!(
+            error.as_deref(),
+            Some("aa_token_fetch_failed:request_timeout")
+        );
+        timeout_server.abort();
     }
 
     #[test]
