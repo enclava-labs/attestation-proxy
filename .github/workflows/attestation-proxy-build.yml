@@ -84,11 +84,38 @@ jobs:
             MUSL_TARGET=${{ env.MUSL_TARGET }}
           provenance: true
 
+      - name: Write immutable image artifact
+        run: |
+          mkdir -p dist
+          image_ref="ghcr.io/enclava-labs/attestation-proxy@${{ steps.push.outputs.digest }}"
+          printf '%s\n' "${image_ref}" > dist/attestation-proxy-image.txt
+
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign pushed digest
         env:
           IMAGE: ghcr.io/enclava-labs/attestation-proxy
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify signed immutable image
+        env:
+          SIGNER_SUBJECT: https://github.com/${{ github.workflow_ref }}
+          SIGNER_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          image_ref="$(cat dist/attestation-proxy-image.txt)"
+          case "${image_ref}" in
+            ghcr.io/enclava-labs/attestation-proxy@sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "release artifact is not an immutable attestation-proxy digest" >&2; exit 1 ;;
+          esac
+          cosign verify \
+            --certificate-identity "${SIGNER_SUBJECT}" \
+            --certificate-oidc-issuer "${SIGNER_ISSUER}" \
+            "${image_ref}" >/dev/null
+
+      - name: Upload immutable image artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: attestation-proxy-image
+          path: dist/attestation-proxy-image.txt
