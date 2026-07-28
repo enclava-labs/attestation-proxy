@@ -283,46 +283,29 @@ async fn fetch_aa_token_payload_from_url(
                 if !status.is_success() {
                     last_error = format!("http_status_{}", status.as_u16());
                 } else {
-                    let content_type_is_json = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .is_some_and(|value| {
-                            value.split(';').next().is_some_and(|media_type| {
-                                media_type.trim().eq_ignore_ascii_case("application/json")
-                                    || media_type.trim().to_ascii_lowercase().ends_with("+json")
-                            })
-                        });
-                    if !content_type_is_json {
-                        last_error = "unexpected_content_type".to_string();
-                    } else {
-                        match resp.bytes().await {
-                            Ok(body) => match serde_json::from_slice::<Value>(&body) {
-                                Ok(payload) => {
-                                    // Validate response has a non-empty token string
-                                    let has_token = payload
-                                        .as_object()
-                                        .and_then(|o| o.get("token"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| !s.is_empty())
-                                        .unwrap_or(false);
+                    match resp.bytes().await {
+                        Ok(body) => match serde_json::from_slice::<Value>(&body) {
+                            Ok(payload) => {
+                                // Validate response has a non-empty token string
+                                let has_token = payload
+                                    .as_object()
+                                    .and_then(|o| o.get("token"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false);
 
-                                    if has_token {
-                                        return (Some(payload), None);
-                                    } else {
-                                        return (
-                                            None,
-                                            Some("aa_token_invalid_response".to_string()),
-                                        );
-                                    }
+                                if has_token {
+                                    return (Some(payload), None);
+                                } else {
+                                    return (None, Some("aa_token_invalid_response".to_string()));
                                 }
-                                Err(_) => {
-                                    last_error = "invalid_json".to_string();
-                                }
-                            },
-                            Err(error) => {
-                                last_error = classify_reqwest_error(&error).to_string();
                             }
+                            Err(_) => {
+                                last_error = "invalid_json".to_string();
+                            }
+                        },
+                        Err(error) => {
+                            last_error = classify_reqwest_error(&error).to_string();
                         }
                     }
                 }
@@ -1043,14 +1026,6 @@ mod tests {
 
         for (path, expected) in [
             ("/upstream-error", "aa_token_fetch_failed:http_status_502"),
-            (
-                "/wrong-content-type",
-                "aa_token_fetch_failed:unexpected_content_type",
-            ),
-            (
-                "/missing-content-type",
-                "aa_token_fetch_failed:unexpected_content_type",
-            ),
             ("/invalid-json", "aa_token_fetch_failed:invalid_json"),
         ] {
             let (payload, error) = fetch_aa_token_payload_from_url(
@@ -1067,22 +1042,25 @@ mod tests {
             assert!(!error.contains("sensitive"));
         }
 
-        let (payload, error) = fetch_aa_token_payload_from_url(
-            &client,
-            &format!("http://{address}/valid"),
-            1,
-            Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .await;
-        assert!(error.is_none());
-        assert_eq!(
-            payload
-                .as_ref()
-                .and_then(|value| value.get("token"))
-                .and_then(Value::as_str),
-            Some("header.payload.signature")
-        );
+        for path in ["/wrong-content-type", "/missing-content-type", "/valid"] {
+            let (payload, error) = fetch_aa_token_payload_from_url(
+                &client,
+                &format!("http://{address}{path}"),
+                1,
+                Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .await;
+            assert!(error.is_none(), "{path}: {error:?}");
+            assert_eq!(
+                payload
+                    .as_ref()
+                    .and_then(|value| value.get("token"))
+                    .and_then(Value::as_str),
+                Some("header.payload.signature"),
+                "{path}"
+            );
+        }
         server.abort();
     }
 
