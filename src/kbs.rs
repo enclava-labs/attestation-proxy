@@ -444,7 +444,7 @@ async fn send_workload_resource_request(
         }
         if status.as_u16() != 503 || attempt == MAX_ATTEMPTS {
             return Err(OwnershipError::Store(format!(
-                "kbs_workload_{operation}_non_200:{}",
+                "kbs_workload_{operation}_non_200:{}:",
                 status.as_u16()
             )));
         }

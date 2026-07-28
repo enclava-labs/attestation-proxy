@@ -5211,7 +5211,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "storage_error: kbs_workload_put_non_200:401"
+            "storage_error: kbs_workload_put_non_200:401:"
         );
         assert_eq!(api_server.kbs_resource(resource_path), None);
     }
