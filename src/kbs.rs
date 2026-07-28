@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
-use crate::attestation::{fetch_kbs_bearer_token, fetch_kbs_bearer_token_with_runtime_data};
+use crate::attestation::fetch_kbs_bearer_token;
 use crate::ownership::{utc_now, OwnershipError};
 use crate::receipts::{ReceiptType, SignReceiptRequest};
 
@@ -368,17 +368,6 @@ fn sign_workload_receipt(
     Ok(envelope)
 }
 
-fn receipt_bound_report_data(envelope: &Value) -> Result<[u8; 64], OwnershipError> {
-    let pubkey_sha256 = envelope
-        .pointer("/receipt/pubkey_sha256")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| OwnershipError::Store("receipt_pubkey_sha256_missing".to_string()))?;
-    let pubkey_sha256 = decode_hex_32(pubkey_sha256)?;
-    let mut report_data = [0u8; 64];
-    report_data[32..].copy_from_slice(&pubkey_sha256);
-    Ok(report_data)
-}
-
 fn receipt_attestation_runtime_data(envelope: &Value) -> Result<String, OwnershipError> {
     let pubkey_sha256 = envelope
         .pointer("/receipt/pubkey_sha256")
@@ -437,6 +426,34 @@ async fn attach_receipt_attestation(
     Ok(())
 }
 
+async fn send_workload_resource_request(
+    operation: &str,
+    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<(), OwnershipError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let response = build_request()
+            .send()
+            .await
+            .map_err(|e| OwnershipError::Store(format!("kbs_workload_{operation}_failed:{e}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status.as_u16() != 503 || attempt == MAX_ATTEMPTS {
+            return Err(OwnershipError::Store(format!(
+                "kbs_workload_{operation}_non_200:{}",
+                status.as_u16()
+            )));
+        }
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+
+    unreachable!("workload resource attempts are nonzero")
+}
+
 /// Write ciphertext to KBS via the workload-resource endpoint.
 /// Uses PUT /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
 pub async fn put_kbs_workload_resource(
@@ -447,8 +464,7 @@ pub async fn put_kbs_workload_resource(
 ) -> Result<(), OwnershipError> {
     let mut envelope = sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
     attach_receipt_attestation(state, &mut envelope).await?;
-    let report_data = receipt_bound_report_data(&envelope)?;
-    let token = fetch_kbs_bearer_token_with_runtime_data(state, &report_data)
+    let token = fetch_kbs_bearer_token(state)
         .await
         .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
 
@@ -457,28 +473,20 @@ pub async fn put_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    let request = state
-        .http_client
-        .put(&workload_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .timeout(std::time::Duration::from_secs(20));
-    let request = match mode {
-        WorkloadResourceWriteMode::Create => request.header("If-None-Match", "*").json(&envelope),
-        WorkloadResourceWriteMode::Replace => request.header("If-Match", "*").json(&envelope),
-    };
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| OwnershipError::Store(format!("kbs_workload_put_failed:{e}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let resp_body = response.text().await.unwrap_or_default();
-        return Err(OwnershipError::Store(format!(
-            "kbs_workload_put_non_200:{status}:{resp_body}"
-        )));
-    }
+    send_workload_resource_request("put", || {
+        let request = state
+            .http_client
+            .put(&workload_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .timeout(std::time::Duration::from_secs(20));
+        match mode {
+            WorkloadResourceWriteMode::Create => {
+                request.header("If-None-Match", "*").json(&envelope)
+            }
+            WorkloadResourceWriteMode::Replace => request.header("If-Match", "*").json(&envelope),
+        }
+    })
+    .await?;
     // Evict cached entry to ensure read-after-write consistency
     evict_kbs_cache_entry(state, resource_path).await;
     Ok(())
@@ -492,8 +500,7 @@ pub async fn delete_kbs_workload_resource(
 ) -> Result<(), OwnershipError> {
     let mut envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
     attach_receipt_attestation(state, &mut envelope).await?;
-    let report_data = receipt_bound_report_data(&envelope)?;
-    let token = fetch_kbs_bearer_token_with_runtime_data(state, &report_data)
+    let token = fetch_kbs_bearer_token(state)
         .await
         .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
 
@@ -502,24 +509,16 @@ pub async fn delete_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    let response = state
-        .http_client
-        .delete(&workload_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("If-Match", "*")
-        .json(&envelope)
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| OwnershipError::Store(format!("kbs_workload_delete_failed:{e}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let resp_body = response.text().await.unwrap_or_default();
-        return Err(OwnershipError::Store(format!(
-            "kbs_workload_delete_non_200:{status}:{resp_body}"
-        )));
-    }
+    send_workload_resource_request("delete", || {
+        state
+            .http_client
+            .delete(&workload_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("If-Match", "*")
+            .json(&envelope)
+            .timeout(std::time::Duration::from_secs(20))
+    })
+    .await?;
     // Evict cached entry to ensure read-after-write consistency
     evict_kbs_cache_entry(state, resource_path).await;
     Ok(())
@@ -583,21 +582,6 @@ mod tests {
             derived,
             "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/workload-resource/default/test-owner/seed-sealed"
         );
-    }
-
-    #[test]
-    fn receipt_bound_report_data_is_receipt_pubkey_hash_hex() {
-        let pubkey_hash = [0x42u8; 32];
-        let envelope = json!({
-            "receipt": {
-                "pubkey_sha256": hex_lower(&pubkey_hash),
-            }
-        });
-
-        let report_data = receipt_bound_report_data(&envelope).unwrap();
-
-        assert_eq!(&report_data[..32], &[0u8; 32]);
-        assert_eq!(&report_data[32..], &pubkey_hash);
     }
 
     #[test]

@@ -5143,6 +5143,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn workload_resource_retries_service_unavailable() {
+        let signal_dir = test_signal_dir("workload-resource-retry-503");
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let mut workload_resource_status_sequences = HashMap::new();
+        workload_resource_status_sequences.insert(format!("PUT {resource_path}"), vec![503]);
+        let api_server = spawn_test_api_server_with_all_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            HashMap::new(),
+            workload_resource_status_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+
+        crate::kbs::put_kbs_workload_resource(
+            &state,
+            resource_path,
+            b"ciphertext",
+            crate::kbs::WorkloadResourceWriteMode::Create,
+        )
+        .await
+        .expect("503 should be retried");
+
+        assert_eq!(
+            api_server.kbs_resource(resource_path),
+            Some("ciphertext".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_resource_does_not_retry_denial_or_expose_body() {
+        let signal_dir = test_signal_dir("workload-resource-no-retry-401");
+        let resource_path = "default/instance-test-01-owner/seed-encrypted";
+        let mut workload_resource_status_sequences = HashMap::new();
+        workload_resource_status_sequences.insert(format!("PUT {resource_path}"), vec![401]);
+        let api_server = spawn_test_api_server_with_all_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            HashMap::new(),
+            workload_resource_status_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(resource_path.to_string()),
+        );
+
+        let error = crate::kbs::put_kbs_workload_resource(
+            &state,
+            resource_path,
+            b"ciphertext",
+            crate::kbs::WorkloadResourceWriteMode::Create,
+        )
+        .await
+        .expect_err("401 must fail without retry");
+
+        assert_eq!(
+            error.to_string(),
+            "storage_error: kbs_workload_put_non_200:401"
+        );
+        assert_eq!(api_server.kbs_resource(resource_path), None);
+    }
+
     fn build_state(signal_dir: &Path) -> AppState {
         build_state_with_mode(signal_dir, "level1", "http://127.0.0.1:9".to_string(), None)
     }
