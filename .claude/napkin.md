@@ -7,7 +7,11 @@
   bodies, bearer tokens, evidence, request query data, or raw URLs.
 - Check HTTP status before decoding an AA token response. Non-success HTML or
   proxy error pages are transport failures, not malformed token payloads.
-- Runtime-data-bound KBS tokens must bypass the reusable AA token cache.
+- `/aa/token` is identity-only and ignores `runtime_data`; never use it to
+  claim receipt-key binding.
+- Workload receipt keys are bound by embedded `/aa/evidence` proof that KBS
+  verifies independently. Retry only KBS `503` verifier outages, never
+  authorization denials.
 
 ## Verification
 

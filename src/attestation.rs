@@ -354,41 +354,6 @@ pub async fn fetch_kbs_bearer_token(state: &crate::AppState) -> Result<String, S
     Ok(token.to_string())
 }
 
-pub fn kbs_token_url_for_runtime_data(base_url: &str, runtime_data: &[u8; 64]) -> String {
-    let separator = if base_url.contains('?') { '&' } else { '?' };
-    let encoded = URL_SAFE_NO_PAD.encode(runtime_data);
-    format!("{base_url}{separator}runtime_data={encoded}")
-}
-
-/// Fetch a bearer token whose AA evidence report_data is bound to runtime_data.
-///
-/// This intentionally bypasses the generic token cache: workload-resource
-/// mutations need a fresh token bound to the receipt public key used for that
-/// mutation, not a reusable KBS read token.
-pub async fn fetch_kbs_bearer_token_with_runtime_data(
-    state: &crate::AppState,
-    runtime_data: &[u8; 64],
-) -> Result<String, String> {
-    let url = kbs_token_url_for_runtime_data(&state.config.aa_token_url, runtime_data);
-    let attempts = state.config.aa_token_fetch_attempts.max(1);
-    let timeout = Duration::from_secs_f64(state.config.aa_token_timeout_seconds);
-    let retry_sleep = Duration::from_secs_f64(state.config.aa_token_fetch_retry_sleep_seconds);
-    let (payload, error) =
-        fetch_aa_token_payload_from_url(&state.http_client, &url, attempts, timeout, retry_sleep)
-            .await;
-    if let Some(e) = error {
-        return Err(e);
-    }
-    let payload = payload.ok_or("aa_token_invalid_response")?;
-    let token = payload
-        .as_object()
-        .and_then(|o| o.get("token"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or("aa_token_missing")?;
-    Ok(token.to_string())
-}
-
 /// Fetch token claims for attestation. Returns JSON with claims_root, measurement, error.
 pub async fn fetch_kbs_token_claims(state: &crate::AppState) -> Value {
     let mut result = json!({
@@ -1217,22 +1182,6 @@ mod tests {
         // None claims
         let ttl4 = token_cache_ttl_seconds(&None, &config);
         assert!((ttl4 - config.aa_token_cache_seconds).abs() < 0.01);
-    }
-
-    #[test]
-    fn kbs_token_url_for_runtime_data_preserves_existing_query() {
-        let mut report_data = [0u8; 64];
-        report_data[32..].copy_from_slice(&[0x42; 32]);
-
-        let url = super::kbs_token_url_for_runtime_data(
-            "http://127.0.0.1:8006/aa/token?token_type=kbs",
-            &report_data,
-        );
-
-        assert_eq!(
-            url,
-            "http://127.0.0.1:8006/aa/token?token_type=kbs&runtime_data=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg"
-        );
     }
 
     #[test]
