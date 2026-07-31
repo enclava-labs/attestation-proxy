@@ -132,7 +132,10 @@ jobs:
         env:
           IMAGE: ghcr.io/enclava-labs/attestation-proxy
           DIGEST: ${{ github.event.inputs.existing_digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          mkdir -p dist
+          printf '%s@%s\n' "${IMAGE}" "${DIGEST}" > dist/attestation-proxy-image.txt
 
       - name: Verify signed immutable image
         env:
