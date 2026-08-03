@@ -108,11 +108,11 @@ async fn main() {
 
     let tls_socket_addr: std::net::SocketAddr = tls_addr.parse().unwrap();
     tokio::select! {
-        result = axum::serve(http_listener, http_app.into_make_service()) => {
+        result = axum::serve(http_listener, http_app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {
             result.expect("attestation HTTP server failed");
         }
         result = axum_server::bind_rustls(tls_socket_addr, tls_config)
-            .serve(tls_app.into_make_service()) => {
+            .serve(tls_app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {
             result.expect("attestation TLS server failed");
         }
     }
@@ -260,6 +260,10 @@ fn app_router(state: AppState, expose_config_routes: bool) -> Router {
         .route(
             "/.well-known/confidential/attestation",
             get(handlers::attestation),
+        )
+        .route(
+            "/.well-known/confidential/proof-bundle",
+            get(handlers::proof_bundle).options(handlers::proof_preflight),
         )
         .route("/cdh/resource/{*path}", get(handlers::cdh_resource))
         .route("/unlock", post(handlers::unlock))
