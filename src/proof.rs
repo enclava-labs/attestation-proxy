@@ -150,6 +150,7 @@ pub async fn amd_endorsements(
     client: &reqwest::Client,
     report: &[u8],
     product: &str,
+    kds_base_url: &str,
 ) -> Result<Vec<u8>, ProofError> {
     if report.len() != 1_184
         || product.is_empty()
@@ -161,7 +162,7 @@ pub async fn amd_endorsements(
     }
     let chip_id = hex_lower(&report[0x1a0..0x1e0]);
     let tcb = &report[0x180..0x188];
-    let base = format!("https://kdsintf.amd.com/vcek/v1/{product}");
+    let base = format!("{}/{product}", kds_base_url.trim_end_matches('/'));
     let vcek_url = format!(
         "{base}/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
         tcb[0], tcb[1], tcb[6], tcb[7]

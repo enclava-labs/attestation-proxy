@@ -484,9 +484,12 @@ pub async fn proof_bundle(
         let report =
             crate::proof::raw_snp_report(&evidence).map_err(|_| "attestation_evidence_invalid")?;
         let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
-        let endorsements = crate::proof::amd_endorsements(&state.http_client, &report, &product)
-            .await
-            .map_err(|_| "amd_endorsements_unavailable")?;
+        let kds_base_url = std::env::var("AMD_KDS_BASE_URL")
+            .unwrap_or_else(|_| "https://kdsintf.amd.com/vcek/v1".into());
+        let endorsements =
+            crate::proof::amd_endorsements(&state.http_client, &report, &product, &kds_base_url)
+                .await
+                .map_err(|_| "amd_endorsements_unavailable")?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "clock_invalid")?
