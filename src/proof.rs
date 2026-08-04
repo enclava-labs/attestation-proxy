@@ -6,8 +6,8 @@ pub const MAX_BUNDLE_BYTES: usize = 1_048_576;
 pub const MAX_STATIC_BYTES: usize = 716_800;
 
 const STATIC_FIELDS: [(&str, usize); 5] = [
-    ("cc_init_data_toml", 49_152),
-    ("workload_artifacts_json", 98_304),
+    ("cc_init_data_toml", 196_608),
+    ("workload_artifacts_json", 196_608),
     ("trustee_policy_json", 49_152),
     ("sigstore_material", 196_608),
     ("provenance_oci_material", 311_296),
@@ -372,12 +372,23 @@ mod tests {
 
     #[test]
     fn static_material_and_bundle_round_trip_at_boundary() {
-        let fields = STATIC_FIELDS.map(|(label, limit)| (label, vec![7; limit]));
+        let framing =
+            crate::receipts::ce_v1_bytes(&STATIC_FIELDS.map(|(label, _)| (label, b"".as_slice())))
+                .len();
+        let mut sizes = [196_608, 196_608, 49_152, 196_608, 0];
+        sizes[4] = MAX_STATIC_BYTES - framing - sizes.iter().sum::<usize>();
+        assert!(sizes[4] <= STATIC_FIELDS[4].1);
+        let fields = STATIC_FIELDS
+            .iter()
+            .zip(sizes)
+            .map(|((label, _), size)| (*label, vec![7; size]))
+            .collect::<Vec<_>>();
         let refs = fields
             .iter()
             .map(|(label, value)| (*label, value.as_slice()))
             .collect::<Vec<_>>();
         let static_material = crate::receipts::ce_v1_bytes(&refs);
+        assert_eq!(static_material.len(), MAX_STATIC_BYTES);
         validate_static_material(&static_material).unwrap();
         let config_map = serde_json::json!({
             "apiVersion": "v1",
