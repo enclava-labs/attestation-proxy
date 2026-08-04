@@ -3105,6 +3105,16 @@ mod tests {
     }
 
     #[test]
+    fn proof_enforces_global_rate_across_sources() {
+        let mut rate = ProofRate::default();
+        let now = Instant::now();
+        for source in 0..PROOF_GLOBAL_PER_MINUTE {
+            assert!(rate.allow(IpAddr::from([192, 0, 2, source as u8]), now));
+        }
+        assert!(!rate.allow(IpAddr::from([198, 51, 100, 1]), now));
+    }
+
+    #[test]
     fn proof_uses_only_trusted_ingress_forwarding_metadata() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
