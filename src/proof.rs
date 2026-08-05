@@ -180,7 +180,7 @@ pub async fn amd_endorsements(
         return Err(ProofError::InvalidReport);
     }
     let key_info = u32::from_le_bytes(report[0x48..0x4c].try_into().unwrap());
-    if (key_info >> 2) & 0b111 != 0 {
+    if key_info & 0b10 != 0 || (key_info >> 2) & 0b111 != 0 {
         return Err(ProofError::InvalidReport);
     }
     let base = format!("{}/{product}", kds_base_url.trim_end_matches('/'));
@@ -518,20 +518,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vlek_reports_are_rejected_before_kds_fetch() {
-        let mut report = vec![0; 1_184];
-        report[0x48..0x4c].copy_from_slice(&4_u32.to_le_bytes());
-        assert!(matches!(
-            amd_endorsements(
-                &reqwest::Client::new(),
-                &report,
-                "Genoa",
-                "https://invalid.example",
-                120_000,
-            )
-            .await,
-            Err(ProofError::InvalidReport)
-        ));
+    async fn unsigned_and_non_vcek_reports_are_rejected_before_kds_fetch() {
+        for key_info in [2_u32, 4] {
+            let mut report = vec![0; 1_184];
+            report[0x48..0x4c].copy_from_slice(&key_info.to_le_bytes());
+            assert!(matches!(
+                amd_endorsements(
+                    &reqwest::Client::new(),
+                    &report,
+                    "Genoa",
+                    "https://invalid.example",
+                    120_000,
+                )
+                .await,
+                Err(ProofError::InvalidReport)
+            ));
+        }
     }
 
     #[test]
