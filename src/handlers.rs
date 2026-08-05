@@ -453,6 +453,12 @@ pub async fn proof_bundle(
     } else {
         cert_file
     };
+    if !matches!(
+        crate::proof::certificate_covers_host(&tls_leaf_der, &host),
+        Ok(true)
+    ) {
+        return proof_json_response(503, "tls_identity_host_mismatch");
+    }
     let leaf_spki_sha256 = {
         use x509_cert::der::{Decode, Encode};
         let certificate = match x509_cert::Certificate::from_der(&tls_leaf_der) {
@@ -502,12 +508,12 @@ pub async fn proof_bundle(
             .map_err(|_| "attestation_unavailable")?;
         let evidence: Value =
             serde_json::from_slice(&evidence_bytes).map_err(|_| "attestation_evidence_invalid")?;
-        let report =
-            crate::proof::raw_snp_report(&evidence).map_err(|_| "attestation_evidence_invalid")?;
+        let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
+        let report = crate::proof::raw_snp_report(&evidence, &product)
+            .map_err(|_| "attestation_evidence_invalid")?;
         if report.get(0x50..0x90) != Some(report_data.as_slice()) {
             return Err("attestation_evidence_invalid");
         }
-        let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
         let kds_base_url = std::env::var("AMD_KDS_BASE_URL")
             .unwrap_or_else(|_| "https://kdsintf.amd.com/vcek/v1".into());
         let crl_max_bytes =

@@ -120,7 +120,7 @@ pub fn build_bundle(input: BundleInput<'_>) -> Result<Vec<u8>, ProofError> {
     Ok(bundle)
 }
 
-pub fn raw_snp_report(evidence: &Value) -> Result<Vec<u8>, ProofError> {
+pub fn raw_snp_report(evidence: &Value, product: &str) -> Result<Vec<u8>, ProofError> {
     let report = evidence
         .get("attestation_report")
         .ok_or(ProofError::InvalidReport)?;
@@ -133,7 +133,8 @@ pub fn raw_snp_report(evidence: &Value) -> Result<Vec<u8>, ProofError> {
     put_array(&mut out, 0x20, report, "image_id", 16)?;
     put_u32(&mut out, 0x30, number(report, "vmpl")?)?;
     put_u32(&mut out, 0x34, number(report, "sig_algo")?)?;
-    put_u64(&mut out, 0x38, tcb(report, "current_tcb")?)?;
+    let turin = product.to_ascii_lowercase().starts_with("turin");
+    put_u64(&mut out, 0x38, tcb(report, "current_tcb", turin)?)?;
     put_u64(&mut out, 0x40, number(report, "plat_info")?)?;
     put_u32(&mut out, 0x48, number(report, "key_info")?)?;
     put_array(&mut out, 0x50, report, "report_data", 64)?;
@@ -143,17 +144,17 @@ pub fn raw_snp_report(evidence: &Value) -> Result<Vec<u8>, ProofError> {
     put_array(&mut out, 0x110, report, "author_key_digest", 48)?;
     put_array(&mut out, 0x140, report, "report_id", 32)?;
     put_array(&mut out, 0x160, report, "report_id_ma", 32)?;
-    put_u64(&mut out, 0x180, tcb(report, "reported_tcb")?)?;
+    put_u64(&mut out, 0x180, tcb(report, "reported_tcb", turin)?)?;
     if version >= 3 {
         out[0x188] = byte(report, "cpuid_fam_id")?;
         out[0x189] = byte(report, "cpuid_mod_id")?;
         out[0x18a] = byte(report, "cpuid_step")?;
     }
     put_array(&mut out, 0x1a0, report, "chip_id", 64)?;
-    put_u64(&mut out, 0x1e0, tcb(report, "committed_tcb")?)?;
+    put_u64(&mut out, 0x1e0, tcb(report, "committed_tcb", turin)?)?;
     put_version(&mut out, 0x1e8, report, "current")?;
     put_version(&mut out, 0x1ec, report, "committed")?;
-    put_u64(&mut out, 0x1f0, tcb(report, "launch_tcb")?)?;
+    put_u64(&mut out, 0x1f0, tcb(report, "launch_tcb", turin)?)?;
     if version >= 5 {
         put_u64(&mut out, 0x1f8, number(report, "launch_mit_vector")?)?;
         put_u64(&mut out, 0x200, number(report, "current_mit_vector")?)?;
@@ -222,7 +223,7 @@ fn vcek_url(report: &[u8], product: &str, base: &str) -> String {
     if turin {
         format!(
             "{base}/{chip_id}?fmcSPL={:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
-            tcb[2], tcb[0], tcb[1], tcb[6], tcb[7]
+            tcb[0], tcb[1], tcb[2], tcb[3], tcb[7]
         )
     } else {
         format!(
@@ -251,6 +252,35 @@ pub fn pem_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProofError> {
     (!certificates.is_empty())
         .then_some(certificates)
         .ok_or(ProofError::Malformed)
+}
+
+pub fn certificate_covers_host(tls_leaf_der: &[u8], host: &str) -> Result<bool, ProofError> {
+    use x509_cert::{
+        der::Decode,
+        ext::pkix::{name::GeneralName, SubjectAltName},
+        Certificate,
+    };
+
+    let certificate = Certificate::from_der(tls_leaf_der).map_err(|_| ProofError::Malformed)?;
+    let names = certificate
+        .tbs_certificate
+        .get::<SubjectAltName>()
+        .map_err(|_| ProofError::Malformed)?
+        .ok_or(ProofError::Malformed)?
+        .1;
+    Ok(names.0.iter().any(|name| match name {
+        GeneralName::DnsName(name) => dns_name_matches(name.as_str(), host),
+        _ => false,
+    }))
+}
+
+fn dns_name_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.split_once('.')
+            .is_some_and(|(_, host_suffix)| host_suffix.eq_ignore_ascii_case(suffix))
+    } else {
+        pattern.eq_ignore_ascii_case(host)
+    }
 }
 
 async fn get_limited(client: &reqwest::Client, url: &str, limit: u64) -> Result<Vec<u8>, ()> {
@@ -408,20 +438,24 @@ fn put_array(
     Ok(())
 }
 
-fn tcb(report: &Value, key: &str) -> Result<u64, ProofError> {
+fn tcb(report: &Value, key: &str, turin: bool) -> Result<u64, ProofError> {
     let value = report.get(key).ok_or(ProofError::InvalidReport)?;
     let mut bytes = [0; 8];
-    bytes[0] = byte(value, "bootloader")?;
-    bytes[1] = byte(value, "tee")?;
-    if let Some(fmc) = value.get("fmc").and_then(Value::as_u64) {
-        bytes[2] = fmc.try_into().map_err(|_| ProofError::InvalidReport)?;
+    if turin {
+        bytes[0] = byte(value, "fmc")?;
+        bytes[1] = byte(value, "bootloader")?;
+        bytes[2] = byte(value, "tee")?;
+        bytes[3] = byte(value, "snp")?;
+    } else {
+        bytes[0] = byte(value, "bootloader")?;
+        bytes[1] = byte(value, "tee")?;
+        bytes[6] = value
+            .get("snp")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| ProofError::InvalidReport)?;
     }
-    bytes[6] = value
-        .get("snp")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .try_into()
-        .map_err(|_| ProofError::InvalidReport)?;
     bytes[7] = byte(value, "microcode")?;
     Ok(u64::from_le_bytes(bytes))
 }
@@ -465,7 +499,7 @@ mod tests {
             "current_mit_vector": 11, "launch_mit_vector": 12,
             "signature": {"r": report_array(72, 13), "s": report_array(72, 14)}
         }});
-        let report = raw_snp_report(&evidence).unwrap();
+        let report = raw_snp_report(&evidence, "Genoa").unwrap();
         assert_eq!(report.len(), 1_184);
         assert_eq!(&report[0x90..0xc0], &[4; 48]);
         assert_eq!(&report[0x1a0..0x1e0], &[10; 64]);
@@ -493,15 +527,55 @@ mod tests {
         ] {
             fields.remove(key);
         }
-        let report = raw_snp_report(&evidence).unwrap();
+        let report = raw_snp_report(&evidence, "Genoa").unwrap();
         assert_eq!(&report[0x188..0x18b], &[0; 3]);
         assert_eq!(&report[0x1f8..0x208], &[0; 16]);
     }
 
     #[test]
+    fn reconstructs_turin_tcb_layout() {
+        let tcb = json!({"fmc": 3, "bootloader": 10, "tee": 2, "snp": 24, "microcode": 84});
+        let evidence = json!({"attestation_report": {
+            "version": 5, "guest_svn": 1, "policy": 0x30000_u64,
+            "family_id": report_array(16, 1), "image_id": report_array(16, 2),
+            "vmpl": 0, "sig_algo": 1, "current_tcb": tcb.clone(),
+            "plat_info": 0, "key_info": 0, "report_data": report_array(64, 3),
+            "measurement": report_array(48, 4), "host_data": report_array(32, 5),
+            "id_key_digest": report_array(48, 6), "author_key_digest": report_array(48, 7),
+            "report_id": report_array(32, 8), "report_id_ma": report_array(32, 9),
+            "reported_tcb": tcb.clone(), "cpuid_fam_id": 26, "cpuid_mod_id": 1,
+            "cpuid_step": 0, "chip_id": report_array(64, 10), "committed_tcb": tcb.clone(),
+            "current": {"build": 1, "minor": 0, "major": 1},
+            "committed": {"build": 1, "minor": 0, "major": 1}, "launch_tcb": tcb,
+            "current_mit_vector": 0, "launch_mit_vector": 0,
+            "signature": {"r": report_array(72, 13), "s": report_array(72, 14)}
+        }});
+        let report = raw_snp_report(&evidence, "Turin").unwrap();
+        for offset in [0x38, 0x180, 0x1e0, 0x1f0] {
+            assert_eq!(&report[offset..offset + 8], &[3, 10, 2, 24, 0, 0, 0, 84]);
+        }
+    }
+
+    #[test]
+    fn certificate_host_matching_supports_exact_and_single_label_wildcards() {
+        let params = rcgen::CertificateParams::new(vec![
+            "app.example.com".into(),
+            "*.apps.example.com".into(),
+        ])
+        .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+
+        assert!(certificate_covers_host(cert.der(), "app.example.com").unwrap());
+        assert!(certificate_covers_host(cert.der(), "demo.apps.example.com").unwrap());
+        assert!(!certificate_covers_host(cert.der(), "deep.demo.apps.example.com").unwrap());
+        assert!(!certificate_covers_host(cert.der(), "other.example.com").unwrap());
+    }
+
+    #[test]
     fn turin_vcek_url_uses_short_hwid_and_fmc_spl() {
         let mut report = vec![0; 1_184];
-        report[0x180..0x188].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        report[0x180..0x188].copy_from_slice(&[3, 1, 2, 7, 0, 0, 0, 8]);
         report[0x1a0..0x1e0].copy_from_slice(&[0xab; 64]);
         let url = vcek_url(&report, "Turin", "https://kds.example/Turin");
         assert_eq!(
