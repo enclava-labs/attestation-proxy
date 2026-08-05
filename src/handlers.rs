@@ -366,12 +366,13 @@ fn proof_origin(headers: &HeaderMap) -> Result<(String, String), &'static str> {
         .ok_or("target_origin_missing")?;
     let authority: axum::http::uri::Authority =
         host.parse().map_err(|_| "target_origin_invalid")?;
-    validate_attestation_domain(authority.host()).map_err(|_| "target_origin_invalid")?;
+    let host =
+        validate_attestation_domain(authority.host()).map_err(|_| "target_origin_invalid")?;
     let origin = match authority.port_u16() {
-        None | Some(443) => format!("https://{}", authority.host()),
-        Some(port) => format!("https://{}:{port}", authority.host()),
+        None | Some(443) => format!("https://{host}"),
+        Some(port) => format!("https://{host}:{port}"),
     };
-    Ok((authority.host().to_owned(), origin))
+    Ok((host, origin))
 }
 
 fn proof_nonce(raw_query: Option<&str>) -> Result<[u8; 32], ()> {
@@ -3176,6 +3177,11 @@ mod tests {
             ("app.example".into(), "https://app.example:8443".into())
         );
         headers.insert(header::HOST, "app.example:443".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example".into())
+        );
+        headers.insert(header::HOST, "APP.EXAMPLE".parse().unwrap());
         assert_eq!(
             proof_origin(&headers).unwrap(),
             ("app.example".into(), "https://app.example".into())
