@@ -221,12 +221,12 @@ fn vcek_url(report: &[u8], product: &str, base: &str) -> String {
     let tcb = &report[0x180..0x188];
     if turin {
         format!(
-            "{base}/{chip_id}?fmcSPL={}&blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+            "{base}/{chip_id}?fmcSPL={:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
             tcb[2], tcb[0], tcb[1], tcb[6], tcb[7]
         )
     } else {
         format!(
-            "{base}/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+            "{base}/{chip_id}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
             tcb[0], tcb[1], tcb[6], tcb[7]
         )
     }
@@ -506,8 +506,16 @@ mod tests {
         let url = vcek_url(&report, "Turin", "https://kds.example/Turin");
         assert_eq!(
             url,
-            "https://kds.example/Turin/abababababababab?fmcSPL=3&blSPL=1&teeSPL=2&snpSPL=7&ucodeSPL=8"
+            "https://kds.example/Turin/abababababababab?fmcSPL=03&blSPL=01&teeSPL=02&snpSPL=07&ucodeSPL=08"
         );
+    }
+
+    #[test]
+    fn genoa_vcek_url_zero_pads_spl_values() {
+        let mut report = vec![0; 1_184];
+        report[0x180..0x188].copy_from_slice(&[1, 0, 3, 4, 5, 6, 7, 8]);
+        let url = vcek_url(&report, "Genoa", "https://kds.example/Genoa");
+        assert!(url.ends_with("?blSPL=01&teeSPL=00&snpSPL=07&ucodeSPL=08"));
     }
 
     #[test]
