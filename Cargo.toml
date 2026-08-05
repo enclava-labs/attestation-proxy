@@ -7,7 +7,7 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "fs"] }
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

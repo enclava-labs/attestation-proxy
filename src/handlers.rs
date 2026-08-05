@@ -51,6 +51,7 @@ pub struct ProofQuery {
 
 const PROOF_PER_SOURCE_PER_MINUTE: usize = 6;
 const PROOF_GLOBAL_PER_MINUTE: usize = 30;
+const PROOF_CRL_MAX_BYTES: u64 = 120_000;
 static PROOF_QUOTE_SLOT: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(1));
 static PROOF_RATE: LazyLock<Mutex<ProofRate>> = LazyLock::new(|| Mutex::new(ProofRate::default()));
@@ -354,6 +355,13 @@ fn proof_source(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     peer.ip()
 }
 
+fn proof_crl_max_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PROOF_CRL_MAX_BYTES)
+        .min(PROOF_CRL_MAX_BYTES)
+}
+
 fn proof_host(headers: &HeaderMap) -> Result<String, &'static str> {
     let host = headers
         .get(header::HOST)
@@ -403,7 +411,7 @@ pub async fn proof_bundle(
 
     let material_path = std::env::var("PROOF_MATERIAL_PATH")
         .unwrap_or_else(|_| "/etc/enclava-verification/verification-material.ce".into());
-    let static_material = match std::fs::read(material_path) {
+    let static_material = match tokio::fs::read(material_path).await {
         Ok(bytes) if crate::proof::validate_static_material(&bytes).is_ok() => bytes,
         _ => return proof_json_response(503, "proof_material_unavailable"),
     };
@@ -416,7 +424,7 @@ pub async fn proof_bundle(
 
     let cert_path = std::env::var("PROOF_TLS_CERT_PATH")
         .unwrap_or_else(|_| "/run/enclava/public-tls/certificates/tls.crt".into());
-    let cert_file = match std::fs::read(cert_path) {
+    let cert_file = match tokio::fs::read(cert_path).await {
         Ok(bytes) => bytes,
         Err(_) => return proof_json_response(503, "tls_identity_unavailable"),
     };
@@ -486,10 +494,23 @@ pub async fn proof_bundle(
         let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
         let kds_base_url = std::env::var("AMD_KDS_BASE_URL")
             .unwrap_or_else(|_| "https://kdsintf.amd.com/vcek/v1".into());
-        let endorsements =
-            crate::proof::amd_endorsements(&state.http_client, &report, &product, &kds_base_url)
-                .await
-                .map_err(|_| "amd_endorsements_unavailable")?;
+        let crl_max_bytes =
+            proof_crl_max_bytes(std::env::var("AMD_KDS_CRL_MAX_BYTES").ok().as_deref());
+        let endorsements = crate::proof::amd_endorsements(
+            &state.http_client,
+            &report,
+            &product,
+            &kds_base_url,
+            crl_max_bytes,
+        )
+        .await
+        .map_err(|_| {
+            eprintln!(
+                "{{\"event\":\"amd_endorsements_unavailable\",\"product\":{}}}",
+                serde_json::to_string(&product).unwrap_or_else(|_| "\"invalid\"".into())
+            );
+            "amd_endorsements_unavailable"
+        })?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "clock_invalid")?
@@ -3126,6 +3147,14 @@ mod tests {
             proof_source(&headers, "192.0.2.2:1234".parse().unwrap()),
             "192.0.2.2".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn proof_crl_limit_is_configurable_but_bounded() {
+        assert_eq!(proof_crl_max_bytes(Some("100000")), 100_000);
+        assert_eq!(proof_crl_max_bytes(Some("999999")), PROOF_CRL_MAX_BYTES);
+        assert_eq!(proof_crl_max_bytes(Some("0")), PROOF_CRL_MAX_BYTES);
+        assert_eq!(proof_crl_max_bytes(Some("invalid")), PROOF_CRL_MAX_BYTES);
     }
 
     #[test]

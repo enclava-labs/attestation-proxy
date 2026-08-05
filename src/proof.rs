@@ -151,6 +151,7 @@ pub async fn amd_endorsements(
     report: &[u8],
     product: &str,
     kds_base_url: &str,
+    crl_max_bytes: u64,
 ) -> Result<Vec<u8>, ProofError> {
     if report.len() != 1_184
         || product.is_empty()
@@ -172,7 +173,7 @@ pub async fn amd_endorsements(
     let (chain, vcek, crl) = tokio::try_join!(
         get_limited(client, &chain_url, 16_384),
         get_limited(client, &vcek_url, 16_384),
-        get_limited(client, &crl_url, 96_000),
+        get_limited(client, &crl_url, crl_max_bytes),
     )
     .map_err(|_| ProofError::InvalidReport)?;
     let certificates = pem_certificates(&chain)?;
