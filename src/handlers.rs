@@ -59,10 +59,12 @@ struct ProofRate {
 
 impl ProofRate {
     fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
-        let cutoff = now - Duration::from_secs(60);
-        self.global.retain(|seen| *seen > cutoff);
+        self.global
+            .retain(|seen| now.saturating_duration_since(*seen) < Duration::from_secs(60));
         self.sources.retain(|_, seen| {
-            seen.retain(|instant| *instant > cutoff);
+            seen.retain(|instant| {
+                now.saturating_duration_since(*instant) < Duration::from_secs(60)
+            });
             !seen.is_empty()
         });
         let source_window = self.sources.entry(source).or_default();
