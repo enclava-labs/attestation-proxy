@@ -3,8 +3,8 @@
 /// All 6 GET endpoints with Python-identical response contracts.
 /// POST /unlock implements the ownership handoff protocol.
 use axum::body::Body;
-use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{header, HeaderValue, Response as HttpResponse};
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
+use axum::http::{header, HeaderMap, HeaderValue, Response as HttpResponse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
@@ -13,8 +13,11 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use serde_json::{json, Value};
-use sha2::Digest;
-use std::time::{Duration, Instant};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use zeroize::Zeroizing;
 
@@ -39,6 +42,41 @@ pub struct AttestationQuery {
     pub runtime_data: Option<String>,
     pub leaf_spki_sha256: Option<String>,
     pub domain: Option<String>,
+}
+
+const PROOF_PER_SOURCE_PER_MINUTE: usize = 6;
+const PROOF_GLOBAL_PER_MINUTE: usize = 30;
+const PROOF_CRL_MAX_BYTES: u64 = 120_000;
+static PROOF_QUOTE_SLOT: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(1));
+static PROOF_RATE: LazyLock<Mutex<ProofRate>> = LazyLock::new(|| Mutex::new(ProofRate::default()));
+
+#[derive(Default)]
+struct ProofRate {
+    global: VecDeque<Instant>,
+    sources: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+impl ProofRate {
+    fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
+        self.global
+            .retain(|seen| now.saturating_duration_since(*seen) < Duration::from_secs(60));
+        self.sources.retain(|_, seen| {
+            seen.retain(|instant| {
+                now.saturating_duration_since(*instant) < Duration::from_secs(60)
+            });
+            !seen.is_empty()
+        });
+        let source_window = self.sources.entry(source).or_default();
+        if self.global.len() >= PROOF_GLOBAL_PER_MINUTE
+            || source_window.len() >= PROOF_PER_SOURCE_PER_MINUTE
+        {
+            return false;
+        }
+        self.global.push_back(now);
+        source_window.push_back(now);
+        true
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -285,6 +323,247 @@ fn bytes_response(status: u16, body: Vec<u8>, content_type: &str) -> Response {
         .body(Body::from(body))
         .unwrap()
         .into_response()
+}
+
+fn proof_json_response(status: u16, error: &str) -> Response {
+    let body = serde_json::to_vec(&json!({"error": error})).unwrap_or_default();
+    let mut builder = HttpResponse::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    if status == 429 {
+        builder = builder.header(header::RETRY_AFTER, "60");
+    }
+    builder.body(Body::from(body)).unwrap().into_response()
+}
+
+fn proof_source(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if peer.ip().is_loopback() {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.trim().parse().ok())
+        {
+            return forwarded;
+        }
+    }
+    peer.ip()
+}
+
+fn proof_crl_max_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PROOF_CRL_MAX_BYTES)
+        .min(PROOF_CRL_MAX_BYTES)
+}
+
+fn proof_origin(headers: &HeaderMap) -> Result<(String, String), &'static str> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or("target_origin_missing")?;
+    let authority: axum::http::uri::Authority =
+        host.parse().map_err(|_| "target_origin_invalid")?;
+    let host =
+        validate_attestation_domain(authority.host()).map_err(|_| "target_origin_invalid")?;
+    let origin = match authority.port_u16() {
+        None | Some(443) => format!("https://{host}"),
+        Some(port) => format!("https://{host}:{port}"),
+    };
+    Ok((host, origin))
+}
+
+fn proof_nonce(raw_query: Option<&str>) -> Result<[u8; 32], ()> {
+    let mut values = raw_query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|field| field.split_once('='))
+        .filter(|(key, _)| *key == "nonce");
+    let raw = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = percent_encoding::percent_decode_str(raw.1)
+        .decode_utf8()
+        .map_err(|_| ())?;
+    decode_fixed32_base64(&value, "nonce").map_err(|_| ())
+}
+
+pub async fn proof_preflight() -> Response {
+    HttpResponse::builder()
+        .status(204)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Accept")
+        .header(header::ACCESS_CONTROL_MAX_AGE, "600")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .unwrap()
+        .into_response()
+}
+
+pub async fn proof_bundle(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let nonce = match proof_nonce(raw_query.as_deref()) {
+        Ok(nonce) => nonce,
+        Err(_) => return proof_json_response(400, "nonce_invalid"),
+    };
+    let (host, origin) = match proof_origin(&headers) {
+        Ok(origin) => origin,
+        Err(error) => return proof_json_response(400, error),
+    };
+    let source = proof_source(&headers, peer);
+    if !PROOF_RATE
+        .lock()
+        .is_ok_and(|mut rate| rate.allow(source, Instant::now()))
+    {
+        return proof_json_response(429, "rate_limited");
+    }
+
+    let material_path = std::env::var("PROOF_MATERIAL_PATH")
+        .unwrap_or_else(|_| "/etc/enclava-verification/verification-material.ce".into());
+    let static_material = match tokio::fs::read(material_path).await {
+        Ok(bytes) if crate::proof::validate_static_material(&bytes).is_ok() => bytes,
+        _ => return proof_json_response(503, "proof_material_unavailable"),
+    };
+    if !matches!(
+        crate::proof::workload_allows_host(&static_material, &host),
+        Ok(true)
+    ) {
+        return proof_json_response(403, "target_origin_not_allowed");
+    }
+
+    let cert_path = std::env::var("PROOF_TLS_CERT_PATH")
+        .unwrap_or_else(|_| "/run/enclava/public-tls/certificates/tls.crt".into());
+    let cert_file = match tokio::fs::read(cert_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return proof_json_response(503, "tls_identity_unavailable"),
+    };
+    let tls_leaf_der = if cert_file.starts_with(b"-----BEGIN CERTIFICATE-----") {
+        match crate::proof::pem_certificates(&cert_file) {
+            Ok(mut certificates) => certificates.remove(0),
+            Err(_) => return proof_json_response(503, "tls_identity_invalid"),
+        }
+    } else {
+        cert_file
+    };
+    if !matches!(
+        crate::proof::certificate_covers_host(&tls_leaf_der, &host),
+        Ok(true)
+    ) {
+        return proof_json_response(503, "tls_identity_host_mismatch");
+    }
+    let leaf_spki_sha256 = {
+        use x509_cert::der::{Decode, Encode};
+        let certificate = match x509_cert::Certificate::from_der(&tls_leaf_der) {
+            Ok(certificate) => certificate,
+            Err(_) => return proof_json_response(503, "tls_identity_invalid"),
+        };
+        let spki = match certificate.tbs_certificate.subject_public_key_info.to_der() {
+            Ok(spki) => spki,
+            Err(_) => return proof_json_response(503, "tls_identity_invalid"),
+        };
+        Sha256::digest(spki).into()
+    };
+
+    let quote_slot = match PROOF_QUOTE_SLOT.try_acquire() {
+        Ok(slot) => slot,
+        Err(_) => return proof_json_response(429, "quote_busy"),
+    };
+    let receipt_public_key = state.receipt_signer.verifying_key().to_bytes();
+    let report_data = build_report_data(
+        origin.strip_prefix("https://").expect("HTTPS origin"),
+        &nonce,
+        &leaf_spki_sha256,
+        &state.receipt_signer.public_key_sha256(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let encoded = std::str::from_utf8(&report_data).expect("report data is hex ASCII");
+        let response = state
+            .http_client
+            .get(format!(
+                "{}?runtime_data={encoded}",
+                state.config.aa_evidence_url
+            ))
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|_| "attestation_unavailable")?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > 65_536)
+        {
+            return Err("attestation_unavailable");
+        }
+        let evidence_bytes = crate::proof::response_bytes_limited(response, 65_536)
+            .await
+            .map_err(|_| "attestation_unavailable")?;
+        let evidence: Value =
+            serde_json::from_slice(&evidence_bytes).map_err(|_| "attestation_evidence_invalid")?;
+        let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
+        let report = crate::proof::raw_snp_report(&evidence, &product)
+            .map_err(|_| "attestation_evidence_invalid")?;
+        if report.get(0x50..0x90) != Some(report_data.as_slice()) {
+            return Err("attestation_evidence_invalid");
+        }
+        let kds_base_url = std::env::var("AMD_KDS_BASE_URL")
+            .unwrap_or_else(|_| "https://kdsintf.amd.com/vcek/v1".into());
+        let crl_max_bytes =
+            proof_crl_max_bytes(std::env::var("AMD_KDS_CRL_MAX_BYTES").ok().as_deref());
+        let endorsements = crate::proof::amd_endorsements(
+            &state.http_client,
+            &report,
+            &product,
+            &kds_base_url,
+            crl_max_bytes,
+        )
+        .await
+        .map_err(|_| {
+            eprintln!(
+                "{{\"event\":\"amd_endorsements_unavailable\",\"product\":{}}}",
+                serde_json::to_string(&product).unwrap_or_else(|_| "\"invalid\"".into())
+            );
+            "amd_endorsements_unavailable"
+        })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock_invalid")?
+            .as_secs();
+        crate::proof::build_bundle(crate::proof::BundleInput {
+            target_origin: &origin,
+            nonce: &nonce,
+            created_at_unix_seconds: now,
+            snp_report: &report,
+            tls_leaf_der: &tls_leaf_der,
+            receipt_public_key: &receipt_public_key,
+            amd_endorsements: &endorsements,
+            static_material: &static_material,
+        })
+        .map_err(|_| "proof_bundle_invalid")
+    })
+    .await;
+    drop(quote_slot);
+
+    match result {
+        Ok(Ok(bundle)) => HttpResponse::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, crate::proof::MEDIA_TYPE)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Body::from(bundle))
+            .unwrap()
+            .into_response(),
+        Ok(Err(error)) => proof_json_response(502, error),
+        Err(_) => proof_json_response(504, "proof_generation_timeout"),
+    }
 }
 
 /// Convert empty string to null for JSON output (matches Python's `or None`).
@@ -2854,6 +3133,81 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         state.ownership.state_json()
+    }
+
+    #[test]
+    fn proof_rate_limits_before_quote_generation() {
+        let mut rate = ProofRate::default();
+        let source = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..PROOF_PER_SOURCE_PER_MINUTE {
+            assert!(rate.allow(source, now));
+        }
+        assert!(!rate.allow(source, now));
+        assert!(rate.allow(source, now + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn proof_enforces_global_rate_across_sources() {
+        let mut rate = ProofRate::default();
+        let now = Instant::now();
+        for source in 0..PROOF_GLOBAL_PER_MINUTE {
+            assert!(rate.allow(IpAddr::from([192, 0, 2, source as u8]), now));
+        }
+        assert!(!rate.allow(IpAddr::from([198, 51, 100, 1]), now));
+    }
+
+    #[test]
+    fn proof_uses_only_trusted_ingress_forwarding_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.1, 192.0.2.10".parse().unwrap(),
+        );
+        assert_eq!(
+            proof_source(&headers, "127.0.0.1:1234".parse().unwrap()),
+            "198.51.100.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            proof_source(&headers, "192.0.2.2:1234".parse().unwrap()),
+            "192.0.2.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn proof_origin_preserves_non_default_ports() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "app.example:8443".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example:8443".into())
+        );
+        headers.insert(header::HOST, "app.example:443".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example".into())
+        );
+        headers.insert(header::HOST, "APP.EXAMPLE".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example".into())
+        );
+    }
+
+    #[test]
+    fn proof_nonce_rejects_missing_and_duplicate_values() {
+        let encoded = URL_SAFE_NO_PAD.encode([7; 32]);
+        assert_eq!(proof_nonce(Some(&format!("nonce={encoded}"))), Ok([7; 32]));
+        assert!(proof_nonce(None).is_err());
+        assert!(proof_nonce(Some(&format!("nonce={encoded}&nonce={encoded}"))).is_err());
+    }
+
+    #[test]
+    fn proof_crl_limit_is_configurable_but_bounded() {
+        assert_eq!(proof_crl_max_bytes(Some("100000")), 100_000);
+        assert_eq!(proof_crl_max_bytes(Some("999999")), PROOF_CRL_MAX_BYTES);
+        assert_eq!(proof_crl_max_bytes(Some("0")), PROOF_CRL_MAX_BYTES);
+        assert_eq!(proof_crl_max_bytes(Some("invalid")), PROOF_CRL_MAX_BYTES);
     }
 
     #[test]

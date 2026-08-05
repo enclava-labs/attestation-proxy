@@ -12,6 +12,7 @@ auto-unlock.
 - `GET /status`
 - `GET /v1/attestation?nonce=<base64-32B>&domain=<host>&leaf_spki_sha256=<hex-or-base64-32B>`
 - `GET /v1/attestation/info`
+- `GET /.well-known/confidential/proof-bundle?nonce=<base64url-32B>`
 - `GET /cdh/resource/<path>`
 - `POST /unlock`
 - `POST /change-password`
@@ -38,6 +39,34 @@ The proxy computes SNP `REPORT_DATA` locally:
 
 Only those 64 computed bytes are base64-encoded and forwarded to AA as
 `runtime_data`.
+
+## Independent proof bundle
+
+The reserved proof route returns `application/vnd.enclava.proof-bundle.v1`,
+`Cache-Control: no-store`, and credential-free CORS. It derives the HTTPS host
+from the ingress request, requires that host in the mounted signed deployment
+descriptor, reads the public ingress leaf certificate internally, and never
+accepts caller-supplied policy, domain, SPKI, or runtime data.
+
+Static evidence is read from
+`PROOF_MATERIAL_PATH` (default
+`/etc/enclava-verification/verification-material.ce`) and the current public
+TLS certificate from `PROOF_TLS_CERT_PATH` (default
+`/run/enclava/public-tls/certificates/tls.crt`). `AMD_KDS_PRODUCT` defaults to
+`Genoa` and remains configurable for other SNP hardware.
+`AMD_KDS_CRL_MAX_BYTES` defaults to 120000 and may be lowered, but cannot be
+raised beyond the proof bundle's public endorsement limit. Failed endorsement
+fetches emit an `amd_endorsements_unavailable` JSON event for log-based alerts.
+
+The v1 abuse-control defaults are 6 requests per source per minute, 30 total
+requests per minute, one quote in flight, no pending quote queue, and a
+20-second end-to-end generation timeout. Excess requests receive `429` and
+`Retry-After: 60` before attestation generation begins.
+
+The deployment topology terminates public TLS in Caddy in the same pod and
+forwards the request to this listener over loopback. Only loopback peers are
+trusted to supply `X-Forwarded-For`; a non-loopback peer is rate-limited by its
+socket address and cannot spoof the header.
 
 ## Receipt signing
 

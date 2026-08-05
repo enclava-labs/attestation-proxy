@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod jwt;
 pub mod kbs;
 pub mod ownership;
+pub mod proof;
 pub mod receipts;
 pub mod sev;
 
