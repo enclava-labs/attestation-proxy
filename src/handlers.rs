@@ -44,11 +44,6 @@ pub struct AttestationQuery {
     pub domain: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-pub struct ProofQuery {
-    pub nonce: String,
-}
-
 const PROOF_PER_SOURCE_PER_MINUTE: usize = 6;
 const PROOF_GLOBAL_PER_MINUTE: usize = 30;
 const PROOF_CRL_MAX_BYTES: u64 = 120_000;
@@ -346,7 +341,7 @@ fn proof_source(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
         if let Some(forwarded) = headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.split(',').next())
             .and_then(|value| value.trim().parse().ok())
         {
             return forwarded;
@@ -362,16 +357,35 @@ fn proof_crl_max_bytes(raw: Option<&str>) -> u64 {
         .min(PROOF_CRL_MAX_BYTES)
 }
 
-fn proof_host(headers: &HeaderMap) -> Result<String, &'static str> {
+fn proof_origin(headers: &HeaderMap) -> Result<(String, String), &'static str> {
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .ok_or("target_origin_missing")?;
-    let host = host.strip_suffix(":443").unwrap_or(host);
-    if host.contains(':') {
-        return Err("target_origin_invalid");
+    let authority: axum::http::uri::Authority =
+        host.parse().map_err(|_| "target_origin_invalid")?;
+    validate_attestation_domain(authority.host()).map_err(|_| "target_origin_invalid")?;
+    let origin = match authority.port_u16() {
+        None | Some(443) => format!("https://{}", authority.host()),
+        Some(port) => format!("https://{}:{port}", authority.host()),
+    };
+    Ok((authority.host().to_owned(), origin))
+}
+
+fn proof_nonce(raw_query: Option<&str>) -> Result<[u8; 32], ()> {
+    let mut values = raw_query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|field| field.split_once('='))
+        .filter(|(key, _)| *key == "nonce");
+    let raw = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
     }
-    validate_attestation_domain(host).map_err(|_| "target_origin_invalid")
+    let value = percent_encoding::percent_decode_str(raw.1)
+        .decode_utf8()
+        .map_err(|_| ())?;
+    decode_fixed32_base64(&value, "nonce").map_err(|_| ())
 }
 
 pub async fn proof_preflight() -> Response {
@@ -391,14 +405,14 @@ pub async fn proof_bundle(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(query): Query<ProofQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let nonce = match decode_fixed32_base64(&query.nonce, "nonce") {
+    let nonce = match proof_nonce(raw_query.as_deref()) {
         Ok(nonce) => nonce,
         Err(_) => return proof_json_response(400, "nonce_invalid"),
     };
-    let host = match proof_host(&headers) {
-        Ok(host) => host,
+    let (host, origin) = match proof_origin(&headers) {
+        Ok(origin) => origin,
         Err(error) => return proof_json_response(400, error),
     };
     let source = proof_source(&headers, peer);
@@ -455,7 +469,7 @@ pub async fn proof_bundle(
     };
     let receipt_public_key = state.receipt_signer.verifying_key().to_bytes();
     let report_data = build_report_data(
-        &host,
+        origin.strip_prefix("https://").expect("HTTPS origin"),
         &nonce,
         &leaf_spki_sha256,
         &state.receipt_signer.public_key_sha256(),
@@ -480,17 +494,16 @@ pub async fn proof_bundle(
         {
             return Err("attestation_unavailable");
         }
-        let evidence_bytes = response
-            .bytes()
+        let evidence_bytes = crate::proof::response_bytes_limited(response, 65_536)
             .await
             .map_err(|_| "attestation_unavailable")?;
-        if evidence_bytes.len() > 65_536 {
-            return Err("attestation_unavailable");
-        }
         let evidence: Value =
             serde_json::from_slice(&evidence_bytes).map_err(|_| "attestation_evidence_invalid")?;
         let report =
             crate::proof::raw_snp_report(&evidence).map_err(|_| "attestation_evidence_invalid")?;
+        if report.get(0x50..0x90) != Some(report_data.as_slice()) {
+            return Err("attestation_evidence_invalid");
+        }
         let product = std::env::var("AMD_KDS_PRODUCT").unwrap_or_else(|_| "Genoa".into());
         let kds_base_url = std::env::var("AMD_KDS_BASE_URL")
             .unwrap_or_else(|_| "https://kdsintf.amd.com/vcek/v1".into());
@@ -516,7 +529,7 @@ pub async fn proof_bundle(
             .map_err(|_| "clock_invalid")?
             .as_secs();
         crate::proof::build_bundle(crate::proof::BundleInput {
-            target_origin: &format!("https://{host}"),
+            target_origin: &origin,
             nonce: &nonce,
             created_at_unix_seconds: now,
             snp_report: &report,
@@ -3138,7 +3151,10 @@ mod tests {
     #[test]
     fn proof_uses_only_trusted_ingress_forwarding_metadata() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.1, 192.0.2.10".parse().unwrap(),
+        );
         assert_eq!(
             proof_source(&headers, "127.0.0.1:1234".parse().unwrap()),
             "198.51.100.1".parse::<IpAddr>().unwrap()
@@ -3147,6 +3163,29 @@ mod tests {
             proof_source(&headers, "192.0.2.2:1234".parse().unwrap()),
             "192.0.2.2".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn proof_origin_preserves_non_default_ports() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "app.example:8443".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example:8443".into())
+        );
+        headers.insert(header::HOST, "app.example:443".parse().unwrap());
+        assert_eq!(
+            proof_origin(&headers).unwrap(),
+            ("app.example".into(), "https://app.example".into())
+        );
+    }
+
+    #[test]
+    fn proof_nonce_rejects_missing_and_duplicate_values() {
+        let encoded = URL_SAFE_NO_PAD.encode([7; 32]);
+        assert_eq!(proof_nonce(Some(&format!("nonce={encoded}"))), Ok([7; 32]));
+        assert!(proof_nonce(None).is_err());
+        assert!(proof_nonce(Some(&format!("nonce={encoded}&nonce={encoded}"))).is_err());
     }
 
     #[test]

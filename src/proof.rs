@@ -1,9 +1,22 @@
 use base64::Engine as _;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 pub const MEDIA_TYPE: &str = "application/vnd.enclava.proof-bundle.v1";
 pub const MAX_BUNDLE_BYTES: usize = 1_048_576;
 pub const MAX_STATIC_BYTES: usize = 716_800;
+const KDS_CACHE_DEFAULT_SECONDS: u64 = 300;
+const KDS_CACHE_MAX_SECONDS: u64 = 86_400;
+
+struct CachedBody {
+    expires_at: Instant,
+    body: Vec<u8>,
+}
+
+static KDS_CACHE: LazyLock<tokio::sync::Mutex<HashMap<String, CachedBody>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 const STATIC_FIELDS: [(&str, usize); 5] = [
     ("cc_init_data_toml", 196_608),
@@ -112,7 +125,8 @@ pub fn raw_snp_report(evidence: &Value) -> Result<Vec<u8>, ProofError> {
         .get("attestation_report")
         .ok_or(ProofError::InvalidReport)?;
     let mut out = vec![0; 1_184];
-    put_u32(&mut out, 0x00, number(report, "version")?)?;
+    let version = number(report, "version")?;
+    put_u32(&mut out, 0x00, version)?;
     put_u32(&mut out, 0x04, number(report, "guest_svn")?)?;
     put_u64(&mut out, 0x08, number(report, "policy")?)?;
     put_array(&mut out, 0x10, report, "family_id", 16)?;
@@ -130,16 +144,20 @@ pub fn raw_snp_report(evidence: &Value) -> Result<Vec<u8>, ProofError> {
     put_array(&mut out, 0x140, report, "report_id", 32)?;
     put_array(&mut out, 0x160, report, "report_id_ma", 32)?;
     put_u64(&mut out, 0x180, tcb(report, "reported_tcb")?)?;
-    out[0x188] = byte(report, "cpuid_fam_id")?;
-    out[0x189] = byte(report, "cpuid_mod_id")?;
-    out[0x18a] = byte(report, "cpuid_step")?;
+    if version >= 3 {
+        out[0x188] = byte(report, "cpuid_fam_id")?;
+        out[0x189] = byte(report, "cpuid_mod_id")?;
+        out[0x18a] = byte(report, "cpuid_step")?;
+    }
     put_array(&mut out, 0x1a0, report, "chip_id", 64)?;
     put_u64(&mut out, 0x1e0, tcb(report, "committed_tcb")?)?;
     put_version(&mut out, 0x1e8, report, "current")?;
     put_version(&mut out, 0x1ec, report, "committed")?;
     put_u64(&mut out, 0x1f0, tcb(report, "launch_tcb")?)?;
-    put_u64(&mut out, 0x1f8, number(report, "current_mit_vector")?)?;
-    put_u64(&mut out, 0x200, number(report, "launch_mit_vector")?)?;
+    if version >= 5 {
+        put_u64(&mut out, 0x1f8, number(report, "launch_mit_vector")?)?;
+        put_u64(&mut out, 0x200, number(report, "current_mit_vector")?)?;
+    }
     let signature = report.get("signature").ok_or(ProofError::InvalidReport)?;
     put_array(&mut out, 0x2a0, signature, "r", 72)?;
     put_array(&mut out, 0x2e8, signature, "s", 72)?;
@@ -161,13 +179,12 @@ pub async fn amd_endorsements(
     {
         return Err(ProofError::InvalidReport);
     }
-    let chip_id = hex_lower(&report[0x1a0..0x1e0]);
-    let tcb = &report[0x180..0x188];
+    let key_info = u32::from_le_bytes(report[0x48..0x4c].try_into().unwrap());
+    if (key_info >> 2) & 0b111 != 0 {
+        return Err(ProofError::InvalidReport);
+    }
     let base = format!("{}/{product}", kds_base_url.trim_end_matches('/'));
-    let vcek_url = format!(
-        "{base}/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
-        tcb[0], tcb[1], tcb[6], tcb[7]
-    );
+    let vcek_url = vcek_url(report, product, &base);
     let chain_url = format!("{base}/cert_chain");
     let crl_url = format!("{base}/crl");
     let (chain, vcek, crl) = tokio::try_join!(
@@ -194,6 +211,27 @@ pub async fn amd_endorsements(
     ]))
 }
 
+fn vcek_url(report: &[u8], product: &str, base: &str) -> String {
+    let turin = product.to_ascii_lowercase().starts_with("turin");
+    let chip_id = hex_lower(if turin {
+        &report[0x1a0..0x1a8]
+    } else {
+        &report[0x1a0..0x1e0]
+    });
+    let tcb = &report[0x180..0x188];
+    if turin {
+        format!(
+            "{base}/{chip_id}?fmcSPL={}&blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+            tcb[2], tcb[0], tcb[1], tcb[6], tcb[7]
+        )
+    } else {
+        format!(
+            "{base}/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+            tcb[0], tcb[1], tcb[6], tcb[7]
+        )
+    }
+}
+
 pub fn pem_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProofError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ProofError::Malformed)?;
     let mut certificates = Vec::new();
@@ -216,6 +254,15 @@ pub fn pem_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ProofError> {
 }
 
 async fn get_limited(client: &reqwest::Client, url: &str, limit: u64) -> Result<Vec<u8>, ()> {
+    if let Some(body) = KDS_CACHE
+        .lock()
+        .await
+        .get(url)
+        .filter(|cached| cached.expires_at > Instant::now() && cached.body.len() as u64 <= limit)
+        .map(|cached| cached.body.clone())
+    {
+        return Ok(body);
+    }
     let response = client
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
@@ -225,10 +272,66 @@ async fn get_limited(client: &reqwest::Client, url: &str, limit: u64) -> Result<
     if !response.status().is_success() || response.content_length().is_some_and(|len| len > limit) {
         return Err(());
     }
-    let bytes = response.bytes().await.map_err(|_| ())?;
-    (bytes.len() as u64 <= limit)
-        .then(|| bytes.to_vec())
-        .ok_or(())
+    let max_age = cache_ttl(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .min(KDS_CACHE_MAX_SECONDS);
+    let body = response_bytes_limited(response, limit).await?;
+    if max_age > 0 {
+        KDS_CACHE.lock().await.insert(
+            url.to_owned(),
+            CachedBody {
+                expires_at: Instant::now() + Duration::from_secs(max_age),
+                body: body.clone(),
+            },
+        );
+    }
+    Ok(body)
+}
+
+fn cache_max_age(value: &str) -> Option<u64> {
+    value.to_ascii_lowercase().split(',').find_map(|directive| {
+        directive
+            .trim()
+            .strip_prefix("max-age=")?
+            .trim_matches('"')
+            .parse()
+            .ok()
+    })
+}
+
+fn cache_ttl(cache_control: Option<&str>) -> u64 {
+    match cache_control {
+        Some(value)
+            if value.split(',').any(|directive| {
+                matches!(
+                    directive.trim().to_ascii_lowercase().as_str(),
+                    "no-store" | "no-cache"
+                )
+            }) =>
+        {
+            0
+        }
+        Some(value) => cache_max_age(value).unwrap_or(KDS_CACHE_DEFAULT_SECONDS),
+        None => KDS_CACHE_DEFAULT_SECONDS,
+    }
+}
+
+pub async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, ()> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if body.len().saturating_add(chunk.len()) as u64 > limit {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -342,7 +445,7 @@ mod tests {
 
     #[test]
     fn reconstructs_complete_snp_report_layout() {
-        let evidence = json!({"attestation_report": {
+        let mut evidence = json!({"attestation_report": {
             "version": 5, "guest_svn": 1, "policy": 0x30000_u64,
             "family_id": report_array(16, 1), "image_id": report_array(16, 2),
             "vmpl": 0, "sig_algo": 1,
@@ -368,8 +471,67 @@ mod tests {
         assert_eq!(&report[0x1a0..0x1e0], &[10; 64]);
         assert_eq!(report[0x186], 24);
         assert_eq!(report[0x187], 84);
+        assert_eq!(
+            u64::from_le_bytes(report[0x1f8..0x200].try_into().unwrap()),
+            12
+        );
+        assert_eq!(
+            u64::from_le_bytes(report[0x200..0x208].try_into().unwrap()),
+            11
+        );
         assert_eq!(&report[0x2a0..0x2e8], &[13; 72]);
         assert_eq!(&report[0x2e8..0x330], &[14; 72]);
+
+        let fields = evidence["attestation_report"].as_object_mut().unwrap();
+        fields.insert("version".into(), json!(2));
+        for key in [
+            "cpuid_fam_id",
+            "cpuid_mod_id",
+            "cpuid_step",
+            "current_mit_vector",
+            "launch_mit_vector",
+        ] {
+            fields.remove(key);
+        }
+        let report = raw_snp_report(&evidence).unwrap();
+        assert_eq!(&report[0x188..0x18b], &[0; 3]);
+        assert_eq!(&report[0x1f8..0x208], &[0; 16]);
+    }
+
+    #[test]
+    fn turin_vcek_url_uses_short_hwid_and_fmc_spl() {
+        let mut report = vec![0; 1_184];
+        report[0x180..0x188].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        report[0x1a0..0x1e0].copy_from_slice(&[0xab; 64]);
+        let url = vcek_url(&report, "Turin", "https://kds.example/Turin");
+        assert_eq!(
+            url,
+            "https://kds.example/Turin/abababababababab?fmcSPL=3&blSPL=1&teeSPL=2&snpSPL=7&ucodeSPL=8"
+        );
+    }
+
+    #[test]
+    fn cache_control_max_age_is_parsed() {
+        assert_eq!(cache_max_age("public, max-age=600"), Some(600));
+        assert_eq!(cache_ttl(Some("no-store")), 0);
+        assert_eq!(cache_ttl(None), KDS_CACHE_DEFAULT_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn vlek_reports_are_rejected_before_kds_fetch() {
+        let mut report = vec![0; 1_184];
+        report[0x48..0x4c].copy_from_slice(&4_u32.to_le_bytes());
+        assert!(matches!(
+            amd_endorsements(
+                &reqwest::Client::new(),
+                &report,
+                "Genoa",
+                "https://invalid.example",
+                120_000,
+            )
+            .await,
+            Err(ProofError::InvalidReport)
+        ));
     }
 
     #[test]

@@ -183,6 +183,7 @@ const ALLOWED_PATHS: &[&str] = &[
     "/health",
     "/v1/attestation",
     "/.well-known/confidential/attestation",
+    "/.well-known/confidential/proof-bundle",
     "/unlock",
     "/.well-known/confidential/unlock",
     "/change-password",
@@ -1106,6 +1107,7 @@ mod tests {
             Some(false)
         );
         assert!(!guard.should_gate("/unlock"));
+        assert!(!guard.should_gate("/.well-known/confidential/proof-bundle"));
         assert!(guard.should_gate(gated_path));
         assert!(
             !guard.should_gate("/cdh/resource/default/instance-test-01-tls/workload-secret-seed")
