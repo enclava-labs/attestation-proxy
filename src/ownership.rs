@@ -5,7 +5,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::Rng;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -485,7 +486,9 @@ impl OwnershipGuard {
         let cipher = Aes256Gcm::new_from_slice(wrap_key)
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
         let mut nonce_bytes = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce_bytes);
+        SysRng.try_fill_bytes(&mut nonce_bytes).map_err(|err| {
+            OwnershipError::Envelope(format!("owner_seed_nonce_entropy_unavailable:{err}"))
+        })?;
         let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
             .encrypt(&nonce, owner_seed.as_slice())
