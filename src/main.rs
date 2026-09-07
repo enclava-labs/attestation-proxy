@@ -352,7 +352,7 @@ fn generate_tls_material(domain: &str) -> Result<TlsMaterial, Box<dyn std::error
     let certified = generate_simple_self_signed(subject_alt_names)?;
     let cert_der = certified.cert.der().to_vec();
     let cert = x509_cert::Certificate::from_der(&cert_der)?;
-    let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
+    let spki_der = cert.tbs_certificate().subject_public_key_info().to_der()?;
     let spki_sha256 = Sha256::digest(spki_der).into();
     Ok(TlsMaterial {
         cert_der,

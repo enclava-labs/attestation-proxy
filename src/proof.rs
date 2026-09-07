@@ -263,8 +263,8 @@ pub fn certificate_covers_host(tls_leaf_der: &[u8], host: &str) -> Result<bool, 
 
     let certificate = Certificate::from_der(tls_leaf_der).map_err(|_| ProofError::Malformed)?;
     let names = certificate
-        .tbs_certificate
-        .get::<SubjectAltName>()
+        .tbs_certificate()
+        .get_extension::<SubjectAltName>()
         .map_err(|_| ProofError::Malformed)?
         .ok_or(ProofError::Malformed)?
         .1;

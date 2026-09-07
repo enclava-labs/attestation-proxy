@@ -8,7 +8,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::{rngs::OsRng, RngCore};
+use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -129,7 +129,7 @@ pub enum ReceiptError {
 impl ReceiptSigner {
     pub fn ephemeral() -> Self {
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         Self {
             signing_key: SigningKey::from_bytes(&seed),
         }
