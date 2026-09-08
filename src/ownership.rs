@@ -5,7 +5,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -458,9 +459,10 @@ impl OwnershipGuard {
 
         let cipher = Aes256Gcm::new_from_slice(wrap_key)
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes.as_slice())
+            .map_err(|_| OwnershipError::Envelope("owner_seed_nonce_length_invalid".to_string()))?;
         let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_ref())
+            .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| OwnershipError::WrongPassword)?;
         let mut plaintext = Zeroizing::new(plaintext);
         if plaintext.len() != 32 {
@@ -484,9 +486,12 @@ impl OwnershipGuard {
         let cipher = Aes256Gcm::new_from_slice(wrap_key)
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        SysRng.try_fill_bytes(&mut nonce_bytes).map_err(|err| {
+            OwnershipError::Envelope(format!("owner_seed_nonce_entropy_unavailable:{err}"))
+        })?;
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
+            .encrypt(&nonce, owner_seed.as_slice())
             .map_err(|err| OwnershipError::Envelope(err.to_string()))?;
         serde_json::to_vec(&json!({
             "version": OWNER_SEED_ENVELOPE_VERSION,
@@ -1485,8 +1490,9 @@ mod tests {
     fn test_owner_seed_envelope_json(owner_seed: &[u8; 32], wrap_key: &[u8; 32]) -> String {
         let cipher = Aes256Gcm::new_from_slice(wrap_key).expect("cipher");
         let nonce_bytes = [7u8; 12];
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
+            .encrypt(&nonce, owner_seed.as_slice())
             .expect("encrypt owner seed");
         serde_json::json!({
             "version": OWNER_SEED_ENVELOPE_VERSION,

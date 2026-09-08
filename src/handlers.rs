@@ -11,7 +11,8 @@ use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -465,7 +466,11 @@ pub async fn proof_bundle(
             Ok(certificate) => certificate,
             Err(_) => return proof_json_response(503, "tls_identity_invalid"),
         };
-        let spki = match certificate.tbs_certificate.subject_public_key_info.to_der() {
+        let spki = match certificate
+            .tbs_certificate()
+            .subject_public_key_info()
+            .to_der()
+        {
             Ok(spki) => spki,
             Err(_) => return proof_json_response(503, "tls_identity_invalid"),
         };
@@ -2202,7 +2207,12 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     }
 
     let mut challenge_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut challenge_bytes);
+    if let Err(err) = SysRng.try_fill_bytes(&mut challenge_bytes) {
+        return json_response(
+            500,
+            &json!({"error": "challenge_entropy_unavailable", "detail": err.to_string()}),
+        );
+    }
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
     let expires_at = Instant::now()
         + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds as u64);
@@ -2280,7 +2290,12 @@ pub async fn bootstrap_claim(
     };
 
     let mut owner_seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut owner_seed);
+    if let Err(err) = SysRng.try_fill_bytes(&mut owner_seed) {
+        return json_response(
+            500,
+            &json!({"error": "claim_failed", "detail": format!("owner_seed_entropy_unavailable:{err}")}),
+        );
+    }
     let owner_seed = Zeroizing::new(owner_seed);
     let encrypted = match state.ownership.encrypt_owner_seed(&owner_seed, &wrap_key) {
         Ok(encrypted) => encrypted,
@@ -6160,8 +6175,9 @@ mod tests {
             .expect("derive password wrap key for test");
         let cipher = Aes256Gcm::new_from_slice(&wrap_key[..]).expect("cipher");
         let nonce_bytes = [9u8; 12];
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), owner_seed.as_slice())
+            .encrypt(&nonce, owner_seed.as_slice())
             .expect("encrypt owner seed");
         json!({
             "version": OWNER_SEED_ENVELOPE_VERSION,
