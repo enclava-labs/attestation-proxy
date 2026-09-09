@@ -4063,34 +4063,63 @@ mod tests {
         );
     }
 
+    /// Bounded, nonblocking test rendezvous with the production error-file
+    /// probe: opening a FIFO write end with O_NONBLOCK succeeds only once the
+    /// probe has opened the read end. ENXIO (no reader yet) is retried with
+    /// async sleeps until the deadline; no filesystem operation is ever left
+    /// blocking, so old orderings fail promptly instead of hanging the
+    /// blocking pool.
+    async fn rendezvous_with_error_probe(
+        error_path: &Path,
+        timeout: Duration,
+    ) -> Option<std::fs::File> {
+        let fifo = std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let fd = unsafe {
+                libc::open(
+                    fifo.as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                use std::os::unix::io::FromRawFd;
+                return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+            }
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ENXIO),
+                "unexpected fifo open error: {err}"
+            );
+            if Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn status_suppresses_error_when_readiness_appears_during_error_probe() {
         let (state, ready_path, error_path) =
             status_test_state_with_init_files("status-bootstrap-probe-race", None, None).await;
-        // The error file is a FIFO so the probe blocks until the test opens
-        // the write end: readiness deterministically appears while the error
-        // probe is still in flight.
-        let error_fifo =
-            std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
-        assert_eq!(unsafe { libc::mkfifo(error_fifo.as_ptr(), 0o644) }, 0);
 
         let status_task = tokio::spawn(async move { status(State(state)).await });
-        // Let the probe reach (and block on) the FIFO before readiness lands.
-        sleep(Duration::from_millis(200)).await;
+        let mut writer = rendezvous_with_error_probe(&error_path, Duration::from_secs(5))
+            .await
+            .expect("status must probe the error file while not ready");
+        // Rendezvous complete: the probe is now reading the error file, so
+        // readiness appearing here lands strictly after the (old ordering's)
+        // ready check and strictly before the probe result is consumed.
         tokio::fs::write(&ready_path, b"ready\n")
             .await
-            .expect("mark init ready while the error probe awaits");
-        let mut writer = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&error_path)
-            .await
-            .expect("open fifo writer");
-        writer
-            .write_all(
-                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
-            )
-            .await
-            .expect("deliver stale terminal error");
+            .expect("mark init ready while the error probe is in flight");
+        std::io::Write::write_all(
+            &mut writer,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+        )
+        .expect("deliver stale terminal error");
         drop(writer);
 
         let response = tokio::time::timeout(Duration::from_secs(10), status_task)
@@ -4766,32 +4795,24 @@ mod tests {
             config.enclava_init_ready_file = ready_path.display().to_string();
             config.enclava_init_error_file = error_path.display().to_string();
         }
-        // The error file is a FIFO so the waiter's error probe blocks until
-        // the test opens the write end: readiness deterministically appears
-        // while the error probe is still in flight.
-        let error_fifo =
-            std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
-        assert_eq!(unsafe { libc::mkfifo(error_fifo.as_ptr(), 0o644) }, 0);
-
         let waiter_state = state.clone();
         let waiter_task = tokio::spawn(async move {
             wait_for_enclava_init_ready(&waiter_state, Duration::from_secs(5)).await
         });
-        sleep(Duration::from_millis(200)).await;
+        let mut writer = rendezvous_with_error_probe(&error_path, Duration::from_secs(5))
+            .await
+            .expect("waiter must probe the error file while not ready");
+        // Rendezvous complete: the waiter's error probe is in flight, so
+        // readiness appearing here lands strictly after the loop's ready
+        // check and strictly before the failure would be surfaced.
         tokio::fs::write(&ready_path, b"ready\n")
             .await
-            .expect("mark init ready while the error probe awaits");
-        let mut writer = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&error_path)
-            .await
-            .expect("open fifo writer");
-        writer
-            .write_all(
-                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
-            )
-            .await
-            .expect("deliver stale terminal error");
+            .expect("mark init ready while the error probe is in flight");
+        std::io::Write::write_all(
+            &mut writer,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+        )
+        .expect("deliver stale terminal error");
         drop(writer);
 
         let outcome = tokio::time::timeout(Duration::from_secs(10), waiter_task)
