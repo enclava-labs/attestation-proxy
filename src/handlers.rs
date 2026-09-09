@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use zeroize::Zeroizing;
 
 use crate::attestation;
@@ -1124,7 +1124,220 @@ pub async fn status(State(state): State<AppState>) -> Response {
     let config_ready =
         crate::config_store::is_config_ready(std::path::Path::new(&state.config.cap_config_dir));
     body["config_ready"] = json!(config_ready);
+    if let Some(bootstrap_error) = bootstrap_error_for_status(&state).await {
+        body["bootstrap_error"] = bootstrap_error;
+    }
     json_response(200, &body)
+}
+
+// ---------------------------------------------------------------------------
+// Safe bounded bootstrap init-error diagnostics
+// ---------------------------------------------------------------------------
+
+/// Maximum number of bytes ever read from the enclava-init error file. The
+/// documented diagnostic payload is a tiny JSON object; legacy free-form
+/// messages must never be forwarded, so anything larger is treated as an
+/// unreadable (generic) failure instead of being parsed.
+const INIT_ERROR_MAX_BYTES: usize = 4096;
+const INIT_ERROR_CODE_RATE_LIMITED: &str = "acme_rate_limited";
+const INIT_ERROR_CODE_CERTIFICATE_ISSUANCE_FAILED: &str = "acme_certificate_issuance_failed";
+const INIT_ERROR_CODE_INIT_FAILED: &str = "enclava_init_failed";
+
+/// Structured bootstrap init-failure diagnostic surfaced via `/status` while
+/// enclava-init is not ready. Contains only recognized exact codes and a
+/// validated deadline; raw error-file content never reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapInitError {
+    code: &'static str,
+    retry_after: Option<String>,
+}
+
+impl BootstrapInitError {
+    /// The safe terminal fallback for anything that is not exactly the
+    /// documented contract (legacy text, unknown codes, malformed or
+    /// oversized payloads, unreadable files).
+    fn generic() -> Self {
+        Self {
+            code: INIT_ERROR_CODE_INIT_FAILED,
+            retry_after: None,
+        }
+    }
+
+    /// Exact wire contract for the `bootstrap_error` status object: only the
+    /// three documented fields, nothing echoed from the error file.
+    fn status_json(&self) -> Value {
+        json!({
+            "error": self.code,
+            "terminal": true,
+            "retry_after": self.retry_after,
+        })
+    }
+
+    /// Stable, fixed-vocabulary detail for ownership error strings and logs.
+    fn ownership_detail(&self) -> String {
+        if self.code == INIT_ERROR_CODE_INIT_FAILED {
+            INIT_ERROR_CODE_INIT_FAILED.to_string()
+        } else {
+            format!("{INIT_ERROR_CODE_INIT_FAILED}:{}", self.code)
+        }
+    }
+}
+
+/// Parse a bounded init-error payload into a safe diagnostic. Only an exact
+/// match of the documented contract (`error` from the recognized code set,
+/// `terminal` exactly `true`, `retry_after` absent/null or a valid RFC3339
+/// UTC deadline) keeps its code; everything else collapses to the generic
+/// terminal failure so no provider prose, extra fields, or raw file bytes can
+/// reach status responses or error strings.
+fn parse_bootstrap_init_error(bytes: &[u8]) -> BootstrapInitError {
+    let value = match serde_json::from_slice::<Value>(bytes) {
+        Ok(value) => value,
+        Err(_) => return BootstrapInitError::generic(),
+    };
+    let Some(fields) = value.as_object() else {
+        return BootstrapInitError::generic();
+    };
+    let code = match fields.get("error").and_then(Value::as_str) {
+        Some(INIT_ERROR_CODE_RATE_LIMITED) => INIT_ERROR_CODE_RATE_LIMITED,
+        Some(INIT_ERROR_CODE_CERTIFICATE_ISSUANCE_FAILED) => {
+            INIT_ERROR_CODE_CERTIFICATE_ISSUANCE_FAILED
+        }
+        Some(INIT_ERROR_CODE_INIT_FAILED) => INIT_ERROR_CODE_INIT_FAILED,
+        _ => return BootstrapInitError::generic(),
+    };
+    if fields.get("terminal").and_then(Value::as_bool) != Some(true) {
+        return BootstrapInitError::generic();
+    }
+    let retry_after = match fields.get("retry_after") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(deadline)) => {
+            if is_valid_rfc3339_utc(deadline) {
+                Some(deadline.clone())
+            } else {
+                return BootstrapInitError::generic();
+            }
+        }
+        Some(_) => return BootstrapInitError::generic(),
+    };
+    BootstrapInitError { code, retry_after }
+}
+
+/// Validate the canonical RFC3339 UTC deadline emitted by the ACME broker
+/// chain: exactly `YYYY-MM-DDTHH:MM:SSZ` (UTC, seconds precision, uppercase
+/// `Z`), calendar-validated including leap years. Leap seconds (`:60`) are
+/// accepted. Local times, numeric offsets, fractional seconds, and
+/// calendar-invalid dates are rejected so an unvalidated deadline can never
+/// reach diagnostics. The value is preserved verbatim when valid; elapsed
+/// deadlines remain valid (the terminal failure stands, retry may be
+/// attempted separately) and no wall-clock comparison happens here.
+fn is_valid_rfc3339_utc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20 || bytes[19] != b'Z' {
+        return false;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day)) = (
+        ascii_digits(&bytes[0..4]),
+        ascii_digits(&bytes[5..7]),
+        ascii_digits(&bytes[8..10]),
+    ) else {
+        return false;
+    };
+    let (Some(hour), Some(minute), Some(second)) = (
+        ascii_digits(&bytes[11..13]),
+        ascii_digits(&bytes[14..16]),
+        ascii_digits(&bytes[17..19]),
+    ) else {
+        return false;
+    };
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return false;
+    }
+    hour <= 23 && minute <= 59 && second <= 60
+}
+
+fn ascii_digits(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Outcome of a bounded read of the enclava-init error file.
+enum InitErrorFileProbe {
+    /// No error file exists: bootstrap has not recorded a failure.
+    Absent,
+    /// The file exists but cannot be read within the size bound.
+    Unreadable,
+    /// Bounded file bytes (at most [`INIT_ERROR_MAX_BYTES`]).
+    Loaded(Vec<u8>),
+}
+
+/// Read at most [`INIT_ERROR_MAX_BYTES`] + 1 bytes of the enclava-init error
+/// file. The file is never deserialized or buffered unbounded.
+async fn probe_init_error_file(path: &str) -> InitErrorFileProbe {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return InitErrorFileProbe::Absent;
+        }
+        Err(_) => return InitErrorFileProbe::Unreadable,
+    };
+    let mut bytes = Vec::new();
+    let mut bounded = file.take(INIT_ERROR_MAX_BYTES as u64 + 1);
+    if bounded.read_to_end(&mut bytes).await.is_err() {
+        return InitErrorFileProbe::Unreadable;
+    }
+    if bytes.len() > INIT_ERROR_MAX_BYTES {
+        return InitErrorFileProbe::Unreadable;
+    }
+    InitErrorFileProbe::Loaded(bytes)
+}
+
+/// Optional bounded bootstrap diagnostic for `/status`, included only while
+/// the enclava-init ready sentinel does not report ready, so a ready process
+/// never reports a stale `bootstrap_error`. An absent error file yields no
+/// diagnostic; unreadable, oversized, legacy, or malformed content collapses
+/// to the generic terminal failure without echoing raw file bytes.
+async fn bootstrap_error_for_status(state: &AppState) -> Option<Value> {
+    let error_file = state.config.enclava_init_error_file.trim();
+    if error_file.is_empty() {
+        return None;
+    }
+    let ready_file = state.config.enclava_init_ready_file.trim();
+    if !ready_file.is_empty() && enclava_init_ready_file_is_ready(state).await == Ok(true) {
+        return None;
+    }
+    match probe_init_error_file(error_file).await {
+        InitErrorFileProbe::Absent => None,
+        InitErrorFileProbe::Unreadable => Some(BootstrapInitError::generic().status_json()),
+        InitErrorFileProbe::Loaded(bytes) => Some(parse_bootstrap_init_error(&bytes).status_json()),
+    }
 }
 
 /// GET /v1/attestation/info
@@ -1980,7 +2193,7 @@ async fn verify_owner_seed_for_recovery(
         }
         Err(OwnershipError::Store(detail))
             if detail.starts_with("enclava_init_ready_file_read_failed:")
-                || detail.starts_with("enclava_init_error_file_read_failed:") =>
+                || detail == "enclava_init_error_file_read_failed" =>
         {
             Err(OwnershipError::UnlockAmbiguous(detail))
         }
@@ -2076,18 +2289,20 @@ async fn wait_for_enclava_init_ready(
         }
 
         if !error_file.is_empty() {
-            match tokio::fs::read_to_string(error_file).await {
-                Ok(detail) => {
-                    return Err(OwnershipError::Store(format!(
-                        "enclava_init_failed:{}",
-                        truncate_init_error(&detail)
-                    )));
+            match probe_init_error_file(error_file).await {
+                InitErrorFileProbe::Absent => {}
+                InitErrorFileProbe::Unreadable => {
+                    // Keep this distinct from a recorded init failure: recovery
+                    // treats an unobservable init state as ambiguous.
+                    return Err(OwnershipError::Store(
+                        "enclava_init_error_file_read_failed".to_string(),
+                    ));
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(OwnershipError::Store(format!(
-                        "enclava_init_error_file_read_failed:{err}"
-                    )));
+                InitErrorFileProbe::Loaded(bytes) => {
+                    // Only the fixed-vocabulary safe code is carried; the raw
+                    // error-file content is never forwarded anywhere.
+                    let diagnostic = parse_bootstrap_init_error(&bytes);
+                    return Err(OwnershipError::Store(diagnostic.ownership_detail()));
                 }
             }
         }
@@ -2098,19 +2313,6 @@ async fn wait_for_enclava_init_ready(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100).min(deadline - now)).await;
     }
-}
-
-fn truncate_init_error(detail: &str) -> String {
-    const LIMIT: usize = 2048;
-    let trimmed = detail.trim();
-    if trimmed.len() <= LIMIT {
-        return trimmed.to_string();
-    }
-    let mut end = LIMIT;
-    while !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...<truncated>", &trimmed[..end])
 }
 
 async fn connect_init_unlock_socket(
@@ -3416,12 +3618,19 @@ mod tests {
         )
         .await;
         let token_file = test_temp_file("status-contract-token", "test-token");
-        let state = build_state_with_secret_backend(
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let mut state = build_state_with_secret_backend(
             &signal_dir.path,
             "password",
             api_server.base_url(),
             &token_file.path,
         );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
         initialize_ownership_state(&state).await;
         let expected_ciphertext_backend = state.config.owner_ciphertext_backend.clone();
 
@@ -3491,6 +3700,244 @@ mod tests {
             Some(true)
         );
         assert!(body.get("claims_error").is_some_and(Value::is_null));
+    }
+
+    async fn status_test_state_with_init_files(
+        prefix: &str,
+        ready_contents: Option<&[u8]>,
+        error_contents: Option<&[u8]>,
+    ) -> (AppState, PathBuf, PathBuf) {
+        let signal_dir = test_signal_dir(prefix);
+        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file(&format!("{prefix}-token"), "test-token");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let mut state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        initialize_ownership_state(&state).await;
+        if let Some(contents) = ready_contents {
+            tokio::fs::write(&ready_path, contents)
+                .await
+                .expect("write ready sentinel");
+        }
+        if let Some(contents) = error_contents {
+            tokio::fs::write(&error_path, contents)
+                .await
+                .expect("write init error file");
+        }
+        // Keep the temp dirs alive for the caller's status call (same leak
+        // pattern as build_config_test_state).
+        std::mem::forget(signal_dir);
+        std::mem::forget(token_file);
+        (state, ready_path, error_path)
+    }
+
+    #[tokio::test]
+    async fn status_reports_structured_bootstrap_error_while_not_ready() {
+        let (state, _ready_path, _error_path) = status_test_state_with_init_files(
+            "status-bootstrap-error",
+            Some(b"not-ready\n"),
+            Some(
+                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z","detail":"SECRET-SYNTHETIC-PROSE"}"#,
+            ),
+        )
+        .await;
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let rendered = body.to_string();
+        assert_eq!(
+            body.get("bootstrap_error"),
+            Some(&json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": "2026-09-09T12:34:56Z",
+            })),
+            "bootstrap_error must be exactly the documented contract object"
+        );
+        assert!(
+            !rendered.contains("SECRET-SYNTHETIC-PROSE"),
+            "status must never echo provider prose or extra error-file fields: {rendered}"
+        );
+        // Existing documented status fields stay preserved alongside the new
+        // optional diagnostic object.
+        for key in [
+            "state",
+            "mode",
+            "error",
+            "auto_unlock_enabled",
+            "instance_id",
+            "ciphertext_backend",
+            "tenant_id",
+            "claims_instance_id",
+            "bootstrap_owner_pubkey_hash",
+            "tenant_instance_identity_hash",
+            "claims_verified",
+            "claims_error",
+            "config_ready",
+        ] {
+            assert!(
+                body.get(key).is_some(),
+                "documented field {key} must be preserved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_bootstrap_error_collapses_unsafe_input_to_generic_failure() {
+        let cases: &[&[u8]] = &[
+            // Unknown diagnostic code with provider prose.
+            br#"{"error":"provider_said_boom","terminal":true,"detail":"SECRET-SYNTHETIC-PROSE"}"#,
+            // Malformed JSON.
+            b"{\"error\":\"acme_rate_limited\",\"terminal\":true,\"SECRET-SYNTHETIC-PROSE\"",
+            // Recognized code but non-terminal producer payload.
+            br#"{"error":"acme_certificate_issuance_failed","terminal":false,"detail":"SECRET-SYNTHETIC-PROSE"}"#,
+            // Recognized code with an invalid deadline.
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"next tuesday"}"#,
+            // Recognized code with a non-string deadline.
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
+            // Legacy free-form text.
+            b"luks_open_failed: SECRET-SYNTHETIC-PROSE /dev/csi0\n",
+        ];
+        for (index, error_contents) in cases.iter().enumerate() {
+            let (state, _ready_path, _error_path) = status_test_state_with_init_files(
+                &format!("status-bootstrap-generic-{index}"),
+                Some(b"not-ready\n"),
+                Some(error_contents),
+            )
+            .await;
+
+            let response = status(State(state)).await;
+            assert_eq!(response.status().as_u16(), 200);
+            let body = read_json(response).await;
+            let rendered = body.to_string();
+            assert_eq!(
+                body.get("bootstrap_error"),
+                Some(&json!({
+                    "error": "enclava_init_failed",
+                    "terminal": true,
+                    "retry_after": null,
+                })),
+                "case {index} must collapse to the generic terminal failure"
+            );
+            assert!(
+                !rendered.contains("SECRET-SYNTHETIC-PROSE") && !rendered.contains("/dev/csi0"),
+                "case {index} must not echo raw error-file content: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_bootstrap_error_oversized_file_is_generic_failure() {
+        // A payload that would parse as a recognized diagnostic if read
+        // unbounded, padded past the read bound with trailing whitespace.
+        let mut error_contents =
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z","detail":"SECRET-SYNTHETIC-PROSE"}"#
+                .to_vec();
+        error_contents.resize(INIT_ERROR_MAX_BYTES + 5000, b' ');
+        let (state, _ready_path, _error_path) = status_test_state_with_init_files(
+            "status-bootstrap-oversized",
+            Some(b"not-ready\n"),
+            Some(&error_contents),
+        )
+        .await;
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let rendered = body.to_string();
+        assert_eq!(
+            body.get("bootstrap_error"),
+            Some(&json!({
+                "error": "enclava_init_failed",
+                "terminal": true,
+                "retry_after": null,
+            }))
+        );
+        assert!(!rendered.contains("acme_rate_limited"));
+        assert!(!rendered.contains("SECRET-SYNTHETIC-PROSE"));
+    }
+
+    #[tokio::test]
+    async fn status_bootstrap_error_unreadable_file_is_generic_failure() {
+        let (state, _ready_path, error_path) =
+            status_test_state_with_init_files("status-bootstrap-unreadable", None, None).await;
+        tokio::fs::create_dir(&error_path)
+            .await
+            .expect("replace error file with directory");
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("bootstrap_error"),
+            Some(&json!({
+                "error": "enclava_init_failed",
+                "terminal": true,
+                "retry_after": null,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_has_no_bootstrap_error_without_error_file() {
+        let (state, ready_path, _error_path) = status_test_state_with_init_files(
+            "status-bootstrap-absent",
+            Some(b"not-ready\n"),
+            None,
+        )
+        .await;
+        assert!(!ready_path.with_file_name("init-error").exists());
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert!(
+            body.get("bootstrap_error").is_none(),
+            "absence of the error file means no diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_suppresses_stale_bootstrap_error_once_ready() {
+        let (state, ready_path, _error_path) = status_test_state_with_init_files(
+            "status-bootstrap-ready",
+            None,
+            Some(
+                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+            ),
+        )
+        .await;
+
+        // Not ready yet: the diagnostic is reported.
+        let body = read_json(status(State(state.clone())).await).await;
+        assert!(body.get("bootstrap_error").is_some());
+
+        tokio::fs::write(&ready_path, b"ready\n")
+            .await
+            .expect("mark init ready");
+        let body = read_json(status(State(state)).await).await;
+        assert!(
+            body.get("bootstrap_error").is_none(),
+            "a ready process must never report a stale bootstrap_error"
+        );
     }
 
     #[tokio::test]
@@ -3803,17 +4250,176 @@ mod tests {
         tokio::fs::write(&ready_path, b"not-ready\n")
             .await
             .expect("write not-ready sentinel");
-        tokio::fs::write(&error_path, b"waiting for workload containers failed\n")
-            .await
-            .expect("write init error");
+        tokio::fs::write(
+            &error_path,
+            b"waiting for workload containers failed: SECRET-SYNTHETIC-PROSE\n",
+        )
+        .await
+        .expect("write init error");
 
         let err = wait_for_enclava_init_ready(&state, Duration::from_secs(1))
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("enclava_init_failed:waiting for workload containers failed"));
+        let rendered = err.to_string();
+        assert_eq!(rendered, "storage_error: enclava_init_failed");
+        assert!(
+            !rendered.contains("SECRET-SYNTHETIC-PROSE"),
+            "legacy free-form error-file content must never be forwarded: {rendered}"
+        );
+        assert!(
+            !rendered.contains("waiting for workload containers"),
+            "raw init error prose must never be forwarded: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_enclava_init_ready_reports_recognized_safe_code() {
+        let signal_dir = test_signal_dir("init-ready-recognized-code");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        tokio::fs::write(&ready_path, b"not-ready\n")
+            .await
+            .expect("write not-ready sentinel");
+        tokio::fs::write(
+            &error_path,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2027-01-02T03:04:05Z","detail":"SECRET-SYNTHETIC-PROSE"}"#,
+        )
+        .await
+        .expect("write init error");
+
+        let err = wait_for_enclava_init_ready(&state, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "storage_error: enclava_init_failed:acme_rate_limited"
+        );
+        assert!(
+            !rendered.contains("SECRET-SYNTHETIC-PROSE"),
+            "error-file extras must never be forwarded: {rendered}"
+        );
+        assert!(
+            !rendered.contains("2027-01-02"),
+            "the deadline is reported only via the structured status diagnostic: {rendered}"
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_init_error_accepts_only_exact_contract() {
+        let rate_limited = parse_bootstrap_init_error(
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+        );
+        assert_eq!(rate_limited.code, "acme_rate_limited");
+        assert_eq!(
+            rate_limited.retry_after.as_deref(),
+            Some("2026-09-09T12:34:56Z")
+        );
+
+        let issuance = parse_bootstrap_init_error(
+            br#"{"error":"acme_certificate_issuance_failed","terminal":true,"retry_after":null}"#,
+        );
+        assert_eq!(issuance.code, "acme_certificate_issuance_failed");
+        assert_eq!(issuance.retry_after, None);
+
+        let init_failed =
+            parse_bootstrap_init_error(br#"{"error":"enclava_init_failed","terminal":true}"#);
+        assert_eq!(init_failed, BootstrapInitError::generic());
+        assert_eq!(
+            rate_limited.status_json(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": "2026-09-09T12:34:56Z",
+            })
+        );
+        assert_eq!(
+            rate_limited.ownership_detail(),
+            "enclava_init_failed:acme_rate_limited"
+        );
+        assert_eq!(init_failed.ownership_detail(), "enclava_init_failed");
+
+        for bytes in [
+            &b"waiting for workload containers failed"[..],
+            b"{}",
+            br#"{"error":"acme_rate_limited"}"#,
+            br#"{"error":"acme_rate_limited","terminal":"true"}"#,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56+01:00"}"#,
+            br#"["acme_rate_limited"]"#,
+        ] {
+            assert_eq!(
+                parse_bootstrap_init_error(bytes),
+                BootstrapInitError::generic(),
+                "input must collapse to the generic safe failure"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3339_utc_validator_accepts_only_canonical_broker_timestamps() {
+        for value in [
+            "2026-09-09T12:34:56Z",
+            "2028-02-29T00:00:00Z",
+            "2026-12-31T23:59:60Z",
+        ] {
+            assert!(is_valid_rfc3339_utc(value), "{value} must be valid");
+        }
+        for value in [
+            "",
+            "2026-09-09",
+            "2026-09-09 12:34:56Z",
+            "2026-13-09T12:34:56Z",
+            "2027-02-29T12:34:56Z",
+            "2026-09-31T12:34:56Z",
+            "2026-09-09T24:00:00Z",
+            "2026-09-09T12:60:00Z",
+            "2026-09-09T12:34:61Z",
+            "2026-09-09T12:34:56",
+            "2026-09-09T12:34:56z",
+            "2026-09-09T12:34:56+00:00",
+            "2026-09-09T12:34:56+01:00",
+            "2026-09-09T12:34:56-00:00",
+            "2026-09-09T12:34:56.Z",
+            "2026-09-09T12:34:56.123456789Z",
+            "not-a-timestamp",
+        ] {
+            assert!(!is_valid_rfc3339_utc(value), "{value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_bootstrap_init_error_preserves_elapsed_deadline() {
+        // An elapsed retry_after does not erase the terminal failure; it means
+        // a retry may be attempted separately. It is preserved verbatim.
+        let diagnostic = parse_bootstrap_init_error(
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2020-01-01T00:00:00Z"}"#,
+        );
+        assert_eq!(diagnostic.code, "acme_rate_limited");
+        assert_eq!(
+            diagnostic.retry_after.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            diagnostic.status_json(),
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": true,
+                "retry_after": "2020-01-01T00:00:00Z",
+            })
+        );
     }
 
     #[tokio::test]
@@ -3904,6 +4510,11 @@ mod tests {
             .expect("recovery verification"));
         socket_task.await.expect("socket task");
         assert_eq!(state.ownership.state_json()["state"], "unlocking");
+        let status_body = read_json(status(State(state)).await).await;
+        assert!(
+            status_body.get("bootstrap_error").is_none(),
+            "recovery must clear stale bootstrap diagnostics before sending a new seed: {status_body}"
+        );
     }
 
     #[tokio::test]
@@ -4125,10 +4736,14 @@ mod tests {
         assert_eq!(read_json(response).await, json!({ "state": "unlocking" }));
         let body = wait_for_ownership_state(&state, "error").await;
         assert_eq!(body["state"], "error");
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("enclava_init_failed:opening state volume /dev/csi0"));
+        assert_eq!(body["error"], "storage_error: enclava_init_failed");
+        assert!(
+            !body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/dev/csi0"),
+            "raw init error-file content must never surface in status/error output"
+        );
         let request_line = socket_task.await.expect("socket task");
         assert_eq!(
             request_line.trim_end(),
