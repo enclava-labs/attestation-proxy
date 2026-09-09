@@ -41,11 +41,13 @@ sourced from the enclava-init error file:
 `error` is one of the exact recognized codes `acme_rate_limited`,
 `acme_certificate_issuance_failed`, or `enclava_init_failed`; `terminal` is
 always `true` (a terminal bootstrap failure); `retry_after` is `null` or a
-validated canonical RFC3339 UTC deadline (`YYYY-MM-DDTHH:MM:SSZ`, exactly
-as emitted by the broker chain). The proxy independently re-checks the
-producer-side bound at its own observation time: a deadline more than 365
-days in the future is out of contract and collapses to the generic
-diagnostic. Elapsed deadlines are preserved verbatim: the failure stays
+validated canonical RFC3339 UTC deadline (`YYYY-MM-DDTHH:MM:SSZ`, seconds
+`00`-`59` — leap seconds and offsets are not canonical broker output and are
+rejected — exactly as emitted by the broker chain). The proxy independently
+re-checks the producer-side bound at its own observation time; a deadline
+more than 365 days in the future, or any otherwise-invalid `retry_after`
+value, degrades to `null` while the recognized safe terminal code is
+retained. Elapsed deadlines are preserved verbatim: the failure stays
 terminal and a retry may be attempted separately; the proxy never retries
 certificate issuance itself. Only
 the first 4 KiB of the error file are read, and it is never deserialized

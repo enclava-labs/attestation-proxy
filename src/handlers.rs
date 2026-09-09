@@ -1188,10 +1188,12 @@ impl BootstrapInitError {
 
 /// Parse a bounded init-error payload into a safe diagnostic. Only an exact
 /// match of the documented contract (`error` from the recognized code set,
-/// `terminal` exactly `true`, `retry_after` absent/null or a valid RFC3339
-/// UTC deadline) keeps its code; everything else collapses to the generic
-/// terminal failure so no provider prose, extra fields, or raw file bytes can
-/// reach status responses or error strings.
+/// `terminal` exactly `true`) keeps its code; anything else collapses to the
+/// generic terminal failure so no provider prose, extra fields, or raw file
+/// bytes can reach status responses or error strings. An invalid `retry_after`
+/// value (bad format, wrong type, or outside the producer bound) degrades to
+/// `null` while the recognized safe terminal code is retained; the raw value
+/// is never echoed.
 fn parse_bootstrap_init_error(bytes: &[u8]) -> BootstrapInitError {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1223,14 +1225,13 @@ fn parse_bootstrap_init_error_at(bytes: &[u8], now_unix: i64) -> BootstrapInitEr
     }
     let retry_after = match fields.get("retry_after") {
         None | Some(Value::Null) => None,
+        // An invalid deadline (bad format, wrong type, or outside the
+        // producer bound) degrades to null; the recognized safe terminal code
+        // is retained and the raw value is never echoed.
         Some(Value::String(deadline)) => {
-            if deadline_within_producer_bound(deadline, now_unix) {
-                Some(deadline.clone())
-            } else {
-                return BootstrapInitError::generic();
-            }
+            deadline_within_producer_bound(deadline, now_unix).then(|| deadline.clone())
         }
-        Some(_) => return BootstrapInitError::generic(),
+        Some(_) => None,
     };
     BootstrapInitError { code, retry_after }
 }
@@ -1251,8 +1252,8 @@ fn deadline_within_producer_bound(deadline: &str, now_unix: i64) -> bool {
 }
 
 /// Convert the canonical `YYYY-MM-DDTHH:MM:SSZ` timestamp (the exact format
-/// accepted by [`is_valid_rfc3339_utc`]) to Unix seconds. Leap seconds
-/// (`:60`) are folded onto the following second.
+/// accepted by [`is_valid_rfc3339_utc`]) to Unix seconds. Leap seconds are
+/// not part of the canonical broker emission and are rejected.
 fn rfc3339_utc_unix_seconds(value: &str) -> Option<i64> {
     if !is_valid_rfc3339_utc(value) {
         return None;
@@ -1281,8 +1282,9 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 /// Validate the canonical RFC3339 UTC deadline emitted by the ACME broker
 /// chain: exactly `YYYY-MM-DDTHH:MM:SSZ` (UTC, seconds precision, uppercase
-/// `Z`), calendar-validated including leap years. Leap seconds (`:60`) are
-/// accepted. Local times, numeric offsets, fractional seconds, and
+/// `Z`), calendar-validated including leap years, seconds `00`-`59` (the
+/// canonical broker format never emits leap seconds, so `:60` at any minute
+/// is rejected). Local times, numeric offsets, fractional seconds, and
 /// calendar-invalid dates are rejected so an unvalidated deadline can never
 /// reach diagnostics. This is pure format validation; the future bound is
 /// enforced separately by [`deadline_within_producer_bound`], and elapsed
@@ -1318,7 +1320,7 @@ fn is_valid_rfc3339_utc(value: &str) -> bool {
     if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return false;
     }
-    hour <= 23 && minute <= 59 && second <= 60
+    hour <= 23 && minute <= 59 && second <= 59
 }
 
 fn ascii_digits(bytes: &[u8]) -> Option<u32> {
@@ -3881,10 +3883,6 @@ mod tests {
             b"{\"error\":\"acme_rate_limited\",\"terminal\":true,\"SECRET-SYNTHETIC-PROSE\"",
             // Recognized code but non-terminal producer payload.
             br#"{"error":"acme_certificate_issuance_failed","terminal":false,"detail":"SECRET-SYNTHETIC-PROSE"}"#,
-            // Recognized code with an invalid deadline.
-            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"next tuesday"}"#,
-            // Recognized code with a non-string deadline.
-            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
             // Legacy free-form text.
             b"luks_open_failed: SECRET-SYNTHETIC-PROSE /dev/csi0\n",
         ];
@@ -3912,6 +3910,44 @@ mod tests {
             assert!(
                 !rendered.contains("SECRET-SYNTHETIC-PROSE") && !rendered.contains("/dev/csi0"),
                 "case {index} must not echo raw error-file content: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_bootstrap_error_invalid_deadline_degrades_to_null_with_safe_code() {
+        let cases: &[&[u8]] = &[
+            // Malformed deadline string.
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"next tuesday"}"#,
+            // Leap second: not canonical broker output.
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2020-01-01T12:34:60Z"}"#,
+            // Non-string deadline.
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
+        ];
+        for (index, error_contents) in cases.iter().enumerate() {
+            let (state, _ready_path, _error_path) = status_test_state_with_init_files(
+                &format!("status-bootstrap-null-deadline-{index}"),
+                Some(b"not-ready\n"),
+                Some(error_contents),
+            )
+            .await;
+
+            let response = status(State(state)).await;
+            assert_eq!(response.status().as_u16(), 200);
+            let body = read_json(response).await;
+            let rendered = body.to_string();
+            assert_eq!(
+                body.get("bootstrap_error"),
+                Some(&json!({
+                    "error": "acme_rate_limited",
+                    "terminal": true,
+                    "retry_after": null,
+                })),
+                "case {index} must keep the safe code with a null deadline"
+            );
+            assert!(
+                !rendered.contains("next tuesday") && !rendered.contains("12:34:60"),
+                "case {index} must not echo the invalid raw deadline: {rendered}"
             );
         }
     }
@@ -4282,11 +4318,9 @@ mod tests {
             rfc3339_utc_unix_seconds("2027-01-15T08:00:00Z"),
             Some(now_unix)
         );
-        // Leap seconds fold onto the following second.
-        assert_eq!(
-            rfc3339_utc_unix_seconds("2016-12-31T23:59:60Z"),
-            rfc3339_utc_unix_seconds("2017-01-01T00:00:00Z")
-        );
+        // Leap seconds are not canonical broker output and are rejected.
+        assert_eq!(rfc3339_utc_unix_seconds("2016-12-31T23:59:60Z"), None);
+        assert_eq!(rfc3339_utc_unix_seconds("2020-01-01T12:34:60Z"), None);
         let at = |deadline: &str| {
             parse_bootstrap_init_error_at(
                 format!(
@@ -4301,8 +4335,16 @@ mod tests {
             at("2028-01-15T08:00:00Z").retry_after.as_deref(),
             Some("2028-01-15T08:00:00Z")
         );
-        // One minute beyond the bound collapses to the generic safe failure.
-        assert_eq!(at("2028-01-15T08:01:00Z"), BootstrapInitError::generic());
+        // One minute beyond the bound degrades to a null deadline while the
+        // recognized safe terminal code is retained.
+        let beyond_bound = at("2028-01-15T08:01:00Z");
+        assert_eq!(beyond_bound.code, "acme_rate_limited");
+        assert_eq!(beyond_bound.retry_after, None);
+        // A malformed deadline (leap second) likewise degrades to null with
+        // the safe code retained, and the raw value is never echoed.
+        let leap_second = at("2020-01-01T12:34:60Z");
+        assert_eq!(leap_second.code, "acme_rate_limited");
+        assert_eq!(leap_second.retry_after, None);
         // Elapsed deadlines stay valid with the terminal code intact.
         let elapsed = at("2020-01-01T00:00:00Z");
         assert_eq!(elapsed.code, "acme_rate_limited");
@@ -4402,6 +4444,65 @@ mod tests {
         assert!(!matches!(err, OwnershipError::UnlockAmbiguous(_)));
         let rendered = err.to_string();
         assert!(!rendered.contains("SECRET-SYNTHETIC-PROSE"));
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "locked");
+        assert_eq!(body["error"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn recovery_recognized_code_with_invalid_deadline_keeps_safe_code() {
+        let signal_dir = test_signal_dir("recover-invalid-deadline");
+        let owner_seed = [0x39; 32];
+        let socket_path = signal_dir.path.join("recover-invalid-deadline.sock");
+        let ready_path = signal_dir.path.join("recover-invalid-deadline-ready");
+        let error_path = signal_dir.path.join("recover-invalid-deadline-error");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let error_for_task = error_path.clone();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            // Recognized code with a leap-second deadline (invalid for the
+            // canonical broker format): the code must survive, the raw
+            // deadline must not.
+            tokio::fs::write(
+                error_for_task,
+                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2020-01-01T12:34:60Z"}"#,
+            )
+            .await
+            .expect("write init error");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+        });
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state.ownership.set_locked();
+
+        let err = verify_owner_seed_for_recovery(&state, &owner_seed, false)
+            .await
+            .expect_err("recorded init error must fail recovery verification");
+        socket_task.await.expect("socket task");
+
+        assert!(
+            matches!(&err, OwnershipError::Store(detail)
+                if detail == "enclava_init_failed:acme_rate_limited"),
+            "expected the recognized safe code, got: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("12:34:60"),
+            "the invalid raw deadline must never reach ownership errors: {rendered}"
+        );
         let body = state.ownership.state_json();
         assert_eq!(body["state"], "locked");
         assert_eq!(body["error"], serde_json::Value::Null);
@@ -4632,7 +4733,6 @@ mod tests {
             b"{}",
             br#"{"error":"acme_rate_limited"}"#,
             br#"{"error":"acme_rate_limited","terminal":"true"}"#,
-            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56+01:00"}"#,
             br#"["acme_rate_limited"]"#,
         ] {
             assert_eq!(
@@ -4641,15 +4741,32 @@ mod tests {
                 "input must collapse to the generic safe failure"
             );
         }
+
+        // Invalid retry_after values degrade to null while the recognized
+        // safe terminal code is retained; the raw value is never echoed.
+        let invalid_deadlines: &[&[u8]] = &[
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56+01:00"}"#,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2020-01-01T12:34:60Z"}"#,
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
+        ];
+        for bytes in invalid_deadlines {
+            let diagnostic = parse_bootstrap_init_error(bytes);
+            assert_eq!(diagnostic.code, "acme_rate_limited");
+            assert_eq!(diagnostic.retry_after, None);
+            assert_eq!(
+                diagnostic.status_json(),
+                json!({
+                    "error": "acme_rate_limited",
+                    "terminal": true,
+                    "retry_after": null,
+                })
+            );
+        }
     }
 
     #[test]
     fn rfc3339_utc_validator_accepts_only_canonical_broker_timestamps() {
-        for value in [
-            "2026-09-09T12:34:56Z",
-            "2028-02-29T00:00:00Z",
-            "2026-12-31T23:59:60Z",
-        ] {
+        for value in ["2026-09-09T12:34:56Z", "2028-02-29T00:00:00Z"] {
             assert!(is_valid_rfc3339_utc(value), "{value} must be valid");
         }
         for value in [
@@ -4661,6 +4778,8 @@ mod tests {
             "2026-09-31T12:34:56Z",
             "2026-09-09T24:00:00Z",
             "2026-09-09T12:60:00Z",
+            "2020-01-01T12:34:60Z",
+            "2026-12-31T23:59:60Z",
             "2026-09-09T12:34:61Z",
             "2026-09-09T12:34:56",
             "2026-09-09T12:34:56z",
