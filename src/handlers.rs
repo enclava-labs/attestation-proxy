@@ -4105,9 +4105,20 @@ mod tests {
                 // A production reader open may have started after the last
                 // attempt above. Release it, remove the fifo so no later
                 // open can block, and finish the spawned task before
-                // failing the test.
+                // failing the test. The handle is retained through a
+                // &mut-bound timeout; unfinished work is aborted AND awaited
+                // -- never detached (abort alone cannot stop an in-flight
+                // blocking filesystem operation, which the release above
+                // has already made impossible to block indefinitely).
                 release_error_probe_fifo(&fifo);
-                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+                let mut task = task;
+                if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+                }
                 panic!("production probe never opened the error fifo within {timeout:?}");
             }
             sleep(Duration::from_millis(5)).await;
@@ -4891,6 +4902,69 @@ mod tests {
             std::fs::symlink_metadata(&error_path).is_err(),
             "rendezvous failure must leave no fifo behind"
         );
+        assert!(unsafe { libc::open(fifo.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) } < 0);
+    }
+
+    /// Linux-only test observation: a thread blocked opening a FIFO for
+    /// reading (no writer) parks in the kernel's `wait_for_partner` wait
+    /// queue. Reading /proc wchan is instantaneous and proves a reader is
+    /// genuinely blocked in open(2) instead of assuming a sleep sufficed.
+    fn fifo_partner_wait_observed() -> bool {
+        std::fs::read_dir("/proc/self/task")
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    std::fs::read_to_string(entry.path().join("wchan"))
+                        .map(|wchan| wchan.trim() == "wait_for_partner")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn release_error_probe_fifo_unblocks_a_blocked_reader() {
+        let signal_dir = test_signal_dir("fifo-release-blocked-reader");
+        let error_path = signal_dir.path.join("init-error");
+        let fifo = std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+        // A probe-like reader with no writer: its blocking read-end open(2)
+        // parks exactly like the production error-file probe would.
+        let reader_path = error_path.clone();
+        let reader_task = tokio::spawn(async move {
+            let mut file = tokio::fs::File::open(&reader_path)
+                .await
+                .expect("reader open");
+            let mut sink = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut sink)
+                .await
+                .expect("reader read");
+        });
+
+        // Prove the reader is actually blocked in the FIFO partner wait
+        // (bounded observation, no sleep-based assumption) before releasing.
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !fifo_partner_wait_observed() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            observed,
+            "reader must reach the blocking fifo open (wait_for_partner)"
+        );
+
+        release_error_probe_fifo(&fifo);
+
+        // The released reader must complete promptly: its open(2) is paired
+        // by the O_RDWR fd and sees EOF once that fd closes.
+        tokio::time::timeout(Duration::from_secs(5), reader_task)
+            .await
+            .expect("blocked reader must be released, not left parked")
+            .expect("reader task");
+        // The fifo is gone and a fresh open fails immediately.
+        assert!(std::fs::symlink_metadata(&error_path).is_err());
         assert!(unsafe { libc::open(fifo.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) } < 0);
     }
 
