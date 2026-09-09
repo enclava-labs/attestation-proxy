@@ -3795,7 +3795,7 @@ mod tests {
         prefix: &str,
         ready_contents: Option<&[u8]>,
         error_contents: Option<&[u8]>,
-    ) -> (AppState, PathBuf, PathBuf) {
+    ) -> (AppState, PathBuf, PathBuf, TestSignalDir, TestTempFile) {
         let signal_dir = test_signal_dir(prefix);
         let signing_key = SigningKey::from_bytes(&[31u8; 32]);
         let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
@@ -3830,16 +3830,15 @@ mod tests {
                 .await
                 .expect("write init error file");
         }
-        // Keep the temp dirs alive for the caller's status call (same leak
-        // pattern as build_config_test_state).
-        std::mem::forget(signal_dir);
-        std::mem::forget(token_file);
-        (state, ready_path, error_path)
+        // The cleanup guards are returned so they stay alive for the
+        // caller's status call and remove the temp paths (including any
+        // FIFO) when the test finishes, on success or panic.
+        (state, ready_path, error_path, signal_dir, token_file)
     }
 
     #[tokio::test]
     async fn status_reports_structured_bootstrap_error_while_not_ready() {
-        let (state, _ready_path, _error_path) = status_test_state_with_init_files(
+        let (state, _ready_path, _error_path, _signal_dir, _token_file) = status_test_state_with_init_files(
             "status-bootstrap-error",
             Some(b"not-ready\n"),
             Some(
@@ -3902,12 +3901,13 @@ mod tests {
             b"luks_open_failed: SECRET-SYNTHETIC-PROSE /dev/csi0\n",
         ];
         for (index, error_contents) in cases.iter().enumerate() {
-            let (state, _ready_path, _error_path) = status_test_state_with_init_files(
-                &format!("status-bootstrap-generic-{index}"),
-                Some(b"not-ready\n"),
-                Some(error_contents),
-            )
-            .await;
+            let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+                status_test_state_with_init_files(
+                    &format!("status-bootstrap-generic-{index}"),
+                    Some(b"not-ready\n"),
+                    Some(error_contents),
+                )
+                .await;
 
             let response = status(State(state)).await;
             assert_eq!(response.status().as_u16(), 200);
@@ -3940,12 +3940,13 @@ mod tests {
             br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
         ];
         for (index, error_contents) in cases.iter().enumerate() {
-            let (state, _ready_path, _error_path) = status_test_state_with_init_files(
-                &format!("status-bootstrap-null-deadline-{index}"),
-                Some(b"not-ready\n"),
-                Some(error_contents),
-            )
-            .await;
+            let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+                status_test_state_with_init_files(
+                    &format!("status-bootstrap-null-deadline-{index}"),
+                    Some(b"not-ready\n"),
+                    Some(error_contents),
+                )
+                .await;
 
             let response = status(State(state)).await;
             assert_eq!(response.status().as_u16(), 200);
@@ -3975,12 +3976,13 @@ mod tests {
             br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z","detail":"SECRET-SYNTHETIC-PROSE"}"#
                 .to_vec();
         error_contents.resize(INIT_ERROR_MAX_BYTES + 5000, b' ');
-        let (state, _ready_path, _error_path) = status_test_state_with_init_files(
-            "status-bootstrap-oversized",
-            Some(b"not-ready\n"),
-            Some(&error_contents),
-        )
-        .await;
+        let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+            status_test_state_with_init_files(
+                "status-bootstrap-oversized",
+                Some(b"not-ready\n"),
+                Some(&error_contents),
+            )
+            .await;
 
         let response = status(State(state)).await;
         assert_eq!(response.status().as_u16(), 200);
@@ -4000,7 +4002,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_bootstrap_error_unreadable_file_is_generic_failure() {
-        let (state, _ready_path, error_path) =
+        let (state, _ready_path, error_path, _signal_dir, _token_file) =
             status_test_state_with_init_files("status-bootstrap-unreadable", None, None).await;
         tokio::fs::create_dir(&error_path)
             .await
@@ -4021,12 +4023,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_has_no_bootstrap_error_without_error_file() {
-        let (state, ready_path, _error_path) = status_test_state_with_init_files(
-            "status-bootstrap-absent",
-            Some(b"not-ready\n"),
-            None,
-        )
-        .await;
+        let (state, ready_path, _error_path, _signal_dir, _token_file) =
+            status_test_state_with_init_files(
+                "status-bootstrap-absent",
+                Some(b"not-ready\n"),
+                None,
+            )
+            .await;
         assert!(!ready_path.with_file_name("init-error").exists());
 
         let response = status(State(state)).await;
@@ -4040,7 +4043,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_suppresses_stale_bootstrap_error_once_ready() {
-        let (state, ready_path, _error_path) = status_test_state_with_init_files(
+        let (state, ready_path, _error_path, _signal_dir, _token_file) = status_test_state_with_init_files(
             "status-bootstrap-ready",
             None,
             Some(
@@ -4066,13 +4069,17 @@ mod tests {
     /// Bounded, nonblocking test rendezvous with the production error-file
     /// probe: opening a FIFO write end with O_NONBLOCK succeeds only once the
     /// probe has opened the read end. ENXIO (no reader yet) is retried with
-    /// async sleeps until the deadline; no filesystem operation is ever left
-    /// blocking, so old orderings fail promptly instead of hanging the
-    /// blocking pool.
-    async fn rendezvous_with_error_probe(
+    /// async sleeps until the deadline. On timeout, the pending reader is
+    /// released with a native O_RDWR|O_NONBLOCK open, the FIFO is unlinked so
+    /// later opens fail instead of blocking, and the spawned task is joined
+    /// (bounded) BEFORE panicking -- so no blocking filesystem operation and
+    /// no spawned task are left behind, and old orderings fail promptly
+    /// instead of hanging the blocking pool or runtime shutdown.
+    async fn rendezvous_with_error_probe<T>(
+        task: tokio::task::JoinHandle<T>,
         error_path: &Path,
         timeout: Duration,
-    ) -> Option<std::fs::File> {
+    ) -> (std::fs::File, tokio::task::JoinHandle<T>) {
         let fifo = std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
         let deadline = Instant::now() + timeout;
@@ -4085,7 +4092,8 @@ mod tests {
             };
             if fd >= 0 {
                 use std::os::unix::io::FromRawFd;
-                return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+                let writer = unsafe { std::fs::File::from_raw_fd(fd) };
+                return (writer, task);
             }
             let err = std::io::Error::last_os_error();
             assert_eq!(
@@ -4094,21 +4102,45 @@ mod tests {
                 "unexpected fifo open error: {err}"
             );
             if Instant::now() >= deadline {
-                return None;
+                // A production reader open may have started after the last
+                // attempt above. Release it, remove the fifo so no later
+                // open can block, and finish the spawned task before
+                // failing the test.
+                release_error_probe_fifo(&fifo);
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+                panic!("production probe never opened the error fifo within {timeout:?}");
             }
             sleep(Duration::from_millis(5)).await;
         }
     }
 
+    /// Release any pending error-probe fifo operation and remove the fifo:
+    /// the O_RDWR|O_NONBLOCK open pairs with a reader blocked in open(2)
+    /// (or would satisfy a future read); the unlink happens while that fd is
+    /// still held so no new open can block; closing afterwards gives a
+    /// released reader immediate EOF. With the path unlinked, later opens
+    /// fail with ENOENT instead of blocking.
+    fn release_error_probe_fifo(fifo: &std::ffi::CString) {
+        unsafe {
+            let fd = libc::open(
+                fifo.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            );
+            libc::unlink(fifo.as_ptr());
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn status_suppresses_error_when_readiness_appears_during_error_probe() {
-        let (state, ready_path, error_path) =
+        let (state, ready_path, error_path, _signal_dir, _token_file) =
             status_test_state_with_init_files("status-bootstrap-probe-race", None, None).await;
 
         let status_task = tokio::spawn(async move { status(State(state)).await });
-        let mut writer = rendezvous_with_error_probe(&error_path, Duration::from_secs(5))
-            .await
-            .expect("status must probe the error file while not ready");
+        let (mut writer, status_task) =
+            rendezvous_with_error_probe(status_task, &error_path, Duration::from_secs(5)).await;
         // Rendezvous complete: the probe is now reading the error file, so
         // readiness appearing here lands strictly after the (old ordering's)
         // ready check and strictly before the probe result is consumed.
@@ -4799,9 +4831,8 @@ mod tests {
         let waiter_task = tokio::spawn(async move {
             wait_for_enclava_init_ready(&waiter_state, Duration::from_secs(5)).await
         });
-        let mut writer = rendezvous_with_error_probe(&error_path, Duration::from_secs(5))
-            .await
-            .expect("waiter must probe the error file while not ready");
+        let (mut writer, waiter_task) =
+            rendezvous_with_error_probe(waiter_task, &error_path, Duration::from_secs(5)).await;
         // Rendezvous complete: the waiter's error probe is in flight, so
         // readiness appearing here lands strictly after the loop's ready
         // check and strictly before the failure would be surfaced.
@@ -4823,6 +4854,44 @@ mod tests {
             outcome.is_ok(),
             "readiness observed after the error probe must win over the stale recorded failure: {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rendezvous_timeout_releases_probe_and_exits_promptly() {
+        let signal_dir = test_signal_dir("fifo-rendezvous-timeout");
+        let error_path = signal_dir.path.join("init-error");
+        let fifo = std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
+        // A task that never touches the error file forces the rendezvous
+        // timeout (its sleep is cancellation-safe at runtime shutdown).
+        let never_probing_task = tokio::spawn(async {
+            sleep(Duration::from_secs(60)).await;
+        });
+        let helper_error_path = error_path.clone();
+
+        let helper_task = tokio::spawn(async move {
+            rendezvous_with_error_probe(
+                never_probing_task,
+                &helper_error_path,
+                Duration::from_millis(200),
+            )
+            .await
+        });
+        // The whole timeout path must finish within a small bound; a hang
+        // here (blocking fifo op or unjoined task) fails the bound instead.
+        let joined = tokio::time::timeout(Duration::from_secs(10), helper_task)
+            .await
+            .expect("rendezvous timeout path must not hang");
+        assert!(
+            joined.is_err(),
+            "rendezvous must fail when the probe never opens the error fifo"
+        );
+        // The failure cleanup unlinked the fifo: nothing is left behind and
+        // a fresh open of the path fails immediately instead of blocking.
+        assert!(
+            std::fs::symlink_metadata(&error_path).is_err(),
+            "rendezvous failure must leave no fifo behind"
+        );
+        assert!(unsafe { libc::open(fifo.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) } < 0);
     }
 
     #[test]
