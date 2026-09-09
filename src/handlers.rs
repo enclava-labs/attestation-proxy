@@ -1384,25 +1384,29 @@ async fn probe_init_error_file(path: &str) -> InitErrorFileProbe {
 
 /// Optional bounded bootstrap diagnostic for `/status`, included only while
 /// the enclava-init ready sentinel does not report ready, so a ready process
-/// never reports a stale `bootstrap_error`. An absent error file yields no
-/// diagnostic; unreadable, oversized, legacy, or malformed content collapses
-/// to the generic terminal failure without echoing raw file bytes.
+/// never reports a stale `bootstrap_error`. The error file is probed first
+/// and readiness is the FINAL observation: if init finishes while the error
+/// probe is in flight, the recorded error is stale and suppressed. An absent
+/// error file yields no diagnostic; unreadable, oversized, legacy, or
+/// malformed content collapses to the generic terminal failure without
+/// echoing raw file bytes.
 async fn bootstrap_error_for_status(state: &AppState) -> Option<Value> {
     let error_file = state.config.enclava_init_error_file.trim();
     if error_file.is_empty() {
         return None;
     }
+    let diagnostic = match probe_init_error_file(error_file).await {
+        InitErrorFileProbe::Absent => return None,
+        InitErrorFileProbe::Unreadable | InitErrorFileProbe::Oversized => {
+            BootstrapInitError::generic().status_json()
+        }
+        InitErrorFileProbe::Loaded(bytes) => parse_bootstrap_init_error(&bytes).status_json(),
+    };
     let ready_file = state.config.enclava_init_ready_file.trim();
     if !ready_file.is_empty() && enclava_init_ready_file_is_ready(state).await == Ok(true) {
         return None;
     }
-    match probe_init_error_file(error_file).await {
-        InitErrorFileProbe::Absent => None,
-        InitErrorFileProbe::Unreadable | InitErrorFileProbe::Oversized => {
-            Some(BootstrapInitError::generic().status_json())
-        }
-        InitErrorFileProbe::Loaded(bytes) => Some(parse_bootstrap_init_error(&bytes).status_json()),
-    }
+    Some(diagnostic)
 }
 
 /// GET /v1/attestation/info
@@ -2354,30 +2358,41 @@ async fn wait_for_enclava_init_ready(
         }
 
         if !error_file.is_empty() {
-            match probe_init_error_file(error_file).await {
-                InitErrorFileProbe::Absent => {}
+            let failure = match probe_init_error_file(error_file).await {
+                InitErrorFileProbe::Absent => None,
                 InitErrorFileProbe::Unreadable => {
                     // Keep this distinct from a recorded init failure: recovery
                     // treats an unobservable init state as ambiguous.
-                    return Err(OwnershipError::Store(
+                    Some(OwnershipError::Store(
                         "enclava_init_error_file_read_failed".to_string(),
-                    ));
+                    ))
                 }
                 InitErrorFileProbe::Oversized => {
                     // Successfully read but out-of-contract content: a recorded
                     // generic init failure, so recovery keeps its locked/
                     // unclaimed retry semantics instead of a restart-required
                     // ambiguous observation.
-                    return Err(OwnershipError::Store(
+                    Some(OwnershipError::Store(
                         BootstrapInitError::generic().ownership_detail(),
-                    ));
+                    ))
                 }
                 InitErrorFileProbe::Loaded(bytes) => {
                     // Only the fixed-vocabulary safe code is carried; the raw
                     // error-file content is never forwarded anywhere.
-                    let diagnostic = parse_bootstrap_init_error(&bytes);
-                    return Err(OwnershipError::Store(diagnostic.ownership_detail()));
+                    Some(OwnershipError::Store(
+                        parse_bootstrap_init_error(&bytes).ownership_detail(),
+                    ))
                 }
+            };
+            if let Some(err) = failure {
+                // Readiness is the FINAL observation: if init finished while
+                // the error file was being probed, success wins over the
+                // now-stale recorded failure.
+                if enclava_init_ready_file_is_ready(state).await == Ok(true) {
+                    *state.startup_owner_seed.write().await = None;
+                    return Ok(());
+                }
+                return Err(err);
             }
         }
 
@@ -4049,6 +4064,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_suppresses_error_when_readiness_appears_during_error_probe() {
+        let (state, ready_path, error_path) =
+            status_test_state_with_init_files("status-bootstrap-probe-race", None, None).await;
+        // The error file is a FIFO so the probe blocks until the test opens
+        // the write end: readiness deterministically appears while the error
+        // probe is still in flight.
+        let error_fifo =
+            std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(error_fifo.as_ptr(), 0o644) }, 0);
+
+        let status_task = tokio::spawn(async move { status(State(state)).await });
+        // Let the probe reach (and block on) the FIFO before readiness lands.
+        sleep(Duration::from_millis(200)).await;
+        tokio::fs::write(&ready_path, b"ready\n")
+            .await
+            .expect("mark init ready while the error probe awaits");
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&error_path)
+            .await
+            .expect("open fifo writer");
+        writer
+            .write_all(
+                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+            )
+            .await
+            .expect("deliver stale terminal error");
+        drop(writer);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), status_task)
+            .await
+            .expect("status completes")
+            .expect("status task");
+        let body = read_json(response).await;
+        assert!(
+            body.get("bootstrap_error").is_none(),
+            "readiness observed after the error probe must suppress the stale terminal error: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn status_returns_not_found_for_legacy_mode() {
         let signal_dir = test_signal_dir("status-legacy-mode");
         let state = build_state_with_mode(
@@ -4691,6 +4747,60 @@ mod tests {
         assert!(
             !rendered.contains("2027-01-02"),
             "the deadline is reported only via the structured status diagnostic: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_enclava_init_ready_prefers_readiness_appearing_during_error_probe() {
+        let signal_dir = test_signal_dir("init-ready-probe-race");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        // The error file is a FIFO so the waiter's error probe blocks until
+        // the test opens the write end: readiness deterministically appears
+        // while the error probe is still in flight.
+        let error_fifo =
+            std::ffi::CString::new(error_path.display().to_string()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(error_fifo.as_ptr(), 0o644) }, 0);
+
+        let waiter_state = state.clone();
+        let waiter_task = tokio::spawn(async move {
+            wait_for_enclava_init_ready(&waiter_state, Duration::from_secs(5)).await
+        });
+        sleep(Duration::from_millis(200)).await;
+        tokio::fs::write(&ready_path, b"ready\n")
+            .await
+            .expect("mark init ready while the error probe awaits");
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&error_path)
+            .await
+            .expect("open fifo writer");
+        writer
+            .write_all(
+                br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z"}"#,
+            )
+            .await
+            .expect("deliver stale terminal error");
+        drop(writer);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), waiter_task)
+            .await
+            .expect("waiter completes")
+            .expect("waiter task");
+        assert!(
+            outcome.is_ok(),
+            "readiness observed after the error probe must win over the stale recorded failure: {outcome:?}"
         );
     }
 
