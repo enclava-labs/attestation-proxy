@@ -24,6 +24,41 @@ auto-unlock.
 The full cross-repo runtime contract lives in
 [`enclava-tenant-manifests/docs/ATTESTATION-PROXY-CONTRACT.md`](../enclava-tenant-manifests/docs/ATTESTATION-PROXY-CONTRACT.md).
 
+## Bootstrap diagnostics
+
+While the enclava-init ready sentinel does not report ready, `GET /status`
+may additionally include a bounded, structured `bootstrap_error` object
+sourced from the enclava-init error file:
+
+```json
+{
+  "error": "acme_rate_limited",
+  "terminal": true,
+  "retry_after": "2026-09-09T12:34:56Z"
+}
+```
+
+`error` is one of the exact recognized codes `acme_rate_limited`,
+`acme_certificate_issuance_failed`, or `enclava_init_failed`; `terminal` is
+always `true` (a terminal bootstrap failure); `retry_after` is `null` or a
+validated canonical RFC3339 UTC deadline (`YYYY-MM-DDTHH:MM:SSZ`, seconds
+`00`-`59` — leap seconds and offsets are not canonical broker output and are
+rejected — exactly as emitted by the broker chain). The proxy independently
+re-checks the producer-side bound at its own observation time; a deadline
+more than 365 days in the future, or any otherwise-invalid `retry_after`
+value, degrades to `null` while the recognized safe terminal code is
+retained. Elapsed deadlines are preserved verbatim: the failure stays
+terminal and a retry may be attempted separately; the proxy never retries
+certificate issuance itself. Only
+the first 4 KiB of the error file are read, and it is never deserialized
+unbounded. Legacy free-form text, unknown codes, malformed, oversized, or
+unreadable error files collapse to the generic terminal `enclava_init_failed`
+diagnostic; raw file content, provider prose, and extra fields are never
+echoed into status responses or error strings. A ready process never reports
+a stale `bootstrap_error`, and recovery clears the stale error file before
+sending a new owner seed. The diagnostic is informational only and grants no
+authorization.
+
 ## Attestation REPORT_DATA binding
 
 `GET /v1/attestation` rejects caller-supplied `runtime_data`. Because this
