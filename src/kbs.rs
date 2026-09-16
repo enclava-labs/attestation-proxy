@@ -278,6 +278,23 @@ pub async fn probe_direct_kbs_resource_status(
     Ok(response.status().as_u16())
 }
 
+/// Probe with one session-refresh retry. A 401/400 from the KBS usually
+/// means the cached AA token was minted against a KBS instance that no
+/// longer exists (trustee rolls restart the KBS and its in-memory sessions).
+/// Invalidate the token cache, re-attest, and probe once more before the
+/// caller maps the status to a terminal ownership error.
+pub async fn probe_direct_kbs_resource_status_with_session_refresh(
+    state: &crate::AppState,
+    resource_path: &str,
+) -> Result<u16, OwnershipError> {
+    let status = probe_direct_kbs_resource_status(state, resource_path).await?;
+    if status != 401 && status != 400 {
+        return Ok(status);
+    }
+    state.aa_token_cache.write().await.invalidate();
+    probe_direct_kbs_resource_status(state, resource_path).await
+}
+
 /// Evict a cached KBS resource entry after a write or delete.
 /// This ensures read-after-write consistency for paths that were
 /// modified via the workload-resource endpoint.
@@ -728,5 +745,103 @@ mod tests {
         };
         assert!(!entry.is_valid());
         assert!(!entry.has_valid_error());
+    }
+
+    #[tokio::test]
+    async fn probe_with_session_refresh_replaces_stale_cached_token() {
+        use std::sync::Arc;
+
+        // Mock in-guest AA + KBS. `minted` is what the AA currently serves;
+        // `accepted` is the bearer token the (current) KBS still knows. They
+        // diverge when a trustee roll restarts the KBS: tokens minted against
+        // the old instance are no longer valid.
+        let minted = Arc::new(tokio::sync::Mutex::new("stale-token".to_string()));
+        let accepted = Arc::new(tokio::sync::Mutex::new("fresh-token".to_string()));
+        let aa_token = minted.clone();
+        let kbs_accepted = accepted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(move || {
+                    let token = aa_token.clone();
+                    async move {
+                        let token = token.lock().await.clone();
+                        axum::Json(serde_json::json!({ "token": token }))
+                    }
+                }),
+            )
+            .route(
+                "/kbs/v0/resource/{*path}",
+                axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                    let accepted = kbs_accepted.lock().await.clone();
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    if auth == format!("Bearer {accepted}") {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::BAD_REQUEST
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        // Prime the cache with the (now stale) token.
+        let status = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
+            .await
+            .expect("plain probe");
+        assert_eq!(status, 400);
+
+        // The AA re-mints what the new KBS accepts; only the wrapper's cache
+        // invalidation can pick the new token up.
+        *minted.lock().await = "fresh-token".to_string();
+        let refreshed = probe_direct_kbs_resource_status_with_session_refresh(
+            &state,
+            "default/o/seed-encrypted",
+        )
+        .await
+        .expect("refreshed probe");
+        assert_eq!(refreshed, 200);
+
+        // The cache is sticky: a second roll makes the AA mint a new token,
+        // but the plain probe keeps sending the cached one.
+        *minted.lock().await = "fresh-token-2".to_string();
+        *accepted.lock().await = "fresh-token-2".to_string();
+        let stale = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
+            .await
+            .expect("plain probe again");
+        assert_eq!(stale, 400);
+
+        server.abort();
     }
 }

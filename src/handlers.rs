@@ -811,7 +811,7 @@ async fn cdh_missing_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path).await? {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -833,7 +833,7 @@ async fn cdh_missing_optional_sealed_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path).await? {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -847,10 +847,25 @@ const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 5;
 
+// Unclaimed polling must stay short: the HTTP server (and with it the claim
+// endpoint) only binds after initialize_ownership_state completes, so a long
+// unclaimed budget would delay every fresh password-mode deploy.
 #[cfg(test)]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 2_000;
+
+// Error-path budget: a KBS-unreachable window (typically a trustee roll,
+// which takes ~10-30s+ to become ready) must be outlived or the boot latches
+// a terminal ownership error that only a pod reboot (or re-probe) clears.
+#[cfg(test)]
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 4;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 30;
+#[cfg(test)]
+const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 10;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 3_000;
 #[cfg(test)]
 const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
@@ -1799,14 +1814,15 @@ pub async fn initialize_ownership_state(state: &AppState) {
         return;
     }
 
-    for attempt in 0..OWNER_SEED_STARTUP_RECHECK_ATTEMPTS {
+    let mut attempt: usize = 0;
+    loop {
         match refresh_ownership_state(state, attempt > 0).await {
             Ok(()) => {
                 if !state.ownership.is_unclaimed() {
                     return;
                 }
                 if state.config.owner_ciphertext_backend != "kbs-resource"
-                    || attempt + 1 == OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                    || attempt + 1 >= OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
                 {
                     return;
                 }
@@ -1814,15 +1830,17 @@ pub async fn initialize_ownership_state(state: &AppState) {
                     OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
                 ))
                 .await;
+                attempt += 1;
             }
             Err(err) => {
                 if state.config.owner_ciphertext_backend == "kbs-resource"
-                    && attempt + 1 < OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                    && attempt + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(
-                        OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
+                        OWNER_SEED_STARTUP_ERROR_DELAY_MS,
                     ))
                     .await;
+                    attempt += 1;
                     continue;
                 }
                 state.ownership.set_error(err.to_string());
@@ -1924,6 +1942,28 @@ pub async fn unlock(
 
     if password.is_empty() {
         return json_response(400, &json!({"error": "password_required"}));
+    }
+
+    // A latched `owner_seed_unavailable` error is an environmental failure
+    // (KBS session or reachability), not an ownership fact: re-probe once so
+    // the operator's unlock retry can recover without a pod reboot.
+    if state.ownership.error_is_reprobeable() {
+        match refresh_ownership_state(&state, true).await {
+            Ok(()) if state.ownership.is_locked() => {}
+            Ok(()) if state.ownership.is_unlocking() => {
+                return json_response(202, &json!({"state": "unlocking"}));
+            }
+            _ => {
+                let current_state = state
+                    .ownership
+                    .state_json()
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string();
+                return json_response(409, &json!({"error": "not_locked", "state": current_state}));
+            }
+        }
     }
 
     if let Err(err) = state.ownership.begin_unlock_attempt() {
@@ -8229,5 +8269,129 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn startup_owner_seed_error_budget_outlives_transient_kbs_failures() {
+        let signal_dir = test_signal_dir("startup-error-budget");
+        // Three consecutive CDH failures exceed the unclaimed recheck budget
+        // (3 in test cfg) but fit the error budget (4): a KBS-unreachable
+        // window must be retried through, not latched as a terminal error.
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![502, 502, 502],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "unclaimed");
+        assert!(body["error"].is_null());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_reprobes_latched_owner_seed_error_instead_of_rejecting() {
+        let signal_dir = test_signal_dir("unlock-reprobe-latched-error");
+        let owner_seed = [0x2a; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let ready_for_task = ready_path.clone();
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            accepted_tx.send(()).expect("notify accepted");
+            ready_rx.await.expect("wait for ready release");
+            tokio::fs::write(&ready_for_task, b"ready\n")
+                .await
+                .expect("write ready file");
+            line
+        });
+
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        // Simulate the latched wedge: boot intersected a trustee roll.
+        state
+            .ownership
+            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("correct-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 202);
+        accepted_rx.await.expect("init accepted owner seed");
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        ready_tx.send(()).expect("release ready writer");
+        let _ = socket_task.await.expect("socket task");
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_keeps_rejection_when_reprobe_still_fails() {
+        let signal_dir = test_signal_dir("unlock-reprobe-still-failing");
+        // Port 9 (discard) refuses connections immediately: the re-probe
+        // cannot reach the KBS.
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 409);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "not_locked");
+        assert_eq!(body["state"], "error");
+        assert_eq!(state.ownership.state_json()["state"], "error");
     }
 }

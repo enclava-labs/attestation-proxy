@@ -361,6 +361,19 @@ impl OwnershipGuard {
         }
     }
 
+    /// Whether the latched error is an environmental ownership-probe failure
+    /// (KBS session or reachability, e.g. after a trustee roll) rather than
+    /// an ownership fact. These states may be re-probed (e.g. at unlock)
+    /// instead of requiring a pod reboot to clear.
+    pub fn error_is_reprobeable(&self) -> bool {
+        let machine = self.machine.lock().expect("ownership lock poisoned");
+        matches!(machine.state, OwnershipState::Error)
+            && machine
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("owner_seed_unavailable"))
+    }
+
     pub fn set_auto_unlock_enabled(&self, enabled: bool) {
         if let Ok(mut machine) = self.machine.lock() {
             machine.auto_unlock_enabled = enabled;
@@ -882,6 +895,10 @@ impl OwnershipGuard {
 
     pub fn is_unlocking(&self) -> bool {
         matches!(self.current_state(), OwnershipState::Unlocking)
+    }
+
+    pub fn is_locked(&self) -> bool {
+        matches!(self.current_state(), OwnershipState::Locked)
     }
 
     pub fn is_unlocked(&self) -> bool {
