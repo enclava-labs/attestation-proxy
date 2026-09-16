@@ -811,7 +811,10 @@ async fn cdh_missing_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path)
+        .await
+        .map_err(|e| OwnershipError::OwnerSeedUnavailable(format!("owner_seed_probe_failed:{e}")))?
+    {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -833,7 +836,10 @@ async fn cdh_missing_optional_sealed_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path)
+        .await
+        .map_err(|e| OwnershipError::OwnerSeedUnavailable(format!("owner_seed_probe_failed:{e}")))?
+    {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -1814,15 +1820,19 @@ pub async fn initialize_ownership_state(state: &AppState) {
         return;
     }
 
-    let mut attempt: usize = 0;
+    let mut unclaimed_polls: usize = 0;
+    let mut error_attempts: usize = 0;
     loop {
-        match refresh_ownership_state(state, attempt > 0).await {
+        // Independent budgets: unclaimed polls and error retries count
+        // separately, so neither ordering of results shortens the other's
+        // budget.
+        match refresh_ownership_state(state, unclaimed_polls + error_attempts > 0).await {
             Ok(()) => {
                 if !state.ownership.is_unclaimed() {
                     return;
                 }
                 if state.config.owner_ciphertext_backend != "kbs-resource"
-                    || attempt + 1 >= OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                    || unclaimed_polls + 1 >= OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
                 {
                     return;
                 }
@@ -1830,17 +1840,17 @@ pub async fn initialize_ownership_state(state: &AppState) {
                     OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
                 ))
                 .await;
-                attempt += 1;
+                unclaimed_polls += 1;
             }
             Err(err) => {
                 if state.config.owner_ciphertext_backend == "kbs-resource"
-                    && attempt + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
+                    && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(
                         OWNER_SEED_STARTUP_ERROR_DELAY_MS,
                     ))
                     .await;
-                    attempt += 1;
+                    error_attempts += 1;
                     continue;
                 }
                 state.ownership.set_error(err.to_string());
@@ -1945,12 +1955,27 @@ pub async fn unlock(
     }
 
     // A latched `owner_seed_unavailable` error is an environmental failure
-    // (KBS session or reachability), not an ownership fact: re-probe once so
-    // the operator's unlock retry can recover without a pod reboot.
+    // (KBS session or reachability), not an ownership fact: re-probe so the
+    // operator's unlock retry can recover without a pod reboot. The probe
+    // shares the unlock attempt budget: an unauthenticated caller must not
+    // be able to trigger unlimited KBS round trips through the latched state.
     if state.ownership.error_is_reprobeable() {
-        match refresh_ownership_state(&state, true).await {
+        if state.ownership.begin_recovery_probe().is_err() {
+            return rate_limited_response();
+        }
+        // One retry after a session-flavored failure: the first refresh can
+        // repair the KBS session mid-flight (the probe re-attests) and only
+        // the second read succeeds.
+        let mut refreshed = refresh_ownership_state(&state, true).await;
+        if refreshed.is_err() {
+            refreshed = refresh_ownership_state(&state, true).await;
+        }
+        match refreshed {
             Ok(()) if state.ownership.is_locked() => {}
             Ok(()) if state.ownership.is_unlocking() => {
+                // Auto-unlock material became visible: resume the startup
+                // auto-unlock path so the 202 means work is in flight.
+                spawn_auto_unlock_if_needed(state.clone());
                 return json_response(202, &json!({"state": "unlocking"}));
             }
             _ => {
@@ -8393,5 +8418,182 @@ mod tests {
         assert_eq!(body["error"], "not_locked");
         assert_eq!(body["state"], "error");
         assert_eq!(state.ownership.state_json()["state"], "error");
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_probe_shares_the_attempt_budget() {
+        let signal_dir = test_signal_dir("unlock-reprobe-rate-limit");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+
+        // The re-probe records an attempt for every failing call: after the
+        // unlock budget is spent the endpoint rate-limits instead of
+        // performing further KBS round trips.
+        for _ in 0..crate::ownership::UNLOCK_MAX_ATTEMPTS {
+            let response = unlock(
+                State(state.clone()),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("whatever".to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 409);
+        }
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 429);
+        assert_eq!(read_json(response).await["error"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn startup_probe_transport_failure_latches_reprobeable_error() {
+        let signal_dir = test_signal_dir("startup-probe-transport");
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![500],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            // The AA token endpoint is unreachable: the direct probe fails
+            // with a transport error rather than an HTTP status.
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.aa_token_url = "http://127.0.0.1:9/aa/token".to_string();
+        }
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "error");
+        let error = body["error"].as_str().expect("latched error");
+        assert!(
+            error.starts_with("owner_seed_unavailable"),
+            "probe transport failures must latch as re-probeable, got: {error}"
+        );
+        assert!(state.ownership.error_is_reprobeable());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_budgets_track_unclaimed_and_error_retries_independently() {
+        let signal_dir = test_signal_dir("startup-split-budgets");
+        // Two unclaimed polls, three transient failures, then recovery:
+        // with a shared counter the first failure would exhaust the recheck
+        // budget and latch; independent counters retry through the outage.
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![404, 404, 502, 502, 502],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "unclaimed");
+        assert!(body["error"].is_null());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_resumes_auto_unlock_after_reprobe() {
+        let signal_dir = test_signal_dir("auto-unlock-reprobe");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("auto-unlock-reprobe-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let enable = enable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(enable.status().as_u16(), 200);
+
+        // Simulate the wedge: a restart boot latched the environmental error
+        // (auto-unlock never engaged because the seed was unreachable).
+        let restart_signal_dir = test_signal_dir("auto-unlock-reprobe-restart");
+        mark_password_slots_unlocked(&restart_signal_dir.path);
+        let restart_state = build_state_with_secret_backend(
+            &restart_signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        restart_state
+            .ownership
+            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+
+        let response = unlock(
+            State(restart_state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+
+        // The re-probe must not just report Unlocking: it resumes the
+        // auto-unlock operation.
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await["state"], "unlocking");
+        let body = wait_for_ownership_state(&restart_state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        api_server.task.abort();
     }
 }

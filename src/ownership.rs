@@ -296,6 +296,22 @@ impl OwnershipGuard {
         Ok(())
     }
 
+    /// Record an attempt for a recovery probe of a latched environmental
+    /// error (see `error_is_reprobeable`), applying the same rate limit and
+    /// attempt window as unlock attempts without requiring the Locked state.
+    /// The probe performs KBS round trips, so it must be budgeted like an
+    /// unlock even though no password is checked yet.
+    pub fn begin_recovery_probe(&self) -> Result<(), OwnershipError> {
+        let mut machine = self.machine.lock().expect("ownership lock poisoned");
+        let now = Self::now();
+        Self::prune_expired_attempts(&mut machine, now);
+        if machine.attempts.len() >= UNLOCK_MAX_ATTEMPTS {
+            return Err(OwnershipError::RateLimited);
+        }
+        machine.attempts.push_back(now);
+        Ok(())
+    }
+
     pub fn begin_recovery_verification(&self) -> Result<(), OwnershipError> {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
         if !matches!(
