@@ -298,17 +298,42 @@ impl OwnershipGuard {
 
     /// Record an attempt for a recovery probe of a latched environmental
     /// error (see `error_is_reprobeable`), applying the same rate limit and
-    /// attempt window as unlock attempts without requiring the Locked state.
-    /// The probe performs KBS round trips, so it must be budgeted like an
-    /// unlock even though no password is checked yet.
-    pub fn begin_recovery_probe(&self) -> Result<(), OwnershipError> {
+    /// attempt window as unlock attempts, and atomically reserve the
+    /// recovery: the Error state transitions to Unlocking under the same
+    /// lock that checked the predicate, so exactly one concurrent request
+    /// owns the recovery and the refreshes that follow cannot clobber each
+    /// other's reservations. The latched error string is kept until the
+    /// recovery resolves (restored on failure by the caller).
+    pub fn begin_recovery_from_error(&self) -> Result<(), OwnershipError> {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
         let now = Self::now();
         Self::prune_expired_attempts(&mut machine, now);
         if machine.attempts.len() >= UNLOCK_MAX_ATTEMPTS {
             return Err(OwnershipError::RateLimited);
         }
+        if !matches!(machine.state, OwnershipState::Error)
+            || !machine
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("owner_seed_unavailable"))
+        {
+            return Err(OwnershipError::NotLocked);
+        }
         machine.attempts.push_back(now);
+        machine.state = OwnershipState::Unlocking;
+        Ok(())
+    }
+
+    /// Take the unlock reservation for a request that already recorded an
+    /// attempt (the recovery probe): transitions Locked to Unlocking without
+    /// charging the rate-limit budget a second time.
+    pub fn begin_unlock_attempt_prearmed(&self) -> Result<(), OwnershipError> {
+        let mut machine = self.machine.lock().expect("ownership lock poisoned");
+        if !matches!(machine.state, OwnershipState::Locked) {
+            return Err(OwnershipError::NotLocked);
+        }
+        machine.state = OwnershipState::Unlocking;
+        machine.error = None;
         Ok(())
     }
 
