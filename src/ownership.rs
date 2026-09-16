@@ -167,6 +167,16 @@ pub enum OwnershipError {
     Store(String),
 }
 
+impl OwnershipError {
+    /// Whether this failure is environmental (KBS session or reachability,
+    /// e.g. after a trustee roll) rather than an ownership fact: such
+    /// latched errors may be re-probed later instead of requiring a pod
+    /// reboot to clear.
+    pub fn is_reprobeable(&self) -> bool {
+        matches!(self, Self::OwnerSeedUnavailable(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoffOutcome {
     Unlocked,
@@ -211,6 +221,12 @@ fn is_tls_seed_cdh_path(path: &str) -> bool {
 struct OwnershipMachine {
     state: OwnershipState,
     error: Option<String>,
+    /// Whether the latched error is an environmental ownership-probe failure
+    /// (see `OwnershipError::is_reprobeable`). Only meaningful while
+    /// `state == Error`; set exclusively by `set_ownership_error` and
+    /// cleared by `set_error`, so the re-probe contract cannot silently
+    /// drift with error-string formatting.
+    error_reprobeable: bool,
     attempts: VecDeque<Instant>,
     auto_unlock_enabled: bool,
 }
@@ -268,6 +284,7 @@ impl OwnershipGuard {
             machine: Mutex::new(OwnershipMachine {
                 state: initial_state,
                 error: None,
+                error_reprobeable: false,
                 attempts: VecDeque::new(),
                 auto_unlock_enabled: false,
             }),
@@ -311,12 +328,7 @@ impl OwnershipGuard {
         if machine.attempts.len() >= UNLOCK_MAX_ATTEMPTS {
             return Err(OwnershipError::RateLimited);
         }
-        if !matches!(machine.state, OwnershipState::Error)
-            || !machine
-                .error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("owner_seed_unavailable"))
-        {
+        if !matches!(machine.state, OwnershipState::Error) || !machine.error_reprobeable {
             return Err(OwnershipError::NotLocked);
         }
         machine.attempts.push_back(now);
@@ -399,20 +411,29 @@ impl OwnershipGuard {
         if let Ok(mut machine) = self.machine.lock() {
             machine.state = OwnershipState::Error;
             machine.error = Some(error.into());
+            machine.error_reprobeable = false;
+        }
+    }
+
+    /// Latch an ownership error, remembering whether it is a re-probeable
+    /// environmental failure (`OwnershipError::is_reprobeable`).
+    pub fn set_ownership_error(&self, error: &OwnershipError) {
+        if let Ok(mut machine) = self.machine.lock() {
+            machine.state = OwnershipState::Error;
+            machine.error = Some(error.to_string());
+            machine.error_reprobeable = error.is_reprobeable();
         }
     }
 
     /// Whether the latched error is an environmental ownership-probe failure
     /// (KBS session or reachability, e.g. after a trustee roll) rather than
     /// an ownership fact. These states may be re-probed (e.g. at unlock)
-    /// instead of requiring a pod reboot to clear.
+    /// instead of requiring a pod reboot to clear. The decision is a stored
+    /// flag (see `set_ownership_error`), not error-string matching: any
+    /// transition out of Error, or a plain `set_error`, makes this false.
     pub fn error_is_reprobeable(&self) -> bool {
         let machine = self.machine.lock().expect("ownership lock poisoned");
-        matches!(machine.state, OwnershipState::Error)
-            && machine
-                .error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("owner_seed_unavailable"))
+        matches!(machine.state, OwnershipState::Error) && machine.error_reprobeable
     }
 
     pub fn set_auto_unlock_enabled(&self, enabled: bool) {

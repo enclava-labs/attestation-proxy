@@ -1007,7 +1007,7 @@ async fn maybe_refresh_unclaimed_state(state: &AppState) {
         return;
     }
     if let Err(err) = refresh_ownership_state(state, true).await {
-        state.ownership.set_error(err.to_string());
+        state.ownership.set_ownership_error(&err);
     }
 }
 
@@ -1853,18 +1853,18 @@ pub async fn initialize_ownership_state(state: &AppState) {
                 unclaimed_polls += 1;
             }
             Err(err) => {
+                let now = tokio::time::Instant::now();
                 if state.config.owner_ciphertext_backend == "kbs-resource"
                     && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
-                    && tokio::time::Instant::now() < error_deadline
+                    && now < error_deadline
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        OWNER_SEED_STARTUP_ERROR_DELAY_MS,
-                    ))
-                    .await;
+                    let next_retry =
+                        now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DELAY_MS);
+                    tokio::time::sleep_until(next_retry.min(error_deadline)).await;
                     error_attempts += 1;
                     continue;
                 }
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return;
             }
         }
@@ -1883,7 +1883,7 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
         let material = match load_owner_seed_material(&state).await {
             Ok(material) => material,
             Err(err) => {
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return;
             }
         };
@@ -1992,32 +1992,35 @@ pub async fn unlock(
                 }
                 match refreshed {
                     Ok(()) if state.ownership.is_locked() => {}
-                    Ok(()) if state.ownership.is_unlocking() => {
+                    Ok(())
+                        if state.ownership.is_unlocking()
+                            && state.ownership.auto_unlock_enabled() =>
+                    {
                         // Auto-unlock material became visible: resume the
                         // startup auto-unlock path so the 202 means work is
-                        // in flight.
+                        // in flight. The `auto_unlock_enabled` guard
+                        // distinguishes real material from the bare recovery
+                        // reservation preserved by refresh_ownership_state.
                         spawn_auto_unlock_if_needed(state.clone());
                         return json_response(202, &json!({"state": "unlocking"}));
                     }
+                    Ok(_) => {
+                        // The seed is gone (e.g. torn down while the error was
+                        // latched): the preserved reservation is not
+                        // auto-unlock material. Restore the claimable state
+                        // instead of leaving the instance stuck Unlocking.
+                        state.ownership.set_unclaimed();
+                        return json_response(
+                            409,
+                            &json!({"error": "unclaimed", "state": "unclaimed"}),
+                        );
+                    }
                     Err(err) => {
                         // Restore the latch so later retries can re-probe.
-                        state.ownership.set_error(err.to_string());
+                        state.ownership.set_ownership_error(&err);
                         return json_response(
                             409,
                             &json!({"error": "not_locked", "state": "error"}),
-                        );
-                    }
-                    Ok(()) => {
-                        let current_state = state
-                            .ownership
-                            .state_json()
-                            .get("state")
-                            .and_then(Value::as_str)
-                            .unwrap_or("error")
-                            .to_string();
-                        return json_response(
-                            409,
-                            &json!({"error": "not_locked", "state": current_state}),
                         );
                     }
                 }
@@ -8412,7 +8415,9 @@ mod tests {
         // Simulate the latched wedge: boot intersected a trustee roll.
         state
             .ownership
-            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
 
         let response = unlock(
             State(state.clone()),
@@ -8444,7 +8449,9 @@ mod tests {
         );
         state
             .ownership
-            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
 
         let response = unlock(
             State(state.clone()),
@@ -8472,7 +8479,9 @@ mod tests {
         );
         state
             .ownership
-            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
 
         // The re-probe records an attempt for every failing call: after the
         // unlock budget is spent the endpoint rate-limits instead of
@@ -8619,7 +8628,9 @@ mod tests {
         );
         restart_state
             .ownership
-            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
 
         let response = unlock(
             State(restart_state.clone()),
@@ -8681,7 +8692,9 @@ mod tests {
         }
         state
             .ownership
-            .set_error("owner_seed_unavailable: owner_seed_probe_unexpected_status:400");
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
 
         // Two requests race on the latched error: the reservation is taken
         // under the ownership lock, so exactly one owns the recovery (and
@@ -8705,12 +8718,53 @@ mod tests {
 
         let mut statuses = [first.status().as_u16(), second.status().as_u16()];
         statuses.sort();
+        let mut statuses = [first.status().as_u16(), second.status().as_u16()];
+        statuses.sort();
         assert_eq!(statuses, [202, 409]);
         accepted_rx.await.expect("init accepted owner seed");
         let body = wait_for_ownership_state(&state, "unlocked").await;
         assert_eq!(body["state"], "unlocked");
         ready_tx.send(()).expect("release ready writer");
         let _ = socket_task.await.expect("socket task");
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_restores_unclaimed_when_seed_is_gone() {
+        let signal_dir = test_signal_dir("unlock-reprobe-seed-gone");
+        // KBS is reachable but holds no seed resources (torn down while the
+        // error was latched): the recovery must restore the claimable
+        // state, not strand the instance in a bare Unlocking reservation.
+        let kbs_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(read_json(response).await["error"], "unclaimed");
+        assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        assert!(!state.ownership.error_is_reprobeable());
         kbs_server.task.abort();
     }
 }
