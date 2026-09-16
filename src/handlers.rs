@@ -1127,6 +1127,11 @@ pub async fn status(State(state): State<AppState>) -> Response {
     if let Some(bootstrap_error) = bootstrap_error_for_status(&state).await {
         body["bootstrap_error"] = bootstrap_error;
     }
+    // A live ACME certificate cooldown is observable, non-terminal state:
+    // surface the pending retry deadline without touching ownership state.
+    if let Some(cooldown) = read_acme_cooldown(&state).await {
+        body["acme_retry_after"] = json!(cooldown.retry_after);
+    }
     json_response(200, &body)
 }
 
@@ -2331,6 +2336,88 @@ fn spawn_recovery_init_ready_watch(state: AppState, timeout: std::time::Duration
     });
 }
 
+/// Bound on how far ACME cooldown markers may extend an init-ready watch
+/// beyond its original timeout. Mirrors enclava-init's own certificate-
+/// phase bound plus slack for the post-deadline retry attempt, so a
+/// correctly functioning wait always outlasts the workload's own limit.
+const ACME_COOLDOWN_MAX_EXTENSION: std::time::Duration =
+    std::time::Duration::from_secs(4 * 60 * 60 + 600);
+
+/// Grace added to a marker's retry deadline before the watch may time
+/// out, so the broker retry the deadline precedes can complete.
+const ACME_COOLDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Bound on the cooldown marker size; the marker is a four-field JSON
+/// document and anything larger is treated as absent.
+const MAX_ACME_COOLDOWN_MARKER_BYTES: u64 = 4 * 1024;
+
+/// Parsed init cooldown marker — the non-terminal
+/// `{"error":"acme_rate_limited","terminal":false,"retry_after":<rfc3339>,
+/// "retry_after_unix":<secs>}` contract written by enclava-init while it
+/// honors a broker rate-limit deadline inside the certificate phase.
+struct AcmeCooldown {
+    retry_after: String,
+    retry_after_unix: u64,
+}
+
+/// Parse the marker fail-closed: only the exact non-terminal
+/// `acme_rate_limited` contract with a bounded future deadline counts.
+/// Anything else — unknown codes, terminal markers, malformed JSON, or
+/// elapsed/out-of-horizon deadlines — yields no watch extension.
+fn parse_acme_cooldown_marker(
+    body: &[u8],
+    now_unix: u64,
+    horizon_unix: u64,
+) -> Option<AcmeCooldown> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if parsed.get("error")?.as_str()? != "acme_rate_limited" {
+        return None;
+    }
+    if parsed.get("terminal").and_then(|value| value.as_bool()) != Some(false) {
+        return None;
+    }
+    let retry_after_unix = parsed.get("retry_after_unix")?.as_u64()?;
+    if retry_after_unix <= now_unix || retry_after_unix > horizon_unix {
+        return None;
+    }
+    let retry_after = parsed
+        .get("retry_after")
+        .and_then(|value| value.as_str())
+        .filter(|value| value.len() <= 64)?
+        .to_string();
+    Some(AcmeCooldown {
+        retry_after,
+        retry_after_unix,
+    })
+}
+
+/// Read the init ACME cooldown marker if one currently describes a live,
+/// bounded wait. Best-effort observability: any unreadable or unusable
+/// file behaves as no marker, never as an error.
+async fn read_acme_cooldown(state: &AppState) -> Option<AcmeCooldown> {
+    let path = state.config.enclava_init_acme_cooldown_file.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return None,
+    };
+    if !metadata.is_file() || metadata.len() > MAX_ACME_COOLDOWN_MARKER_BYTES {
+        return None;
+    }
+    let body = match tokio::fs::read(path).await {
+        Ok(body) => body,
+        Err(_) => return None,
+    };
+    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    parse_acme_cooldown_marker(
+        &body,
+        now_unix,
+        now_unix + ACME_COOLDOWN_MAX_EXTENSION.as_secs(),
+    )
+}
+
 async fn wait_for_enclava_init_ready(
     state: &AppState,
     timeout: std::time::Duration,
@@ -2340,7 +2427,8 @@ async fn wait_for_enclava_init_ready(
         return Ok(());
     }
     let error_file = state.config.enclava_init_error_file.trim();
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut deadline = started + timeout;
 
     loop {
         match tokio::fs::read_to_string(ready_file).await {
@@ -2393,6 +2481,25 @@ async fn wait_for_enclava_init_ready(
                     return Ok(());
                 }
                 return Err(err);
+            }
+        }
+
+        // An active ACME certificate cooldown is a bounded wait, not a
+        // failure: extend the watch to the marker's deadline (plus retry
+        // grace), capped at the absolute extension bound. Without this a
+        // legitimate certificate-phase wait would surface as a terminal
+        // unlock_timeout ownership error.
+        if let Some(cooldown) = read_acme_cooldown(state).await {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            let remaining = cooldown.retry_after_unix.saturating_sub(now_unix);
+            let candidate =
+                Instant::now() + std::time::Duration::from_secs(remaining) + ACME_COOLDOWN_GRACE;
+            let absolute_cap = started + ACME_COOLDOWN_MAX_EXTENSION;
+            if candidate > deadline {
+                deadline = candidate.min(absolute_cap);
             }
         }
 
@@ -5088,6 +5195,188 @@ mod tests {
                 "retry_after": "2020-01-01T00:00:00Z",
             })
         );
+    }
+
+    fn acme_marker_json(retry_after_unix: u64) -> String {
+        format!(
+            "{{\"error\":\"acme_rate_limited\",\"terminal\":false,\
+             \"retry_after\":\"2026-09-16T00:00:00Z\",\
+             \"retry_after_unix\":{retry_after_unix}}}\n"
+        )
+    }
+
+    #[test]
+    fn acme_cooldown_marker_accepts_only_bounded_live_contract() {
+        let now = 1_789_000_000u64;
+        let horizon = now + ACME_COOLDOWN_MAX_EXTENSION.as_secs();
+        let valid = acme_marker_json(now + 1800);
+        let parsed = parse_acme_cooldown_marker(valid.as_bytes(), now, horizon)
+            .expect("valid live marker parses");
+        assert_eq!(parsed.retry_after_unix, now + 1800);
+        assert_eq!(parsed.retry_after, "2026-09-16T00:00:00Z");
+
+        for (label, body) in [
+            ("elapsed deadline", acme_marker_json(now)),
+            ("beyond horizon", acme_marker_json(horizon + 1)),
+            (
+                "wrong code",
+                valid.replace("acme_rate_limited", "acme_certificate_issuance_failed"),
+            ),
+            (
+                "terminal marker",
+                valid.replace("\"terminal\":false", "\"terminal\":true"),
+            ),
+            (
+                "missing unix",
+                valid.replace(",\"retry_after_unix\":1789001800", ""),
+            ),
+            (
+                "fractional unix",
+                valid.replace("1789001800", "1789001800.5"),
+            ),
+            ("not json", "garbage".to_string()),
+            ("empty", String::new()),
+        ] {
+            assert!(
+                parse_acme_cooldown_marker(body.as_bytes(), now, horizon).is_none(),
+                "must not extend on: {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acme_cooldown_extends_init_ready_watch_past_original_timeout() {
+        let signal_dir = test_signal_dir("init-ready-acme-cooldown");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let cooldown_path = signal_dir.path.join("init-acme-cooldown");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+            config.enclava_init_acme_cooldown_file = cooldown_path.display().to_string();
+        }
+        tokio::fs::write(&ready_path, b"not-ready\n")
+            .await
+            .expect("write not-ready sentinel");
+        let deadline_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2;
+        tokio::fs::write(&cooldown_path, acme_marker_json(deadline_unix))
+            .await
+            .expect("write cooldown marker");
+
+        // The init side flips ready at ~400ms — past the 100ms watch
+        // timeout that would fire without the cooldown extension.
+        let ready_writer = ready_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::fs::write(&ready_writer, b"ready\n")
+                .await
+                .expect("write ready sentinel");
+        });
+
+        wait_for_enclava_init_ready(&state, Duration::from_millis(100))
+            .await
+            .expect("cooldown marker must extend the watch until ready");
+    }
+
+    #[tokio::test]
+    async fn terminal_error_file_still_wins_over_live_cooldown_marker() {
+        let signal_dir = test_signal_dir("init-ready-acme-error-wins");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let cooldown_path = signal_dir.path.join("init-acme-cooldown");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+            config.enclava_init_acme_cooldown_file = cooldown_path.display().to_string();
+        }
+        let deadline_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        tokio::fs::write(&cooldown_path, acme_marker_json(deadline_unix))
+            .await
+            .expect("write cooldown marker");
+        tokio::fs::write(&error_path, b"{\"error\":\"enclava_init_failed\"}\n")
+            .await
+            .expect("write init error");
+
+        let err = wait_for_enclava_init_ready(&state, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("enclava_init_failed"));
+    }
+
+    #[tokio::test]
+    async fn read_acme_cooldown_ignores_unusable_marker_files() {
+        let signal_dir = test_signal_dir("acme-cooldown-read");
+        let cooldown_path = signal_dir.path.join("init-acme-cooldown");
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:1".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_acme_cooldown_file = cooldown_path.display().to_string();
+        }
+
+        // Absent → None.
+        assert!(read_acme_cooldown(&state).await.is_none());
+
+        // Valid future marker → Some with the surfaced timestamp.
+        let deadline_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        tokio::fs::write(&cooldown_path, acme_marker_json(deadline_unix))
+            .await
+            .unwrap();
+        let cooldown = read_acme_cooldown(&state)
+            .await
+            .expect("live marker must be read");
+        assert_eq!(cooldown.retry_after, "2026-09-16T00:00:00Z");
+
+        // Elapsed marker → None.
+        let past = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        tokio::fs::write(&cooldown_path, acme_marker_json(past))
+            .await
+            .unwrap();
+        assert!(read_acme_cooldown(&state).await.is_none());
+
+        // Terminal marker → None.
+        tokio::fs::write(
+            &cooldown_path,
+            acme_marker_json(deadline_unix).replace("\"terminal\":false", "\"terminal\":true"),
+        )
+        .await
+        .unwrap();
+        assert!(read_acme_cooldown(&state).await.is_none());
     }
 
     #[tokio::test]
