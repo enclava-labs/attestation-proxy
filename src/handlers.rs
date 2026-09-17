@@ -1830,13 +1830,35 @@ pub async fn initialize_ownership_state(state: &AppState) {
 
     let mut unclaimed_polls: usize = 0;
     let mut error_attempts: usize = 0;
-    let error_deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS);
+    // Wall-clock bound on the error-retry span. Initialized on the FIRST
+    // error, not at loop entry: time spent in (even slow) successful
+    // unclaimed polls must not shorten the error-retry window. Until the
+    // first error the refresh runs under a far-future cap so the timeout
+    // wrapper stays inert for the unclaimed path.
+    let mut error_deadline: Option<tokio::time::Instant> = None;
     loop {
         // Independent budgets: unclaimed polls and error retries count
         // separately, so neither ordering of results shortens the other's
-        // budget.
-        match refresh_ownership_state(state, unclaimed_polls + error_attempts > 0).await {
+        // budget. The refresh itself is bounded by the wall-clock deadline:
+        // a stalling upstream (connections accepted, requests never
+        // answered) cannot stretch startup past the bound by holding an
+        // in-flight attempt open.
+        let force_refresh = unclaimed_polls + error_attempts > 0;
+        let refresh_deadline = error_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(24 * 3600)
+        });
+        let refreshed = match tokio::time::timeout_at(
+            refresh_deadline,
+            refresh_ownership_state(state, force_refresh),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_deadline_exceeded) => Err(OwnershipError::OwnerSeedUnavailable(
+                "startup_deadline_exceeded".to_string(),
+            )),
+        };
+        match refreshed {
             Ok(()) => {
                 if !state.ownership.is_unclaimed() {
                     return;
@@ -1854,13 +1876,16 @@ pub async fn initialize_ownership_state(state: &AppState) {
             }
             Err(err) => {
                 let now = tokio::time::Instant::now();
+                let deadline = *error_deadline.get_or_insert(
+                    now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS),
+                );
                 if state.config.owner_ciphertext_backend == "kbs-resource"
                     && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
-                    && now < error_deadline
+                    && now < deadline
                 {
                     let next_retry =
                         now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DELAY_MS);
-                    tokio::time::sleep_until(next_retry.min(error_deadline)).await;
+                    tokio::time::sleep_until(next_retry.min(deadline)).await;
                     error_attempts += 1;
                     continue;
                 }
@@ -1994,13 +2019,17 @@ pub async fn unlock(
                     Ok(()) if state.ownership.is_locked() => {}
                     Ok(())
                         if state.ownership.is_unlocking()
+                            && state.ownership.is_auto_unlock_mode()
                             && state.ownership.auto_unlock_enabled() =>
                     {
                         // Auto-unlock material became visible: resume the
                         // startup auto-unlock path so the 202 means work is
-                        // in flight. The `auto_unlock_enabled` guard
-                        // distinguishes real material from the bare recovery
-                        // reservation preserved by refresh_ownership_state.
+                        // in flight. The mode+material guards distinguish
+                        // real resumable state from a bare recovery
+                        // reservation (and from password-mode instances with
+                        // a leftover sealed resource, which cannot resume —
+                        // those fall through to the claimable unclaimed
+                        // transition below).
                         spawn_auto_unlock_if_needed(state.clone());
                         return json_response(202, &json!({"state": "unlocking"}));
                     }

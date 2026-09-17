@@ -278,17 +278,24 @@ pub async fn probe_direct_kbs_resource_status(
     Ok(response.status().as_u16())
 }
 
-/// Probe with one session-refresh retry. A 401/400 from the KBS usually
-/// means the cached AA token was minted against a KBS instance that no
-/// longer exists (trustee rolls restart the KBS and its in-memory sessions).
-/// Invalidate the token cache, re-attest, and probe once more before the
+/// Probe with one session-refresh retry. A 401 from the KBS means the
+/// cached AA token was minted against a KBS instance that no longer
+/// exists (trustee rolls restart the KBS and its in-memory sessions):
+/// invalidate the token cache, re-attest, and probe once more before the
 /// caller maps the status to a terminal ownership error.
+///
+/// Only 401 triggers the refresh. In the KBS error mapping
+/// (kbs/src/error.rs) the ONLY 400 is `ParsePolicyError` — a policy
+/// publication/parse failure, where re-attesting cannot help; that case
+/// stays a plain status for the caller to latch as a re-probeable
+/// environmental error (retrying later is the correct recovery, since
+/// publication settles after a roll).
 pub async fn probe_direct_kbs_resource_status_with_session_refresh(
     state: &crate::AppState,
     resource_path: &str,
 ) -> Result<u16, OwnershipError> {
     let status = probe_direct_kbs_resource_status(state, resource_path).await?;
-    if status != 401 && status != 400 {
+    if status != 401 {
         return Ok(status);
     }
     state.aa_token_cache.write().await.invalidate();
@@ -781,7 +788,10 @@ mod tests {
                     if auth == format!("Bearer {accepted}") {
                         axum::http::StatusCode::OK
                     } else {
-                        axum::http::StatusCode::BAD_REQUEST
+                        // Real KBS answers an unknown/stale bearer with 401
+                        // (kbs/src/error.rs maps everything session/token to
+                        // Unauthorized); the only 400 is ParsePolicyError.
+                        axum::http::StatusCode::UNAUTHORIZED
                     }
                 }),
             );
@@ -820,7 +830,7 @@ mod tests {
         let status = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
             .await
             .expect("plain probe");
-        assert_eq!(status, 400);
+        assert_eq!(status, 401);
 
         // The AA re-mints what the new KBS accepts; only the wrapper's cache
         // invalidation can pick the new token up.
@@ -840,7 +850,79 @@ mod tests {
         let stale = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
             .await
             .expect("plain probe again");
-        assert_eq!(stale, 400);
+        assert_eq!(stale, 401);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_with_session_refresh_ignores_400_policy_errors() {
+        use std::sync::Arc;
+
+        // A 400 from the KBS is ParsePolicyError (the only 400 in the KBS
+        // error mapping), not a stale session: it must not trigger the
+        // re-attest cycle. The AA hit counter proves the cache is left
+        // untouched.
+        let aa_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let aa_token = aa_hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(move || {
+                    let hits = aa_token.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!({ "token": "some-token" }))
+                    }
+                }),
+            )
+            .route(
+                "/kbs/v0/resource/{*path}",
+                axum::routing::get(|| async { axum::http::StatusCode::BAD_REQUEST }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        let status = probe_direct_kbs_resource_status_with_session_refresh(
+            &state,
+            "default/o/seed-encrypted",
+        )
+        .await
+        .expect("wrapped probe");
+        assert_eq!(status, 400);
+        assert_eq!(
+            aa_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 400 must not trigger a re-attest cycle"
+        );
 
         server.abort();
     }
