@@ -1868,6 +1868,11 @@ pub async fn initialize_ownership_state(state: &AppState) {
         };
         match refreshed {
             Ok(_) => {
+                // A successful refresh ends the current error episode:
+                // drop the error deadline so later unclaimed polls cannot
+                // be failed by a stale timeout (the next error starts a
+                // fresh window; the attempt counters still bound totals).
+                error_deadline = None;
                 if !state.ownership.is_unclaimed() {
                     return;
                 }
@@ -1904,9 +1909,14 @@ pub async fn initialize_ownership_state(state: &AppState) {
     }
 }
 
-pub fn spawn_auto_unlock_if_needed(state: AppState) {
+/// Spawn the startup auto-unlock task if auto-unlock material is enabled.
+/// Returns whether a task was actually spawned: callers that promise work
+/// in flight (the 202 resume arm) must handle a `false` (e.g. a concurrent
+/// /disable-auto-unlock cleared the flag between their check and this
+/// call) by falling back instead of stranding the `Unlocking` state.
+pub fn spawn_auto_unlock_if_needed(state: AppState) -> bool {
     if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
-        return;
+        return false;
     }
 
     tokio::spawn(async move {
@@ -1958,6 +1968,7 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
             Err(err) => state.ownership.set_ownership_error(&err),
         }
     });
+    true
 }
 
 async fn unlock_startup_auto_unlock_material(
@@ -2069,9 +2080,14 @@ pub async fn unlock(
                             // Auto-unlock material became visible on our
                             // preserved reservation: resume the startup
                             // auto-unlock path so the 202 means work is in
-                            // flight.
-                            spawn_auto_unlock_if_needed(state.clone());
-                            return json_response(202, &json!({"state": "unlocking"}));
+                            // flight. If a concurrent /disable-auto-unlock
+                            // cleared the flag between the claim and the
+                            // spawn, no task engages — fall through to the
+                            // normal unlock path instead of stranding the
+                            // Unlocking state behind a 202.
+                            if spawn_auto_unlock_if_needed(state.clone()) {
+                                return json_response(202, &json!({"state": "unlocking"}));
+                            }
                         }
                         RecoveryClaim::Unclaimed => {
                             // The seed is gone (e.g. torn down while the
@@ -8933,6 +8949,28 @@ mod tests {
             state.ownership.error_is_reprobeable(),
             "an outage during a normal unlock must stay re-probeable"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_unlock_resume_reports_unspawned_after_concurrent_disable() {
+        // A /disable-auto-unlock that lands between the recovery claim and
+        // the spawn handoff must not strand the Unlocking state behind a
+        // 202: the helper reports that no task engaged so the caller can
+        // fall back to the normal unlock path.
+        let signal_dir = test_signal_dir("resume-disable-race");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        // The resume precondition: material enabled.
+        state.ownership.set_auto_unlock_enabled(true);
+        assert!(spawn_auto_unlock_if_needed(state.clone()));
+        // The disable interleave clears the flag; the next handoff attempt
+        // reports no-spawn instead of silently doing nothing.
+        state.ownership.set_auto_unlock_enabled(false);
+        assert!(!spawn_auto_unlock_if_needed(state.clone()));
     }
 
     #[tokio::test]
