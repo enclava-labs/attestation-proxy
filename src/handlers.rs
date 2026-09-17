@@ -2039,8 +2039,9 @@ pub async fn unlock(
                 recovery_owned = true;
                 // If this request is cancelled (client disconnect) while a
                 // refresh is in flight, restore the re-probeable latch
-                // instead of stranding the reservation. Disarmed before the
-                // one arm that hands `Unlocking` to a spawned task.
+                // instead of stranding the reservation. The generation
+                // check makes it a no-op against any other owner of an
+                // `Unlocking` state (see the guard's docs).
                 let _recovery_guard = RecoveryCancelGuard {
                     ownership: state.ownership.clone(),
                     generation,
@@ -8935,6 +8936,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_claim_resumes_auto_mode_with_sealed_seed_only() {
+        // Torn state: the encrypted envelope is gone but the sealed seed
+        // remains. In auto-unlock mode the existing ownership must RESUME
+        // from the seal — falling to the claimable Unclaimed transition
+        // here would let a different owner take over the instance.
+        let signal_dir = test_signal_dir("claim-sealed-only");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // Mirror refresh's write: observing a sealed seed enables the
+        // auto-unlock material flag before the claim runs.
+        state.ownership.set_auto_unlock_enabled(true);
+        // refresh observed: encrypted absent, sealed present; the machine
+        // still holds our bare reservation (refresh preserves it).
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: false,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::AutoUnlockResume
+        );
+
+        // Password mode with the same torn material cannot resume: it must
+        // fall through to the claimable transition instead.
+        let password_state = build_state_with_mode(
+            &test_signal_dir("claim-sealed-only-pw").path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        password_state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+        let generation = password_state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve password recovery");
+        password_state.ownership.set_auto_unlock_enabled(true);
+        assert_eq!(
+            password_state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: false,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::Unclaimed
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_claim_does_not_clobber_a_concurrent_unlock_reservation() {
         let signal_dir = test_signal_dir("recovery-claim-race");
         let state = build_state_with_mode(
@@ -8981,8 +9051,8 @@ mod tests {
         assert!(state.ownership.is_unlocking());
         assert!(!state.ownership.is_unclaimed());
 
-        // The still-armed cancellation guard dropping after the Conflict
-        // (the request returns) must not clobber the concurrent request's
+        // The recovering request's guard dropping after the Conflict (the
+        // request returns) must not clobber the concurrent request's
         // reservation: the generation check keeps the restore inert.
         drop(RecoveryCancelGuard {
             ownership: state.ownership.clone(),

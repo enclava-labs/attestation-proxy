@@ -190,7 +190,8 @@ pub struct OwnershipObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryClaim {
     /// Our refresh recovered to `Locked`: the state is now THIS request's
-    /// unlock reservation (the spawn section follows directly).
+    /// unlock reservation without a second budget charge (the recovery
+    /// probe already recorded the attempt; the spawn section follows).
     UnlockReservation,
     /// Our preserved reservation with auto-unlock material visible.
     AutoUnlockResume,
@@ -359,7 +360,13 @@ impl OwnershipGuard {
         observation: OwnershipObservation,
     ) -> RecoveryClaim {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
-        if observation.encrypted_present {
+        // Resumable material: the encrypted seed, or (auto-unlock mode)
+        // a sealed seed alone — a torn state where the encrypted envelope
+        // was deleted but the seal remains must resume the existing
+        // ownership, not become claimable by a different owner.
+        let material_present = observation.encrypted_present
+            || (observation.sealed_present && self.is_auto_unlock_mode());
+        if material_present {
             match machine.state {
                 OwnershipState::Locked => {
                     machine.unlock_generation += 1;
@@ -386,6 +393,7 @@ impl OwnershipGuard {
             RecoveryClaim::Conflict
         }
     }
+
     /// Record an attempt for a recovery probe of a latched environmental
     /// error (see `error_is_reprobeable`), applying the same rate limit and
     /// attempt window as unlock attempts, and atomically reserve the
