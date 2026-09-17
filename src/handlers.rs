@@ -1973,6 +1973,31 @@ async fn unlock_startup_auto_unlock_material(
     unlock_owner_seed_material(state, owner_seed).await
 }
 
+/// Restores the re-probeable error latch if the recovery section of
+/// `unlock` is cancelled (client disconnect / handler future dropped)
+/// while the ownership machine still holds the bare `Unlocking`
+/// reservation — without it, a cancelled request would strand the
+/// instance in `Unlocking` with nothing in flight (recovery cannot
+/// re-enter, unlock rejects `not_locked`, claim is blocked).
+struct RecoveryCancelGuard {
+    ownership: std::sync::Arc<crate::ownership::OwnershipGuard>,
+    armed: std::cell::Cell<bool>,
+}
+
+impl RecoveryCancelGuard {
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+impl Drop for RecoveryCancelGuard {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            self.ownership.restore_reprobeable_error_if_unlocking();
+        }
+    }
+}
+
 /// POST /unlock, POST /.well-known/confidential/unlock.
 pub async fn unlock(
     State(state): State<AppState>,
@@ -2010,6 +2035,14 @@ pub async fn unlock(
             }
             Ok(()) => {
                 recovery_owned = true;
+                // If this request is cancelled (client disconnect) while a
+                // refresh is in flight, restore the re-probeable latch
+                // instead of stranding the reservation. Disarmed before the
+                // one arm that hands `Unlocking` to a spawned task.
+                let recovery_guard = RecoveryCancelGuard {
+                    ownership: state.ownership.clone(),
+                    armed: std::cell::Cell::new(true),
+                };
                 // One retry after a session-flavored failure: the first
                 // refresh can repair the KBS session mid-flight (the probe
                 // re-attests) and only the second read succeeds.
@@ -2033,6 +2066,7 @@ pub async fn unlock(
                         // those fall through to the claimable unclaimed
                         // transition below).
                         spawn_auto_unlock_if_needed(state.clone());
+                        recovery_guard.disarm();
                         return json_response(202, &json!({"state": "unlocking"}));
                     }
                     Ok(_) => {
@@ -2055,6 +2089,9 @@ pub async fn unlock(
                         );
                     }
                 }
+                // Fall-through (recovered to Locked): the guard drops here
+                // with the state already moved off the reservation.
+                drop(recovery_guard);
             }
         }
     }
@@ -8797,5 +8834,48 @@ mod tests {
         assert_eq!(state.ownership.state_json()["state"], "unclaimed");
         assert!(!state.ownership.error_is_reprobeable());
         kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_cancelled_mid_refresh_restores_reprobeable_latch() {
+        let signal_dir = test_signal_dir("unlock-reprobe-cancelled");
+        // A TCP listener that accepts connections (kernel backlog) but
+        // never answers: every KBS/CDH read in the recovery refresh hangs,
+        // so the only way the handler future finishes is cancellation.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead kbs mock");
+        let dead_addr = dead_listener.local_addr().expect("dead kbs mock addr");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            format!("http://{dead_addr}"),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // Cancel the request while the first refresh is hung. Without the
+        // cancellation guard this strands the Unlocking reservation.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            unlock(
+                State(state.clone()),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("whatever".to_string()),
+                }),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "handler should still be awaiting KBS");
+
+        // The latch is restored and still re-probeable: a later unlock can
+        // re-enter recovery instead of wedging on a bare Unlocking state.
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert!(state.ownership.error_is_reprobeable());
+        assert!(state.ownership.begin_recovery_from_error().is_ok());
     }
 }

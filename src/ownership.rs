@@ -425,6 +425,26 @@ impl OwnershipGuard {
         }
     }
 
+    /// Restore a re-probeable error latch IF the machine still holds the
+    /// bare `Unlocking` recovery reservation. No-op once the state moved
+    /// on (locked / unlocked / unclaimed / a real error): used by the
+    /// recovery cancellation guard so a dropped request cannot strand the
+    /// instance in `Unlocking` with nothing in flight. Does NOT clobber the
+    /// `Unlocking` state owned by a spawned unlock task — callers disarm
+    /// their guard before handing the reservation to a background task.
+    pub fn restore_reprobeable_error_if_unlocking(&self) {
+        if let Ok(mut machine) = self.machine.lock() {
+            if !matches!(machine.state, OwnershipState::Unlocking) {
+                return;
+            }
+            machine.state = OwnershipState::Error;
+            machine.error = Some(
+                OwnershipError::OwnerSeedUnavailable("recovery_cancelled".to_string()).to_string(),
+            );
+            machine.error_reprobeable = true;
+        }
+    }
+
     /// Whether the latched error is an environmental ownership-probe failure
     /// (KBS session or reachability, e.g. after a trustee roll) rather than
     /// an ownership fact. These states may be re-probed (e.g. at unlock)
