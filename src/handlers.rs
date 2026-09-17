@@ -1955,7 +1955,7 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
                     "warning": warning,
                 }),
             ),
-            Err(err) => state.ownership.set_error(err.to_string()),
+            Err(err) => state.ownership.set_ownership_error(&err),
         }
     });
 }
@@ -2168,7 +2168,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     {
         Ok(key) => key,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2177,7 +2177,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     };
 
     if let Err(err) = state.ownership.write_handoff_key(&key) {
-        state.ownership.set_error(err.to_string());
+        state.ownership.set_ownership_error(&err);
         return json_response(
             500,
             &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2190,7 +2190,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2208,7 +2208,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
     {
         Ok(key) => key,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2225,7 +2225,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             }
         },
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2243,7 +2243,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             return json_response(200, &json!({"error": "wrong_password", "state": "locked"}));
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2274,7 +2274,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             json_response(200, &json!({"error": "wrong_password", "state": "locked"}))
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             let detail = match &err {
                 OwnershipError::Store(detail) => detail.clone(),
                 _ => err.to_string(),
@@ -2295,7 +2295,7 @@ fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> R
         }
         HandoffOutcome::WrongPassword => {
             if let Err(err) = state.ownership.clear_handoff_retry_files() {
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return json_response(
                     500,
                     &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2948,7 +2948,7 @@ pub async fn bootstrap_claim(
             )
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             json_response(
                 500,
                 &json!({"error": "claim_failed", "detail": err.to_string(), "state": "error"}),
@@ -3207,7 +3207,7 @@ pub async fn recover(
             )
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}),
@@ -8896,6 +8896,42 @@ mod tests {
         assert_eq!(state.ownership.state_json()["state"], "error");
         assert!(state.ownership.error_is_reprobeable());
         assert!(state.ownership.begin_recovery_from_error().is_ok());
+    }
+
+    #[tokio::test]
+    async fn normal_unlock_outage_latches_reprobeable_error() {
+        // A normal (non-recovery) unlock that hits a KBS outage must latch
+        // a re-probeable error, not a terminal one: the spawned task's
+        // material load uses the typed setter.
+        let signal_dir = test_signal_dir("unlock-outage-reprobeable");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_locked();
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("some-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 202);
+        let mut latched = false;
+        for _ in 0..100 {
+            if state.ownership.state_json()["state"] == "error" {
+                latched = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(latched, "unlock task should latch the outage error");
+        assert!(
+            state.ownership.error_is_reprobeable(),
+            "an outage during a normal unlock must stay re-probeable"
+        );
     }
 
     #[tokio::test]
