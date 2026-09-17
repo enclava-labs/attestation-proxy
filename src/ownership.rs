@@ -489,15 +489,17 @@ impl OwnershipGuard {
     }
 
     /// Restore a re-probeable error latch IF the machine still holds the
-    /// bare `Unlocking` recovery reservation. No-op once the state moved
-    /// on (locked / unlocked / unclaimed / a real error): used by the
-    /// recovery cancellation guard so a dropped request cannot strand the
-    /// instance in `Unlocking` with nothing in flight. Does NOT clobber the
-    /// `Unlocking` state owned by a spawned unlock task — callers disarm
-    /// their guard before handing the reservation to a background task.
-    pub fn restore_reprobeable_error_if_unlocking(&self) {
+    /// bare `Unlocking` recovery reservation owned by `generation`. No-op
+    /// once the state moved on or another owner (a concurrent request's
+    /// reservation, a completed transition) holds it: used by the recovery
+    /// cancellation guard so a dropped request cannot strand the instance
+    /// in `Unlocking` with nothing in flight — nor clobber someone else's
+    /// in-flight reservation.
+    pub fn restore_reprobeable_error_if_unlocking(&self, generation: u64) {
         if let Ok(mut machine) = self.machine.lock() {
-            if !matches!(machine.state, OwnershipState::Unlocking) {
+            if !matches!(machine.state, OwnershipState::Unlocking)
+                || machine.unlock_generation != generation
+            {
                 return;
             }
             machine.state = OwnershipState::Error;

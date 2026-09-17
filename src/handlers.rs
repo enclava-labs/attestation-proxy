@@ -1981,26 +1981,22 @@ async fn unlock_startup_auto_unlock_material(
 
 /// Restores the re-probeable error latch if the recovery section of
 /// `unlock` is cancelled (client disconnect / handler future dropped)
-/// while the ownership machine still holds the bare `Unlocking`
-/// reservation — without it, a cancelled request would strand the
-/// instance in `Unlocking` with nothing in flight (recovery cannot
-/// re-enter, unlock rejects `not_locked`, claim is blocked).
+/// while the ownership machine still holds THIS recovery's bare
+/// `Unlocking` reservation — without it, a cancelled request would strand
+/// the instance in `Unlocking` with nothing in flight (recovery cannot
+/// re-enter, unlock rejects `not_locked`, claim is blocked). The
+/// generation check keeps it a no-op against any other owner of an
+/// `Unlocking` state (a concurrent request's reservation, our own claim,
+/// or a resumed auto-unlock), so no explicit disarm is needed.
 struct RecoveryCancelGuard {
     ownership: std::sync::Arc<crate::ownership::OwnershipGuard>,
-    armed: std::cell::Cell<bool>,
-}
-
-impl RecoveryCancelGuard {
-    fn disarm(&self) {
-        self.armed.set(false);
-    }
+    generation: u64,
 }
 
 impl Drop for RecoveryCancelGuard {
     fn drop(&mut self) {
-        if self.armed.get() {
-            self.ownership.restore_reprobeable_error_if_unlocking();
-        }
+        self.ownership
+            .restore_reprobeable_error_if_unlocking(self.generation);
     }
 }
 
@@ -2045,9 +2041,9 @@ pub async fn unlock(
                 // refresh is in flight, restore the re-probeable latch
                 // instead of stranding the reservation. Disarmed before the
                 // one arm that hands `Unlocking` to a spawned task.
-                let recovery_guard = RecoveryCancelGuard {
+                let _recovery_guard = RecoveryCancelGuard {
                     ownership: state.ownership.clone(),
-                    armed: std::cell::Cell::new(true),
+                    generation,
                 };
                 // One retry after a session-flavored failure: the first
                 // refresh can repair the KBS session mid-flight (the probe
@@ -2074,7 +2070,6 @@ pub async fn unlock(
                             // auto-unlock path so the 202 means work is in
                             // flight.
                             spawn_auto_unlock_if_needed(state.clone());
-                            recovery_guard.disarm();
                             return json_response(202, &json!({"state": "unlocking"}));
                         }
                         RecoveryClaim::Unclaimed => {
@@ -2112,10 +2107,10 @@ pub async fn unlock(
                         );
                     }
                 }
-                // Fall-through (reservation claimed): the guard's job is
-                // done - the reservation now belongs to this request and
-                // the spawn section below owns its lifetime.
-                recovery_guard.disarm();
+                // Fall-through (reservation claimed): the generation
+                // mismatch makes the guard a no-op from here on — the
+                // reservation now belongs to this request and the spawn
+                // section below owns its lifetime.
             }
         }
     }
@@ -8949,6 +8944,18 @@ mod tests {
         );
         assert!(state.ownership.is_unlocking());
         assert!(!state.ownership.is_unclaimed());
+
+        // The still-armed cancellation guard dropping after the Conflict
+        // (the request returns) must not clobber the concurrent request's
+        // reservation: the generation check keeps the restore inert.
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(
+            state.ownership.is_unlocking(),
+            "a foreign reservation must survive the recovering request's guard drop"
+        );
 
         // Sanity: without the interleaving, the same sequence claims the
         // reservation atomically.
