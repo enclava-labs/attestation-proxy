@@ -1832,21 +1832,23 @@ pub async fn initialize_ownership_state(state: &AppState) {
     let mut error_attempts: usize = 0;
     // Wall-clock bound on the error-retry span. Initialized on the FIRST
     // error, not at loop entry: time spent in (even slow) successful
-    // unclaimed polls must not shorten the error-retry window. Until the
-    // first error the refresh runs under a far-future cap so the timeout
-    // wrapper stays inert for the unclaimed path.
+    // unclaimed polls must not shorten the error-retry window.
     let mut error_deadline: Option<tokio::time::Instant> = None;
     loop {
         // Independent budgets: unclaimed polls and error retries count
         // separately, so neither ordering of results shortens the other's
-        // budget. The refresh itself is bounded by the wall-clock deadline:
-        // a stalling upstream (connections accepted, requests never
-        // answered) cannot stretch startup past the bound by holding an
-        // in-flight attempt open.
+        // budget. Every in-flight refresh is capped by the same duration —
+        // including the first, pre-error attempt — so a stalling upstream
+        // (connections accepted, requests never answered) cannot stretch
+        // startup past the bound even before any error has been returned;
+        // once the error budget is set it binds tighter via min().
         let force_refresh = unclaimed_polls + error_attempts > 0;
-        let refresh_deadline = error_deadline.unwrap_or_else(|| {
-            tokio::time::Instant::now() + std::time::Duration::from_secs(24 * 3600)
-        });
+        let attempt_cap = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS);
+        let refresh_deadline = match error_deadline {
+            Some(budget) => attempt_cap.min(budget),
+            None => attempt_cap,
+        };
         let refreshed = match tokio::time::timeout_at(
             refresh_deadline,
             refresh_ownership_state(state, force_refresh),
@@ -1855,7 +1857,7 @@ pub async fn initialize_ownership_state(state: &AppState) {
         {
             Ok(result) => result,
             Err(_deadline_exceeded) => Err(OwnershipError::OwnerSeedUnavailable(
-                "startup_deadline_exceeded".to_string(),
+                "startup_refresh_timed_out".to_string(),
             )),
         };
         match refreshed {
