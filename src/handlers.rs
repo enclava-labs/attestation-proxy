@@ -27,8 +27,8 @@ use crate::escrow::{self, EscrowValueUpdate, OwnerSeedMaterial};
 use crate::kbs;
 use crate::ownership::utc_now;
 use crate::ownership::{
-    BootstrapChallenge, HandoffOutcome, OwnershipError, BOOTSTRAP_CHALLENGE_MAX_ACTIVE,
-    SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
+    BootstrapChallenge, HandoffOutcome, OwnershipError, OwnershipObservation, RecoveryClaim,
+    BOOTSTRAP_CHALLENGE_MAX_ACTIVE, SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
 };
 use crate::receipts::SignReceiptRequest;
 use crate::AppState;
@@ -970,9 +970,12 @@ async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial,
 async fn refresh_ownership_state(
     state: &AppState,
     force_refresh: bool,
-) -> Result<(), OwnershipError> {
+) -> Result<OwnershipObservation, OwnershipError> {
     if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
-        return Ok(());
+        return Ok(OwnershipObservation {
+            encrypted_present: false,
+            sealed_present: false,
+        });
     }
 
     if force_refresh && state.config.owner_ciphertext_backend == "kbs-resource" {
@@ -999,7 +1002,10 @@ async fn refresh_ownership_state(
     } else {
         state.ownership.set_unclaimed();
     }
-    Ok(())
+    Ok(OwnershipObservation {
+        encrypted_present: claimed,
+        sealed_present: material.sealed.is_some(),
+    })
 }
 
 async fn maybe_refresh_unclaimed_state(state: &AppState) {
@@ -1861,7 +1867,7 @@ pub async fn initialize_ownership_state(state: &AppState) {
             )),
         };
         match refreshed {
-            Ok(()) => {
+            Ok(_) => {
                 if !state.ownership.is_unclaimed() {
                     return;
                 }
@@ -2033,7 +2039,7 @@ pub async fn unlock(
                 // reserved) or the latch cleared: fall through to the
                 // normal path, which rejects non-Locked states.
             }
-            Ok(()) => {
+            Ok(generation) => {
                 recovery_owned = true;
                 // If this request is cancelled (client disconnect) while a
                 // refresh is in flight, restore the re-probeable latch
@@ -2051,35 +2057,52 @@ pub async fn unlock(
                     refreshed = refresh_ownership_state(&state, true).await;
                 }
                 match refreshed {
-                    Ok(()) if state.ownership.is_locked() => {}
-                    Ok(())
-                        if state.ownership.is_unlocking()
-                            && state.ownership.is_auto_unlock_mode()
-                            && state.ownership.auto_unlock_enabled() =>
+                    Ok(observation) => match state
+                        .ownership
+                        .claim_recovered_state(generation, observation)
                     {
-                        // Auto-unlock material became visible: resume the
-                        // startup auto-unlock path so the 202 means work is
-                        // in flight. The mode+material guards distinguish
-                        // real resumable state from a bare recovery
-                        // reservation (and from password-mode instances with
-                        // a leftover sealed resource, which cannot resume —
-                        // those fall through to the claimable unclaimed
-                        // transition below).
-                        spawn_auto_unlock_if_needed(state.clone());
-                        recovery_guard.disarm();
-                        return json_response(202, &json!({"state": "unlocking"}));
-                    }
-                    Ok(_) => {
-                        // The seed is gone (e.g. torn down while the error was
-                        // latched): the preserved reservation is not
-                        // auto-unlock material. Restore the claimable state
-                        // instead of leaving the instance stuck Unlocking.
-                        state.ownership.set_unclaimed();
-                        return json_response(
-                            409,
-                            &json!({"error": "unclaimed", "state": "unclaimed"}),
-                        );
-                    }
+                        RecoveryClaim::UnlockReservation => {
+                            // Our refresh recovered to Locked and the claim
+                            // already took the unlock reservation for THIS
+                            // request under one lock - a concurrent /unlock
+                            // cannot slip in between and be clobbered. Fall
+                            // through to the spawn section.
+                        }
+                        RecoveryClaim::AutoUnlockResume => {
+                            // Auto-unlock material became visible on our
+                            // preserved reservation: resume the startup
+                            // auto-unlock path so the 202 means work is in
+                            // flight.
+                            spawn_auto_unlock_if_needed(state.clone());
+                            recovery_guard.disarm();
+                            return json_response(202, &json!({"state": "unlocking"}));
+                        }
+                        RecoveryClaim::Unclaimed => {
+                            // The seed is gone (e.g. torn down while the
+                            // error was latched) and the claim applied the
+                            // claimable transition.
+                            return json_response(
+                                409,
+                                &json!({"error": "unclaimed", "state": "unclaimed"}),
+                            );
+                        }
+                        RecoveryClaim::Conflict => {
+                            // The state moved on to another owner (a
+                            // concurrent request's unlock reservation or a
+                            // completed unlock): nothing was changed here.
+                            let current_state = state
+                                .ownership
+                                .state_json()
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string();
+                            return json_response(
+                                409,
+                                &json!({"error": "not_locked", "state": current_state}),
+                            );
+                        }
+                    },
                     Err(err) => {
                         // Restore the latch so later retries can re-probe.
                         state.ownership.set_ownership_error(&err);
@@ -2089,19 +2112,20 @@ pub async fn unlock(
                         );
                     }
                 }
-                // Fall-through (recovered to Locked): the guard drops here
-                // with the state already moved off the reservation.
-                drop(recovery_guard);
+                // Fall-through (reservation claimed): the guard's job is
+                // done - the reservation now belongs to this request and
+                // the spawn section below owns its lifetime.
+                recovery_guard.disarm();
             }
         }
     }
 
-    // A successful recovery already recorded its attempt: take the unlock
-    // reservation without charging the budget a second time.
-    let begin_result = if recovery_owned {
-        state.ownership.begin_unlock_attempt_prearmed()
-    } else {
+    // The recovery path already took its unlock reservation atomically in
+    // `claim_recovered_state`; a normal request charges the budget here.
+    let begin_result = if !recovery_owned {
         state.ownership.begin_unlock_attempt()
+    } else {
+        Ok(())
     };
     if let Err(err) = begin_result {
         return match err {
@@ -8877,5 +8901,77 @@ mod tests {
         assert_eq!(state.ownership.state_json()["state"], "error");
         assert!(state.ownership.error_is_reprobeable());
         assert!(state.ownership.begin_recovery_from_error().is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_does_not_clobber_a_concurrent_unlock_reservation() {
+        let signal_dir = test_signal_dir("recovery-claim-race");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // Deterministic interleaving of the race: our recovery holds its
+        // reservation (generation G) across the refresh awaits; meanwhile a
+        // concurrent /unlock sees the recovered Locked state, reserves it
+        // (generation G+1) and spawns its unlock task.
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // ... refresh completes: material present -> Locked.
+        state.ownership.set_locked();
+        // ... the concurrent request wins the lock.
+        state
+            .ownership
+            .begin_unlock_attempt()
+            .expect("concurrent unlock reservation");
+
+        // The claim must report the conflict without touching the state
+        // (the old catch-all here clobbered the running unlock to
+        // Unclaimed).
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: false,
+                }
+            ),
+            RecoveryClaim::Conflict
+        );
+        assert!(state.ownership.is_unlocking());
+        assert!(!state.ownership.is_unclaimed());
+
+        // Sanity: without the interleaving, the same sequence claims the
+        // reservation atomically.
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "recovery_cancelled".to_string(),
+            ));
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery again");
+        state.ownership.set_locked();
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: false,
+                }
+            ),
+            RecoveryClaim::UnlockReservation
+        );
+        assert!(state.ownership.is_unlocking());
     }
 }

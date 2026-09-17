@@ -177,6 +177,31 @@ impl OwnershipError {
     }
 }
 
+/// What a `refresh_ownership_state` run observed in KBS, independent of
+/// the machine-state writes it performed. Recovery flows decide on THIS
+/// (their own observation) rather than re-reading the machine state, which
+/// a concurrent request may have moved on in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnershipObservation {
+    pub encrypted_present: bool,
+    pub sealed_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryClaim {
+    /// Our refresh recovered to `Locked`: the state is now THIS request's
+    /// unlock reservation (the spawn section follows directly).
+    UnlockReservation,
+    /// Our preserved reservation with auto-unlock material visible.
+    AutoUnlockResume,
+    /// Our bare reservation with no seed: the claimable `Unclaimed`
+    /// transition was applied.
+    Unclaimed,
+    /// The state is owned by someone else (concurrent unlock reservation or
+    /// a completed unlock): nothing was changed.
+    Conflict,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoffOutcome {
     Unlocked,
@@ -229,6 +254,11 @@ struct OwnershipMachine {
     error_reprobeable: bool,
     attempts: VecDeque<Instant>,
     auto_unlock_enabled: bool,
+    /// Bumped on every transition into `Unlocking`. Identifies WHICH
+    /// reservation currently owns the state, so a recovery flow can tell
+    /// its own (possibly preserved) reservation from a concurrent
+    /// request's unlock reservation.
+    unlock_generation: u64,
 }
 
 pub struct OwnershipGuard {
@@ -287,6 +317,7 @@ impl OwnershipGuard {
                 error_reprobeable: false,
                 attempts: VecDeque::new(),
                 auto_unlock_enabled: false,
+                unlock_generation: 0,
             }),
         }
     }
@@ -308,11 +339,53 @@ impl OwnershipGuard {
         }
 
         machine.attempts.push_back(now);
+        machine.unlock_generation += 1;
         machine.state = OwnershipState::Unlocking;
         machine.error = None;
         Ok(())
     }
 
+    /// Atomically claim the post-refresh state for a recovery flow that
+    /// owns `generation`. Under one lock: a `Locked` result of our refresh
+    /// becomes THIS request's unlock reservation (prearmed semantics — the
+    /// recovery probe already charged the budget); our own preserved bare
+    /// `Unlocking` reservation resolves to an auto-unlock resume or, when
+    /// the seed is gone, the claimable `Unclaimed` transition; a state now
+    /// owned by someone else (a concurrent request's unlock reservation or
+    /// a completed unlock) is reported as `Conflict` and never clobbered.
+    pub fn claim_recovered_state(
+        &self,
+        generation: u64,
+        observation: OwnershipObservation,
+    ) -> RecoveryClaim {
+        let mut machine = self.machine.lock().expect("ownership lock poisoned");
+        if observation.encrypted_present {
+            match machine.state {
+                OwnershipState::Locked => {
+                    machine.unlock_generation += 1;
+                    machine.state = OwnershipState::Unlocking;
+                    machine.error = None;
+                    RecoveryClaim::UnlockReservation
+                }
+                OwnershipState::Unlocking
+                    if self.is_auto_unlock_mode() && machine.auto_unlock_enabled =>
+                {
+                    RecoveryClaim::AutoUnlockResume
+                }
+                _ => RecoveryClaim::Conflict,
+            }
+        } else if matches!(machine.state, OwnershipState::Unlocking)
+            && machine.unlock_generation == generation
+        {
+            machine.state = OwnershipState::Unclaimed;
+            machine.error = None;
+            machine.attempts.clear();
+            machine.auto_unlock_enabled = false;
+            RecoveryClaim::Unclaimed
+        } else {
+            RecoveryClaim::Conflict
+        }
+    }
     /// Record an attempt for a recovery probe of a latched environmental
     /// error (see `error_is_reprobeable`), applying the same rate limit and
     /// attempt window as unlock attempts, and atomically reserve the
@@ -321,7 +394,7 @@ impl OwnershipGuard {
     /// owns the recovery and the refreshes that follow cannot clobber each
     /// other's reservations. The latched error string is kept until the
     /// recovery resolves (restored on failure by the caller).
-    pub fn begin_recovery_from_error(&self) -> Result<(), OwnershipError> {
+    pub fn begin_recovery_from_error(&self) -> Result<u64, OwnershipError> {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
         let now = Self::now();
         Self::prune_expired_attempts(&mut machine, now);
@@ -332,21 +405,9 @@ impl OwnershipGuard {
             return Err(OwnershipError::NotLocked);
         }
         machine.attempts.push_back(now);
+        machine.unlock_generation += 1;
         machine.state = OwnershipState::Unlocking;
-        Ok(())
-    }
-
-    /// Take the unlock reservation for a request that already recorded an
-    /// attempt (the recovery probe): transitions Locked to Unlocking without
-    /// charging the rate-limit budget a second time.
-    pub fn begin_unlock_attempt_prearmed(&self) -> Result<(), OwnershipError> {
-        let mut machine = self.machine.lock().expect("ownership lock poisoned");
-        if !matches!(machine.state, OwnershipState::Locked) {
-            return Err(OwnershipError::NotLocked);
-        }
-        machine.state = OwnershipState::Unlocking;
-        machine.error = None;
-        Ok(())
+        Ok(machine.unlock_generation)
     }
 
     pub fn begin_recovery_verification(&self) -> Result<(), OwnershipError> {
@@ -357,6 +418,7 @@ impl OwnershipGuard {
         ) {
             return Err(OwnershipError::NotLocked);
         }
+        machine.unlock_generation += 1;
         machine.state = OwnershipState::Unlocking;
         machine.error = None;
         Ok(())
@@ -395,6 +457,7 @@ impl OwnershipGuard {
 
     pub fn set_unlocking(&self) {
         if let Ok(mut machine) = self.machine.lock() {
+            machine.unlock_generation += 1;
             machine.state = OwnershipState::Unlocking;
             machine.error = None;
         }
