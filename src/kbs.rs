@@ -458,12 +458,18 @@ async fn send_workload_resource_request(
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    for attempt in 1..=MAX_ATTEMPTS {
+    // Independent retry budgets: availability-class retries (503 while the
+    // KBS restarts) share MAX_ATTEMPTS, while the session-refresh retry
+    // (a stale bearer after the roll) has its own single allowance — a
+    // roll that answers 503s while starting and then a session-flavored
+    // 401 once ready must not exhaust the session budget first.
+    let mut availability_retries = 0;
+    let mut session_refreshed = false;
+    loop {
         // Fetch (or reuse the cached) bearer per attempt: a session-flavored
         // 401 invalidates the cache and the next attempt re-attests against
-        // the current KBS (trustee rolls restart the KBS and its sessions —
-        // a stale cached bearer otherwise keeps failing writes until the
-        // TTL). Authorization denials and unrecognized 401s stay terminal.
+        // the current KBS. Authorization denials and unrecognized 401s stay
+        // terminal.
         let token = fetch_kbs_bearer_token(state)
             .await
             .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
@@ -476,7 +482,8 @@ async fn send_workload_resource_request(
             return Ok(());
         }
         if status.as_u16() == 401 {
-            if attempt < MAX_ATTEMPTS && stale_session_401(response).await {
+            if !session_refreshed && stale_session_401(response).await {
+                session_refreshed = true;
                 state.aa_token_cache.write().await.invalidate();
                 continue;
             }
@@ -484,16 +491,15 @@ async fn send_workload_resource_request(
                 "kbs_workload_{operation}_non_200:401:"
             )));
         }
-        if status.as_u16() != 503 || attempt == MAX_ATTEMPTS {
+        if status.as_u16() != 503 || availability_retries + 1 >= MAX_ATTEMPTS {
             return Err(OwnershipError::Store(format!(
                 "kbs_workload_{operation}_non_200:{}:",
                 status.as_u16()
             )));
         }
+        availability_retries += 1;
         tokio::time::sleep(RETRY_DELAY).await;
     }
-
-    unreachable!("workload resource attempts are nonzero")
 }
 
 /// Whether a workload-resource 401 is a stale-session signal (the KBS
@@ -984,6 +990,95 @@ mod tests {
         )
         .await
         .expect("put recovers after 401");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workload_resource_session_retry_survives_preceding_503s() {
+        use std::sync::Arc;
+
+        // The roll window: the KBS answers 503 twice while starting, then a
+        // session-flavored 401 once ready. The session-refresh retry must
+        // have its own budget - not be exhausted by the availability
+        // retries - so the fourth request (re-attested) succeeds.
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "token": "some-token" }))
+                }),
+            )
+            .route(
+                "/aa/evidence",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                axum::routing::put(move || {
+                    let counter = counter.clone();
+                    async move {
+                        match counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 | 1 => (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!(null))),
+                            2 => (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::Json(serde_json::json!({
+                                    "error_type": "https://github.com/confidential-containers/kbs/errors/TokenNotFound",
+                                })),
+                            ),
+                            _ => (axum::http::StatusCode::OK, axum::Json(serde_json::json!(null))),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.instance_id = "instance-test-01".to_string();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.aa_evidence_url = format!("http://{addr}/aa/evidence");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        put_kbs_workload_resource(
+            &state,
+            "default/instance-test-01-owner/seed-encrypted",
+            b"some-ciphertext",
+            WorkloadResourceWriteMode::Replace,
+        )
+        .await
+        .expect("session retry must survive preceding 503 retries");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "503, 503, stale-session 401, then one re-attested success"
+        );
 
         server.abort();
     }
