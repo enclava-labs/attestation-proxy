@@ -8953,6 +8953,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_claim_resolves_disable_before_claim_to_normal_unlock() {
+        // A /disable-auto-unlock that clears the flag AFTER the refresh's
+        // set_unlocking but BEFORE the claim: the resume guard fails, and
+        // the claim must resolve to the normal unlock path (material
+        // present, password unlock) instead of stranding the reservation.
+        let signal_dir = test_signal_dir("claim-disable-before");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // The refresh's writes for observed material (auto mode, both
+        // resources): resume transition + enabled flag.
+        state.ownership.set_unlocking();
+        state.ownership.set_auto_unlock_enabled(true);
+        // The concurrent disable's machine write (its KBS removal of the
+        // sealed resource is not visible to the claim's observation).
+        state.ownership.set_auto_unlock_enabled(false);
+
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::UnlockReservation
+        );
+        assert!(state.ownership.is_unlocking());
+
+        // The recovering request's guard drop must not clobber the claimed
+        // reservation (generation advanced by the claim).
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(state.ownership.is_unlocking());
+    }
+
+    #[tokio::test]
     async fn auto_unlock_resume_reports_unspawned_after_concurrent_disable() {
         // A /disable-auto-unlock that lands between the recovery claim and
         // the spawn handoff must not strand the Unlocking state behind a

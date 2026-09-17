@@ -387,6 +387,21 @@ impl OwnershipGuard {
                     machine.error = None;
                     RecoveryClaim::AutoUnlockResume
                 }
+                OwnershipState::Unlocking
+                    if self.is_auto_unlock_mode() && observation.sealed_present =>
+                {
+                    // A /disable-auto-unlock cleared the flag between our
+                    // refresh's set_unlocking and this claim: the material
+                    // snapshot is ours (auto mode + sealed observed means
+                    // the refresh wrote this Unlocking — a concurrent
+                    // request's reservation needed a Locked window the
+                    // refresh precluded), so resolve to the normal unlock
+                    // path instead of stranding the reservation.
+                    machine.unlock_generation += 1;
+                    machine.state = OwnershipState::Unlocking;
+                    machine.error = None;
+                    RecoveryClaim::UnlockReservation
+                }
                 _ => RecoveryClaim::Conflict,
             }
         } else if matches!(machine.state, OwnershipState::Unlocking)
