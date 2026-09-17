@@ -194,6 +194,18 @@ impl AaTokenCache {
         let ttl = config.aa_token_failure_cache_seconds.max(0.0);
         self.error_until = Instant::now() + Duration::from_secs_f64(ttl);
     }
+
+    /// Invalidate any cached token payload or error, forcing the next fetch
+    /// to re-run the auth/attest flow. Used when the KBS rejects a token that
+    /// was minted against an instance that no longer exists (e.g. after a
+    /// trustee roll).
+    pub fn invalidate(&mut self) {
+        self.payload = None;
+        self.claims = None;
+        self.error = None;
+        self.expires_at = Instant::now();
+        self.error_until = Instant::now();
+    }
 }
 
 /// Compute TTL for token cache, factoring in JWT `exp` claim.
@@ -1302,5 +1314,20 @@ tenant_instance_identity_hash = "identity-hash"
         assert_eq!(to_hex_bytes(&json!("not-hex")), None);
         // Null
         assert_eq!(to_hex_bytes(&json!(null)), None);
+    }
+
+    #[test]
+    fn aa_token_cache_invalidate_clears_payload_and_error() {
+        let config = crate::config::Config::from_env_for_test();
+        let mut cache = AaTokenCache::new();
+
+        cache.store_error("aa_token_fetch_failed:http_status_502".into(), &config);
+        cache.invalidate();
+        assert_eq!(cache.cached_payload(), (None, None));
+
+        cache.store_payload(json!({"token": "header.payload.signature"}), &config);
+        assert!(cache.cached_payload().0.is_some());
+        cache.invalidate();
+        assert_eq!(cache.cached_payload(), (None, None));
     }
 }

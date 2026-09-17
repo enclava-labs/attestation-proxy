@@ -278,6 +278,30 @@ pub async fn probe_direct_kbs_resource_status(
     Ok(response.status().as_u16())
 }
 
+/// Probe with one session-refresh retry. A 401 from the KBS means the
+/// cached AA token was minted against a KBS instance that no longer
+/// exists (trustee rolls restart the KBS and its in-memory sessions):
+/// invalidate the token cache, re-attest, and probe once more before the
+/// caller maps the status to a terminal ownership error.
+///
+/// Only 401 triggers the refresh. In the KBS error mapping
+/// (kbs/src/error.rs) the ONLY 400 is `ParsePolicyError` — a policy
+/// publication/parse failure, where re-attesting cannot help; that case
+/// stays a plain status for the caller to latch as a re-probeable
+/// environmental error (retrying later is the correct recovery, since
+/// publication settles after a roll).
+pub async fn probe_direct_kbs_resource_status_with_session_refresh(
+    state: &crate::AppState,
+    resource_path: &str,
+) -> Result<u16, OwnershipError> {
+    let status = probe_direct_kbs_resource_status(state, resource_path).await?;
+    if status != 401 {
+        return Ok(status);
+    }
+    state.aa_token_cache.write().await.invalidate();
+    probe_direct_kbs_resource_status(state, resource_path).await
+}
+
 /// Evict a cached KBS resource entry after a write or delete.
 /// This ensures read-after-write consistency for paths that were
 /// modified via the workload-resource endpoint.
@@ -427,14 +451,29 @@ async fn attach_receipt_attestation(
 }
 
 async fn send_workload_resource_request(
+    state: &crate::AppState,
     operation: &str,
-    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    build_request: impl Fn(&str) -> reqwest::RequestBuilder,
 ) -> Result<(), OwnershipError> {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    for attempt in 1..=MAX_ATTEMPTS {
-        let response = build_request()
+    // Independent retry budgets: availability-class retries (503 while the
+    // KBS restarts) share MAX_ATTEMPTS, while the session-refresh retry
+    // (a stale bearer after the roll) has its own single allowance — a
+    // roll that answers 503s while starting and then a session-flavored
+    // 401 once ready must not exhaust the session budget first.
+    let mut availability_retries = 0;
+    let mut session_refreshed = false;
+    loop {
+        // Fetch (or reuse the cached) bearer per attempt: a session-flavored
+        // 401 invalidates the cache and the next attempt re-attests against
+        // the current KBS. Authorization denials and unrecognized 401s stay
+        // terminal.
+        let token = fetch_kbs_bearer_token(state)
+            .await
+            .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
+        let response = build_request(&token)
             .send()
             .await
             .map_err(|e| OwnershipError::Store(format!("kbs_workload_{operation}_failed:{e}")))?;
@@ -442,16 +481,48 @@ async fn send_workload_resource_request(
         if status.is_success() {
             return Ok(());
         }
-        if status.as_u16() != 503 || attempt == MAX_ATTEMPTS {
+        if status.as_u16() == 401 {
+            if !session_refreshed && stale_session_401(response).await {
+                session_refreshed = true;
+                state.aa_token_cache.write().await.invalidate();
+                continue;
+            }
+            return Err(OwnershipError::Store(format!(
+                "kbs_workload_{operation}_non_200:401:"
+            )));
+        }
+        if status.as_u16() != 503 || availability_retries + 1 >= MAX_ATTEMPTS {
             return Err(OwnershipError::Store(format!(
                 "kbs_workload_{operation}_non_200:{}:",
                 status.as_u16()
             )));
         }
+        availability_retries += 1;
         tokio::time::sleep(RETRY_DELAY).await;
     }
+}
 
-    unreachable!("workload resource attempts are nonzero")
+/// Whether a workload-resource 401 is a stale-session signal (the KBS
+/// error body's machine-readable `error_type` names a token/session
+/// failure) rather than an authorization denial. Both map to HTTP 401
+/// (`kbs/src/error.rs` sends every auth error and `PolicyDeny` to
+/// Unauthorized); denials and unrecognized bodies stay terminal — only a
+/// clearly session-flavored failure triggers the invalidation + re-attest
+/// retry, so a policy denial is never retried.
+async fn stale_session_401(response: reqwest::Response) -> bool {
+    let error_type = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body.get("error_type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+    match error_type.as_deref() {
+        Some(error_type) => error_type.contains("Token") || error_type.contains("Session"),
+        None => false,
+    }
 }
 
 /// Write ciphertext to KBS via the workload-resource endpoint.
@@ -464,16 +535,12 @@ pub async fn put_kbs_workload_resource(
 ) -> Result<(), OwnershipError> {
     let mut envelope = sign_workload_receipt(state, ReceiptType::Rekey, resource_path, Some(body))?;
     attach_receipt_attestation(state, &mut envelope).await?;
-    let token = fetch_kbs_bearer_token(state)
-        .await
-        .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
-
     let workload_url = format!(
         "{}/{resource_path}",
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    send_workload_resource_request("put", || {
+    send_workload_resource_request(state, "put", |token| {
         let request = state
             .http_client
             .put(&workload_url)
@@ -500,16 +567,12 @@ pub async fn delete_kbs_workload_resource(
 ) -> Result<(), OwnershipError> {
     let mut envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
     attach_receipt_attestation(state, &mut envelope).await?;
-    let token = fetch_kbs_bearer_token(state)
-        .await
-        .map_err(|e| OwnershipError::Store(format!("kbs_token_unavailable:{e}")))?;
-
     let workload_url = format!(
         "{}/{resource_path}",
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    send_workload_resource_request("delete", || {
+    send_workload_resource_request(state, "delete", |token| {
         state
             .http_client
             .delete(&workload_url)
@@ -728,5 +791,367 @@ mod tests {
         };
         assert!(!entry.is_valid());
         assert!(!entry.has_valid_error());
+    }
+
+    #[tokio::test]
+    async fn probe_with_session_refresh_replaces_stale_cached_token() {
+        use std::sync::Arc;
+
+        // Mock in-guest AA + KBS. `minted` is what the AA currently serves;
+        // `accepted` is the bearer token the (current) KBS still knows. They
+        // diverge when a trustee roll restarts the KBS: tokens minted against
+        // the old instance are no longer valid.
+        let minted = Arc::new(tokio::sync::Mutex::new("stale-token".to_string()));
+        let accepted = Arc::new(tokio::sync::Mutex::new("fresh-token".to_string()));
+        let aa_token = minted.clone();
+        let kbs_accepted = accepted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(move || {
+                    let token = aa_token.clone();
+                    async move {
+                        let token = token.lock().await.clone();
+                        axum::Json(serde_json::json!({ "token": token }))
+                    }
+                }),
+            )
+            .route(
+                "/kbs/v0/resource/{*path}",
+                axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                    let accepted = kbs_accepted.lock().await.clone();
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    if auth == format!("Bearer {accepted}") {
+                        axum::http::StatusCode::OK
+                    } else {
+                        // Real KBS answers an unknown/stale bearer with 401
+                        // (kbs/src/error.rs maps everything session/token to
+                        // Unauthorized); the only 400 is ParsePolicyError.
+                        axum::http::StatusCode::UNAUTHORIZED
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        // Prime the cache with the (now stale) token.
+        let status = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
+            .await
+            .expect("plain probe");
+        assert_eq!(status, 401);
+
+        // The AA re-mints what the new KBS accepts; only the wrapper's cache
+        // invalidation can pick the new token up.
+        *minted.lock().await = "fresh-token".to_string();
+        let refreshed = probe_direct_kbs_resource_status_with_session_refresh(
+            &state,
+            "default/o/seed-encrypted",
+        )
+        .await
+        .expect("refreshed probe");
+        assert_eq!(refreshed, 200);
+
+        // The cache is sticky: a second roll makes the AA mint a new token,
+        // but the plain probe keeps sending the cached one.
+        *minted.lock().await = "fresh-token-2".to_string();
+        *accepted.lock().await = "fresh-token-2".to_string();
+        let stale = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
+            .await
+            .expect("plain probe again");
+        assert_eq!(stale, 401);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workload_resource_put_refreshes_stale_cached_token() {
+        use std::sync::Arc;
+
+        // A trustee roll invalidates the cached bearer for WRITES too: the
+        // first PUT 401s, the retry invalidates the AA cache, re-attests
+        // and succeeds with the token the current KBS accepts.
+        let minted = Arc::new(tokio::sync::Mutex::new("stale-token".to_string()));
+        let accepted = Arc::new(tokio::sync::Mutex::new("fresh-token".to_string()));
+        let aa_token = minted.clone();
+        let kbs_accepted = accepted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(move || {
+                    let token = aa_token.clone();
+                    async move {
+                        let token = token.lock().await.clone();
+                        axum::Json(serde_json::json!({ "token": token }))
+                    }
+                }),
+            )
+            .route(
+                "/aa/evidence",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                axum::routing::put(move |headers: axum::http::HeaderMap| async move {
+                    let accepted = kbs_accepted.lock().await.clone();
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    if auth == format!("Bearer {accepted}") {
+                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!(null)))
+                    } else {
+                        // Real KBS answers an unknown/stale bearer with 401
+                        // and a machine-readable token/session error_type.
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(serde_json::json!({
+                                "error_type": "https://github.com/confidential-containers/kbs/errors/TokenNotFound",
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.instance_id = "instance-test-01".to_string();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.aa_evidence_url = format!("http://{addr}/aa/evidence");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        // Prime the cache with the (now stale) token, then re-mint what the
+        // rolled KBS accepts: only the retry's invalidation picks it up.
+        crate::attestation::fetch_kbs_bearer_token(&state)
+            .await
+            .expect("prime cache");
+        *minted.lock().await = "fresh-token".to_string();
+
+        put_kbs_workload_resource(
+            &state,
+            "default/instance-test-01-owner/seed-encrypted",
+            b"some-ciphertext",
+            WorkloadResourceWriteMode::Replace,
+        )
+        .await
+        .expect("put recovers after 401");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workload_resource_session_retry_survives_preceding_503s() {
+        use std::sync::Arc;
+
+        // The roll window: the KBS answers 503 twice while starting, then a
+        // session-flavored 401 once ready. The session-refresh retry must
+        // have its own budget - not be exhausted by the availability
+        // retries - so the fourth request (re-attested) succeeds.
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = request_count.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "token": "some-token" }))
+                }),
+            )
+            .route(
+                "/aa/evidence",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                axum::routing::put(move || {
+                    let counter = counter.clone();
+                    async move {
+                        match counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 | 1 => (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!(null))),
+                            2 => (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::Json(serde_json::json!({
+                                    "error_type": "https://github.com/confidential-containers/kbs/errors/TokenNotFound",
+                                })),
+                            ),
+                            _ => (axum::http::StatusCode::OK, axum::Json(serde_json::json!(null))),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.instance_id = "instance-test-01".to_string();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.aa_evidence_url = format!("http://{addr}/aa/evidence");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        put_kbs_workload_resource(
+            &state,
+            "default/instance-test-01-owner/seed-encrypted",
+            b"some-ciphertext",
+            WorkloadResourceWriteMode::Replace,
+        )
+        .await
+        .expect("session retry must survive preceding 503 retries");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "503, 503, stale-session 401, then one re-attested success"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_with_session_refresh_ignores_400_policy_errors() {
+        use std::sync::Arc;
+
+        // A 400 from the KBS is ParsePolicyError (the only 400 in the KBS
+        // error mapping), not a stale session: it must not trigger the
+        // re-attest cycle. The AA hit counter proves the cache is left
+        // untouched.
+        let aa_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let aa_token = aa_hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/aa/token",
+                axum::routing::get(move || {
+                    let hits = aa_token.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!({ "token": "some-token" }))
+                    }
+                }),
+            )
+            .route(
+                "/kbs/v0/resource/{*path}",
+                axum::routing::get(|| async { axum::http::StatusCode::BAD_REQUEST }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind kbs mock");
+        let addr = listener.local_addr().expect("kbs mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve kbs mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.aa_token_url = format!("http://{addr}/aa/token");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        let status = probe_direct_kbs_resource_status_with_session_refresh(
+            &state,
+            "default/o/seed-encrypted",
+        )
+        .await
+        .expect("wrapped probe");
+        assert_eq!(status, 400);
+        assert_eq!(
+            aa_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 400 must not trigger a re-attest cycle"
+        );
+
+        server.abort();
     }
 }

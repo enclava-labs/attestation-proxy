@@ -27,8 +27,8 @@ use crate::escrow::{self, EscrowValueUpdate, OwnerSeedMaterial};
 use crate::kbs;
 use crate::ownership::utc_now;
 use crate::ownership::{
-    BootstrapChallenge, HandoffOutcome, OwnershipError, BOOTSTRAP_CHALLENGE_MAX_ACTIVE,
-    SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
+    BootstrapChallenge, HandoffOutcome, OwnershipError, OwnershipObservation, RecoveryClaim,
+    BOOTSTRAP_CHALLENGE_MAX_ACTIVE, SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
 };
 use crate::receipts::SignReceiptRequest;
 use crate::AppState;
@@ -811,7 +811,10 @@ async fn cdh_missing_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path)
+        .await
+        .map_err(|e| OwnershipError::OwnerSeedUnavailable(format!("owner_seed_probe_failed:{e}")))?
+    {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -833,7 +836,10 @@ async fn cdh_missing_optional_sealed_owner_seed_resource(
         return Ok(false);
     }
 
-    match kbs::probe_direct_kbs_resource_status(state, resource_path).await? {
+    match kbs::probe_direct_kbs_resource_status_with_session_refresh(state, resource_path)
+        .await
+        .map_err(|e| OwnershipError::OwnerSeedUnavailable(format!("owner_seed_probe_failed:{e}")))?
+    {
         404 => Ok(true),
         200 => Ok(false),
         status => Err(OwnershipError::OwnerSeedUnavailable(format!(
@@ -847,10 +853,33 @@ const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_ATTEMPTS: usize = 5;
 
+// Unclaimed polling must stay short: the HTTP server (and with it the claim
+// endpoint) only binds after initialize_ownership_state completes, so a long
+// unclaimed budget would delay every fresh password-mode deploy.
 #[cfg(test)]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 2_000;
+
+// Error-path budget: a KBS-unreachable window (typically a trustee roll,
+// which takes ~10-30s+ to become ready) must be outlived or the boot latches
+// a terminal ownership error that only a pod reboot (or re-probe) clears.
+#[cfg(test)]
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 4;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 30;
+#[cfg(test)]
+const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 10;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 3_000;
+// Wall-clock bound for the same error path: upstream stalls (a KBS that
+// accepts connections but never answers) spend up to ~20s per CDH read plus
+// probe/token timeouts, so the attempt budget alone could hold startup (and
+// listener binding) open for tens of minutes.
+#[cfg(test)]
+const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 10_000;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 90_000;
 #[cfg(test)]
 const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
@@ -941,9 +970,12 @@ async fn load_owner_seed_material(state: &AppState) -> Result<OwnerSeedMaterial,
 async fn refresh_ownership_state(
     state: &AppState,
     force_refresh: bool,
-) -> Result<(), OwnershipError> {
+) -> Result<OwnershipObservation, OwnershipError> {
     if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
-        return Ok(());
+        return Ok(OwnershipObservation {
+            encrypted_present: false,
+            sealed_present: false,
+        });
     }
 
     if force_refresh && state.config.owner_ciphertext_backend == "kbs-resource" {
@@ -970,7 +1002,10 @@ async fn refresh_ownership_state(
     } else {
         state.ownership.set_unclaimed();
     }
-    Ok(())
+    Ok(OwnershipObservation {
+        encrypted_present: claimed,
+        sealed_present: material.sealed.is_some(),
+    })
 }
 
 async fn maybe_refresh_unclaimed_state(state: &AppState) {
@@ -978,7 +1013,7 @@ async fn maybe_refresh_unclaimed_state(state: &AppState) {
         return;
     }
     if let Err(err) = refresh_ownership_state(state, true).await {
-        state.ownership.set_error(err.to_string());
+        state.ownership.set_ownership_error(&err);
     }
 }
 
@@ -1799,14 +1834,50 @@ pub async fn initialize_ownership_state(state: &AppState) {
         return;
     }
 
-    for attempt in 0..OWNER_SEED_STARTUP_RECHECK_ATTEMPTS {
-        match refresh_ownership_state(state, attempt > 0).await {
-            Ok(()) => {
+    let mut unclaimed_polls: usize = 0;
+    let mut error_attempts: usize = 0;
+    // Wall-clock bound on the error-retry span. Initialized on the FIRST
+    // error, not at loop entry: time spent in (even slow) successful
+    // unclaimed polls must not shorten the error-retry window.
+    let mut error_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        // Independent budgets: unclaimed polls and error retries count
+        // separately, so neither ordering of results shortens the other's
+        // budget. Every in-flight refresh is capped by the same duration —
+        // including the first, pre-error attempt — so a stalling upstream
+        // (connections accepted, requests never answered) cannot stretch
+        // startup past the bound even before any error has been returned;
+        // once the error budget is set it binds tighter via min().
+        let force_refresh = unclaimed_polls + error_attempts > 0;
+        let attempt_cap = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS);
+        let refresh_deadline = match error_deadline {
+            Some(budget) => attempt_cap.min(budget),
+            None => attempt_cap,
+        };
+        let refreshed = match tokio::time::timeout_at(
+            refresh_deadline,
+            refresh_ownership_state(state, force_refresh),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_deadline_exceeded) => Err(OwnershipError::OwnerSeedUnavailable(
+                "startup_refresh_timed_out".to_string(),
+            )),
+        };
+        match refreshed {
+            Ok(_) => {
+                // A successful refresh ends the current error episode:
+                // drop the error deadline so later unclaimed polls cannot
+                // be failed by a stale timeout (the next error starts a
+                // fresh window; the attempt counters still bound totals).
+                error_deadline = None;
                 if !state.ownership.is_unclaimed() {
                     return;
                 }
                 if state.config.owner_ciphertext_backend != "kbs-resource"
-                    || attempt + 1 == OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                    || unclaimed_polls + 1 >= OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
                 {
                     return;
                 }
@@ -1814,27 +1885,38 @@ pub async fn initialize_ownership_state(state: &AppState) {
                     OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
                 ))
                 .await;
+                unclaimed_polls += 1;
             }
             Err(err) => {
+                let now = tokio::time::Instant::now();
+                let deadline = *error_deadline.get_or_insert(
+                    now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS),
+                );
                 if state.config.owner_ciphertext_backend == "kbs-resource"
-                    && attempt + 1 < OWNER_SEED_STARTUP_RECHECK_ATTEMPTS
+                    && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
+                    && now < deadline
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
-                    ))
-                    .await;
+                    let next_retry =
+                        now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DELAY_MS);
+                    tokio::time::sleep_until(next_retry.min(deadline)).await;
+                    error_attempts += 1;
                     continue;
                 }
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return;
             }
         }
     }
 }
 
-pub fn spawn_auto_unlock_if_needed(state: AppState) {
+/// Spawn the startup auto-unlock task if auto-unlock material is enabled.
+/// Returns whether a task was actually spawned: callers that promise work
+/// in flight (the 202 resume arm) must handle a `false` (e.g. a concurrent
+/// /disable-auto-unlock cleared the flag between their check and this
+/// call) by falling back instead of stranding the `Unlocking` state.
+pub fn spawn_auto_unlock_if_needed(state: AppState) -> bool {
     if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
-        return;
+        return false;
     }
 
     tokio::spawn(async move {
@@ -1844,7 +1926,7 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
         let material = match load_owner_seed_material(&state).await {
             Ok(material) => material,
             Err(err) => {
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return;
             }
         };
@@ -1883,9 +1965,10 @@ pub fn spawn_auto_unlock_if_needed(state: AppState) {
                     "warning": warning,
                 }),
             ),
-            Err(err) => state.ownership.set_error(err.to_string()),
+            Err(err) => state.ownership.set_ownership_error(&err),
         }
     });
+    true
 }
 
 async fn unlock_startup_auto_unlock_material(
@@ -1907,6 +1990,28 @@ async fn unlock_startup_auto_unlock_material(
     unlock_owner_seed_material(state, owner_seed).await
 }
 
+/// Restores the re-probeable error latch if the recovery section of
+/// `unlock` is cancelled (client disconnect / handler future dropped)
+/// while the ownership machine still holds THIS recovery's bare
+/// `Unlocking` reservation — without it, a cancelled request would strand
+/// the instance in `Unlocking` with nothing in flight (recovery cannot
+/// re-enter, unlock rejects `not_locked`, claim is blocked). The
+/// generation check keeps it a no-op against any other owner of an
+/// `Unlocking` state: every successful claim outcome either transitions
+/// the state off `Unlocking` or advances the generation, so the guard
+/// only ever fires on our still-bare (unhanded-off) reservation.
+struct RecoveryCancelGuard {
+    ownership: std::sync::Arc<crate::ownership::OwnershipGuard>,
+    generation: u64,
+}
+
+impl Drop for RecoveryCancelGuard {
+    fn drop(&mut self) {
+        self.ownership
+            .restore_reprobeable_error_if_unlocking(self.generation);
+    }
+}
+
 /// POST /unlock, POST /.well-known/confidential/unlock.
 pub async fn unlock(
     State(state): State<AppState>,
@@ -1926,7 +2031,116 @@ pub async fn unlock(
         return json_response(400, &json!({"error": "password_required"}));
     }
 
-    if let Err(err) = state.ownership.begin_unlock_attempt() {
+    // A latched `owner_seed_unavailable` error is an environmental failure
+    // (KBS session or reachability), not an ownership fact: re-probe so the
+    // operator's unlock retry can recover without a pod reboot. The
+    // reservation is atomic (Error -> Unlocking under the ownership lock),
+    // so concurrent requests cannot both own the recovery, and it shares
+    // the unlock attempt budget: an unauthenticated caller must not be able
+    // to trigger unlimited KBS round trips through the latched state.
+    let mut recovery_owned = false;
+    if state.ownership.error_is_reprobeable() {
+        match state.ownership.begin_recovery_from_error() {
+            Err(OwnershipError::RateLimited) => return rate_limited_response(),
+            Err(_) => {
+                // Another request owns the recovery (state already
+                // reserved) or the latch cleared: fall through to the
+                // normal path, which rejects non-Locked states.
+            }
+            Ok(generation) => {
+                recovery_owned = true;
+                // If this request is cancelled (client disconnect) while a
+                // refresh is in flight, restore the re-probeable latch
+                // instead of stranding the reservation. The generation
+                // check makes it a no-op against any other owner of an
+                // `Unlocking` state (see the guard's docs).
+                let _recovery_guard = RecoveryCancelGuard {
+                    ownership: state.ownership.clone(),
+                    generation,
+                };
+                // One retry after a session-flavored failure: the first
+                // refresh can repair the KBS session mid-flight (the probe
+                // re-attests) and only the second read succeeds.
+                let mut refreshed = refresh_ownership_state(&state, true).await;
+                if refreshed.is_err() {
+                    refreshed = refresh_ownership_state(&state, true).await;
+                }
+                match refreshed {
+                    Ok(observation) => match state
+                        .ownership
+                        .claim_recovered_state(generation, observation)
+                    {
+                        RecoveryClaim::UnlockReservation => {
+                            // Our refresh recovered to Locked and the claim
+                            // already took the unlock reservation for THIS
+                            // request under one lock - a concurrent /unlock
+                            // cannot slip in between and be clobbered. Fall
+                            // through to the spawn section.
+                        }
+                        RecoveryClaim::AutoUnlockResume => {
+                            // Auto-unlock material became visible on our
+                            // preserved reservation: resume the startup
+                            // auto-unlock path so the 202 means work is in
+                            // flight. If a concurrent /disable-auto-unlock
+                            // cleared the flag between the claim and the
+                            // spawn, no task engages — fall through to the
+                            // normal unlock path instead of stranding the
+                            // Unlocking state behind a 202.
+                            if spawn_auto_unlock_if_needed(state.clone()) {
+                                return json_response(202, &json!({"state": "unlocking"}));
+                            }
+                        }
+                        RecoveryClaim::Unclaimed => {
+                            // The seed is gone (e.g. torn down while the
+                            // error was latched) and the claim applied the
+                            // claimable transition.
+                            return json_response(
+                                409,
+                                &json!({"error": "unclaimed", "state": "unclaimed"}),
+                            );
+                        }
+                        RecoveryClaim::Conflict => {
+                            // The state moved on to another owner (a
+                            // concurrent request's unlock reservation or a
+                            // completed unlock): nothing was changed here.
+                            let current_state = state
+                                .ownership
+                                .state_json()
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string();
+                            return json_response(
+                                409,
+                                &json!({"error": "not_locked", "state": current_state}),
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        // Restore the latch so later retries can re-probe.
+                        state.ownership.set_ownership_error(&err);
+                        return json_response(
+                            409,
+                            &json!({"error": "not_locked", "state": "error"}),
+                        );
+                    }
+                }
+                // Fall-through (reservation claimed): the generation
+                // mismatch makes the guard a no-op from here on — the
+                // reservation now belongs to this request and the spawn
+                // section below owns its lifetime.
+            }
+        }
+    }
+
+    // The recovery path already took its unlock reservation atomically in
+    // `claim_recovered_state`; a normal request charges the budget here.
+    let begin_result = if !recovery_owned {
+        state.ownership.begin_unlock_attempt()
+    } else {
+        Ok(())
+    };
+    if let Err(err) = begin_result {
         return match err {
             OwnershipError::RateLimited => rate_limited_response(),
             OwnershipError::NotLocked => {
@@ -1972,7 +2186,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     {
         Ok(key) => key,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -1981,7 +2195,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     };
 
     if let Err(err) = state.ownership.write_handoff_key(&key) {
-        state.ownership.set_error(err.to_string());
+        state.ownership.set_ownership_error(&err);
         return json_response(
             500,
             &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -1994,7 +2208,7 @@ fn unlock_level1_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>>) -> Re
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2012,7 +2226,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
     {
         Ok(key) => key,
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2029,7 +2243,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             }
         },
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2047,7 +2261,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             return json_response(200, &json!({"error": "wrong_password", "state": "locked"}));
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             return json_response(
                 500,
                 &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2078,7 +2292,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
             json_response(200, &json!({"error": "wrong_password", "state": "locked"}))
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             let detail = match &err {
                 OwnershipError::Store(detail) => detail.clone(),
                 _ => err.to_string(),
@@ -2099,7 +2313,7 @@ fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> R
         }
         HandoffOutcome::WrongPassword => {
             if let Err(err) = state.ownership.clear_handoff_retry_files() {
-                state.ownership.set_error(err.to_string());
+                state.ownership.set_ownership_error(&err);
                 return json_response(
                     500,
                     &json!({"error": "unlock_failed", "detail": err.to_string(), "state": "error"}),
@@ -2752,7 +2966,7 @@ pub async fn bootstrap_claim(
             )
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             json_response(
                 500,
                 &json!({"error": "claim_failed", "detail": err.to_string(), "state": "error"}),
@@ -3011,7 +3225,7 @@ pub async fn recover(
             )
         }
         Err(err) => {
-            state.ownership.set_error(err.to_string());
+            state.ownership.set_ownership_error(&err);
             json_response(
                 500,
                 &json!({"error": "recover_failed", "detail": err.to_string(), "state": "error"}),
@@ -8229,5 +8443,751 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn startup_owner_seed_error_budget_outlives_transient_kbs_failures() {
+        let signal_dir = test_signal_dir("startup-error-budget");
+        // Three consecutive CDH failures exceed the unclaimed recheck budget
+        // (3 in test cfg) but fit the error budget (4): a KBS-unreachable
+        // window must be retried through, not latched as a terminal error.
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![502, 502, 502],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "unclaimed");
+        assert!(body["error"].is_null());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_reprobes_latched_owner_seed_error_instead_of_rejecting() {
+        let signal_dir = test_signal_dir("unlock-reprobe-latched-error");
+        let owner_seed = [0x2a; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let ready_for_task = ready_path.clone();
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            accepted_tx.send(()).expect("notify accepted");
+            ready_rx.await.expect("wait for ready release");
+            tokio::fs::write(&ready_for_task, b"ready\n")
+                .await
+                .expect("write ready file");
+            line
+        });
+
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        // Simulate the latched wedge: boot intersected a trustee roll.
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("correct-password".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 202);
+        accepted_rx.await.expect("init accepted owner seed");
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        ready_tx.send(()).expect("release ready writer");
+        let _ = socket_task.await.expect("socket task");
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_keeps_rejection_when_reprobe_still_fails() {
+        let signal_dir = test_signal_dir("unlock-reprobe-still-failing");
+        // Port 9 (discard) refuses connections immediately: the re-probe
+        // cannot reach the KBS.
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 409);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "not_locked");
+        assert_eq!(body["state"], "error");
+        assert_eq!(state.ownership.state_json()["state"], "error");
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_probe_shares_the_attempt_budget() {
+        let signal_dir = test_signal_dir("unlock-reprobe-rate-limit");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // The re-probe records an attempt for every failing call: after the
+        // unlock budget is spent the endpoint rate-limits instead of
+        // performing further KBS round trips.
+        for _ in 0..crate::ownership::UNLOCK_MAX_ATTEMPTS {
+            let response = unlock(
+                State(state.clone()),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("whatever".to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 409);
+        }
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 429);
+        assert_eq!(read_json(response).await["error"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn startup_probe_transport_failure_latches_reprobeable_error() {
+        let signal_dir = test_signal_dir("startup-probe-transport");
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![500],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            // The AA token endpoint is unreachable: the direct probe fails
+            // with a transport error rather than an HTTP status.
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.aa_token_url = "http://127.0.0.1:9/aa/token".to_string();
+        }
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "error");
+        let error = body["error"].as_str().expect("latched error");
+        assert!(
+            error.starts_with("owner_seed_unavailable"),
+            "probe transport failures must latch as re-probeable, got: {error}"
+        );
+        assert!(state.ownership.error_is_reprobeable());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_budgets_track_unclaimed_and_error_retries_independently() {
+        let signal_dir = test_signal_dir("startup-split-budgets");
+        // Two unclaimed polls, three transient failures, then recovery:
+        // with a shared counter the first failure would exhaust the recheck
+        // budget and latch; independent counters retry through the outage.
+        let mut cdh_sequences = HashMap::new();
+        cdh_sequences.insert(
+            "default/instance-test-01-owner/seed-encrypted".to_string(),
+            vec![404, 404, 502, 502, 502],
+        );
+        let kbs_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh_sequences,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        let body = state.ownership.state_json();
+        assert_eq!(body["state"], "unclaimed");
+        assert!(body["error"].is_null());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_resumes_auto_unlock_after_reprobe() {
+        let signal_dir = test_signal_dir("auto-unlock-reprobe");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("auto-unlock-reprobe-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+        clear_password_slot_artifacts(&signal_dir.path);
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let enable = enable_auto_unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(enable.status().as_u16(), 200);
+
+        // Simulate the wedge: a restart boot latched the environmental error
+        // (auto-unlock never engaged because the seed was unreachable).
+        let restart_signal_dir = test_signal_dir("auto-unlock-reprobe-restart");
+        mark_password_slots_unlocked(&restart_signal_dir.path);
+        let restart_state = build_state_with_secret_backend(
+            &restart_signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        restart_state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let response = unlock(
+            State(restart_state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+
+        // The re-probe must not just report Unlocking: it resumes the
+        // auto-unlock operation.
+        // The re-probe must not just report Unlocking: it resumes the
+        // auto-unlock operation.
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(read_json(response).await["state"], "unlocking");
+        let body = wait_for_ownership_state(&restart_state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        api_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_reservation_is_atomic_under_concurrent_requests() {
+        let signal_dir = test_signal_dir("unlock-reprobe-concurrent");
+        let owner_seed = [0x2b; 32];
+        let kbs_server =
+            spawn_owner_seed_server(owner_seed, "correct-password", "instance-test-01").await;
+        let socket_path = signal_dir.path.join("unlock.sock");
+        let ready_path = signal_dir.path.join("init-ready");
+        let error_path = signal_dir.path.join("init-error");
+        let ready_for_task = ready_path.clone();
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind init socket");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let socket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init socket");
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            reader.get_mut().write_all(b"OK\n").await.expect("reply OK");
+            accepted_tx.send(()).expect("notify accepted");
+            ready_rx.await.expect("wait for ready release");
+            tokio::fs::write(&ready_for_task, b"ready\n")
+                .await
+                .expect("write ready file");
+            line
+        });
+
+        let mut state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        {
+            let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+            config.enclava_init_unlock_socket = socket_path.display().to_string();
+            config.enclava_init_ready_file = ready_path.display().to_string();
+            config.enclava_init_error_file = error_path.display().to_string();
+        }
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // Two requests race on the latched error: the reservation is taken
+        // under the ownership lock, so exactly one owns the recovery (and
+        // spawns the single unlock task); the loser is rejected without a
+        // second task.
+        let state_b = state.clone();
+        let (first, second) = tokio::join!(
+            unlock(
+                State(state.clone()),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("correct-password".to_string()),
+                })
+            ),
+            unlock(
+                State(state_b),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("correct-password".to_string()),
+                })
+            )
+        );
+
+        let mut statuses = [first.status().as_u16(), second.status().as_u16()];
+        statuses.sort();
+        let mut statuses = [first.status().as_u16(), second.status().as_u16()];
+        statuses.sort();
+        assert_eq!(statuses, [202, 409]);
+        accepted_rx.await.expect("init accepted owner seed");
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+        ready_tx.send(()).expect("release ready writer");
+        let _ = socket_task.await.expect("socket task");
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_restores_unclaimed_when_seed_is_gone() {
+        let signal_dir = test_signal_dir("unlock-reprobe-seed-gone");
+        // KBS is reachable but holds no seed resources (torn down while the
+        // error was latched): the recovery must restore the claimable
+        // state, not strand the instance in a bare Unlocking reservation.
+        let kbs_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            kbs_server.base_url(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("whatever".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(read_json(response).await["error"], "unclaimed");
+        assert_eq!(state.ownership.state_json()["state"], "unclaimed");
+        assert!(!state.ownership.error_is_reprobeable());
+        kbs_server.task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlock_recovery_cancelled_mid_refresh_restores_reprobeable_latch() {
+        let signal_dir = test_signal_dir("unlock-reprobe-cancelled");
+        // A TCP listener that accepts connections (kernel backlog) but
+        // never answers: every KBS/CDH read in the recovery refresh hangs,
+        // so the only way the handler future finishes is cancellation.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead kbs mock");
+        let dead_addr = dead_listener.local_addr().expect("dead kbs mock addr");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            format!("http://{dead_addr}"),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // Cancel the request while the first refresh is hung. Without the
+        // cancellation guard this strands the Unlocking reservation.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            unlock(
+                State(state.clone()),
+                Json(UnlockRequest {
+                    password: Zeroizing::new("whatever".to_string()),
+                }),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "handler should still be awaiting KBS");
+
+        // The latch is restored and still re-probeable: a later unlock can
+        // re-enter recovery instead of wedging on a bare Unlocking state.
+        assert_eq!(state.ownership.state_json()["state"], "error");
+        assert!(state.ownership.error_is_reprobeable());
+        assert!(state.ownership.begin_recovery_from_error().is_ok());
+    }
+
+    #[tokio::test]
+    async fn normal_unlock_outage_latches_reprobeable_error() {
+        // A normal (non-recovery) unlock that hits a KBS outage must latch
+        // a re-probeable error, not a terminal one: the spawned task's
+        // material load uses the typed setter.
+        let signal_dir = test_signal_dir("unlock-outage-reprobeable");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state.ownership.set_locked();
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("some-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 202);
+        let mut latched = false;
+        for _ in 0..100 {
+            if state.ownership.state_json()["state"] == "error" {
+                latched = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(latched, "unlock task should latch the outage error");
+        assert!(
+            state.ownership.error_is_reprobeable(),
+            "an outage during a normal unlock must stay re-probeable"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_resolves_disable_before_claim_to_normal_unlock() {
+        // A /disable-auto-unlock that clears the flag AFTER the refresh's
+        // set_unlocking but BEFORE the claim: the resume guard fails, and
+        // the claim must resolve to the normal unlock path (material
+        // present, password unlock) instead of stranding the reservation.
+        let signal_dir = test_signal_dir("claim-disable-before");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // The refresh's writes for observed material (auto mode, both
+        // resources): resume transition + enabled flag.
+        state.ownership.set_unlocking();
+        state.ownership.set_auto_unlock_enabled(true);
+        // The concurrent disable's machine write (its KBS removal of the
+        // sealed resource is not visible to the claim's observation).
+        state.ownership.set_auto_unlock_enabled(false);
+
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::UnlockReservation
+        );
+        assert!(state.ownership.is_unlocking());
+
+        // The recovering request's guard drop must not clobber the claimed
+        // reservation (generation advanced by the claim).
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(state.ownership.is_unlocking());
+    }
+
+    #[tokio::test]
+    async fn auto_unlock_resume_reports_unspawned_after_concurrent_disable() {
+        // A /disable-auto-unlock that lands between the recovery claim and
+        // the spawn handoff must not strand the Unlocking state behind a
+        // 202: the helper reports that no task engaged so the caller can
+        // fall back to the normal unlock path.
+        let signal_dir = test_signal_dir("resume-disable-race");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        // The resume precondition: material enabled.
+        state.ownership.set_auto_unlock_enabled(true);
+        assert!(spawn_auto_unlock_if_needed(state.clone()));
+        // The disable interleave clears the flag; the next handoff attempt
+        // reports no-spawn instead of silently doing nothing.
+        state.ownership.set_auto_unlock_enabled(false);
+        assert!(!spawn_auto_unlock_if_needed(state.clone()));
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_resumes_auto_mode_with_sealed_seed_only() {
+        // Torn state: the encrypted envelope is gone but the sealed seed
+        // remains. In auto-unlock mode the existing ownership must RESUME
+        // from the seal — falling to the claimable Unclaimed transition
+        // here would let a different owner take over the instance.
+        let signal_dir = test_signal_dir("claim-sealed-only");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // Mirror refresh's write: observing a sealed seed enables the
+        // auto-unlock material flag before the claim runs.
+        state.ownership.set_auto_unlock_enabled(true);
+        // refresh observed: encrypted absent, sealed present; the machine
+        // still holds our bare reservation (refresh preserves it).
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: false,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::AutoUnlockResume
+        );
+
+        // The handed-off reservation must be invisible to the recovering
+        // request's cancellation guard: dropping it after the claim leaves
+        // the resumed state intact (the claim advanced the generation).
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(
+            state.ownership.is_unlocking(),
+            "a handed-off resume must survive the recovering request's guard drop"
+        );
+
+        // Password mode with the same torn material cannot resume: it must
+        // fall through to the claimable transition instead.
+        let password_state = build_state_with_mode(
+            &test_signal_dir("claim-sealed-only-pw").path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        password_state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+        let generation = password_state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve password recovery");
+        password_state.ownership.set_auto_unlock_enabled(true);
+        assert_eq!(
+            password_state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: false,
+                    sealed_present: true,
+                }
+            ),
+            RecoveryClaim::Unclaimed
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_does_not_clobber_a_concurrent_unlock_reservation() {
+        let signal_dir = test_signal_dir("recovery-claim-race");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            "http://127.0.0.1:9".to_string(),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "owner_seed_probe_unexpected_status:400".to_string(),
+            ));
+
+        // Deterministic interleaving of the race: our recovery holds its
+        // reservation (generation G) across the refresh awaits; meanwhile a
+        // concurrent /unlock sees the recovered Locked state, reserves it
+        // (generation G+1) and spawns its unlock task.
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery");
+        // ... refresh completes: material present -> Locked.
+        state.ownership.set_locked();
+        // ... the concurrent request wins the lock.
+        state
+            .ownership
+            .begin_unlock_attempt()
+            .expect("concurrent unlock reservation");
+
+        // The claim must report the conflict without touching the state
+        // (the old catch-all here clobbered the running unlock to
+        // Unclaimed).
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: false,
+                }
+            ),
+            RecoveryClaim::Conflict
+        );
+        assert!(state.ownership.is_unlocking());
+        assert!(!state.ownership.is_unclaimed());
+
+        // The recovering request's guard dropping after the Conflict (the
+        // request returns) must not clobber the concurrent request's
+        // reservation: the generation check keeps the restore inert.
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(
+            state.ownership.is_unlocking(),
+            "a foreign reservation must survive the recovering request's guard drop"
+        );
+
+        // Sanity: without the interleaving, the same sequence claims the
+        // reservation atomically.
+        state
+            .ownership
+            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                "recovery_cancelled".to_string(),
+            ));
+        let generation = state
+            .ownership
+            .begin_recovery_from_error()
+            .expect("reserve recovery again");
+        state.ownership.set_locked();
+        assert_eq!(
+            state.ownership.claim_recovered_state(
+                generation,
+                OwnershipObservation {
+                    encrypted_present: true,
+                    sealed_present: false,
+                }
+            ),
+            RecoveryClaim::UnlockReservation
+        );
+        assert!(state.ownership.is_unlocking());
     }
 }
