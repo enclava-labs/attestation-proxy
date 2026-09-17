@@ -377,6 +377,14 @@ impl OwnershipGuard {
                 OwnershipState::Unlocking
                     if self.is_auto_unlock_mode() && machine.auto_unlock_enabled =>
                 {
+                    // Hand the reservation to the spawned auto-unlock task:
+                    // advance the generation so the recovering request's
+                    // cancellation guard (which holds ours) becomes inert —
+                    // without this, a sealed-only resume keeps our
+                    // generation and the guard's drop would replace the
+                    // handed-off state with a re-probeable Error.
+                    machine.unlock_generation += 1;
+                    machine.error = None;
                     RecoveryClaim::AutoUnlockResume
                 }
                 _ => RecoveryClaim::Conflict,

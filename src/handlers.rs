@@ -1997,8 +1997,9 @@ async fn unlock_startup_auto_unlock_material(
 /// the instance in `Unlocking` with nothing in flight (recovery cannot
 /// re-enter, unlock rejects `not_locked`, claim is blocked). The
 /// generation check keeps it a no-op against any other owner of an
-/// `Unlocking` state (a concurrent request's reservation, our own claim,
-/// or a resumed auto-unlock), so no explicit disarm is needed.
+/// `Unlocking` state: every successful claim outcome either transitions
+/// the state off `Unlocking` or advances the generation, so the guard
+/// only ever fires on our still-bare (unhanded-off) reservation.
 struct RecoveryCancelGuard {
     ownership: std::sync::Arc<crate::ownership::OwnershipGuard>,
     generation: u64,
@@ -9010,6 +9011,18 @@ mod tests {
                 }
             ),
             RecoveryClaim::AutoUnlockResume
+        );
+
+        // The handed-off reservation must be invisible to the recovering
+        // request's cancellation guard: dropping it after the claim leaves
+        // the resumed state intact (the claim advanced the generation).
+        drop(RecoveryCancelGuard {
+            ownership: state.ownership.clone(),
+            generation,
+        });
+        assert!(
+            state.ownership.is_unlocking(),
+            "a handed-off resume must survive the recovering request's guard drop"
         );
 
         // Password mode with the same torn material cannot resume: it must
