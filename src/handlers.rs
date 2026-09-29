@@ -1071,7 +1071,9 @@ async fn restore_kbs_owner_seed_resource(
             )
             .await
         }
-        None => kbs::delete_kbs_workload_resource(state, resource_path).await,
+        None => kbs::delete_kbs_workload_resource(state, resource_path)
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -3590,35 +3592,23 @@ pub async fn teardown(
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
 
-    // Delete seed-encrypted (required). A 404 means a prior teardown already
-    // erased it: CAP retries teardown after transport timeouts, so a retry
-    // that follows a slow success must converge instead of wedging the delete
-    // at 500 forever.
+    // Delete seed-encrypted (required). A NotFound from the workload-resource
+    // DELETE itself means a prior teardown already erased it (CAP retries
+    // after transport timeouts) — the desired end state. The distinction is
+    // typed: only the DELETE's own 404 counts, so an attestation-fetch failure
+    // or any other upstream error still fails the teardown.
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_encrypted_kbs_path)
         .await
     {
-        Ok(()) => deleted.push("seed-encrypted"),
-        Err(e) => {
-            if e.to_string().contains(":404:") {
-                deleted.push("seed-encrypted");
-            } else {
-                errors.push(format!("seed-encrypted:{e}"));
-            }
-        }
+        Ok(_erased) => deleted.push("seed-encrypted"),
+        Err(e) => errors.push(format!("seed-encrypted:{e}")),
     }
 
-    // Delete seed-sealed (best effort -- 404 is OK since not all modes use it)
+    // Delete seed-sealed (best effort -- absent is OK since not all modes use it)
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_sealed_kbs_path).await
     {
-        Ok(()) => deleted.push("seed-sealed"),
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains(":404:") {
-                deleted.push("seed-sealed"); // Treat 404 as success for sealed
-            } else {
-                errors.push(format!("seed-sealed:{e}"));
-            }
-        }
+        Ok(_erased) => deleted.push("seed-sealed"),
+        Err(e) => errors.push(format!("seed-sealed:{e}")),
     }
 
     // Audit log
@@ -9204,22 +9194,35 @@ mod tests {
     async fn teardown_treats_already_erased_seed_as_success() {
         use std::sync::atomic::{AtomicU16, Ordering};
 
-        // CAP retries teardown after transport timeouts. A retry that follows
-        // a slow-but-successful erasure must converge: the KBS resource delete
-        // then 404s, and treating that as failure would wedge the delete at
-        // 500 forever. Any other upstream failure stays terminal.
+        // CAP retries teardown after transport timeouts. A retry whose DELETE
+        // finds the resource already absent must converge; any failure before
+        // the DELETE (e.g. the receipt-attestation fetch) or any other
+        // upstream status must still fail the teardown — an unrelated 404
+        // must never masquerade as erasure.
         let delete_status = Arc::new(AtomicU16::new(404));
-        let mock_status = delete_status.clone();
+        let evidence_status = Arc::new(AtomicU16::new(200));
+        let mock_delete_status = delete_status.clone();
+        let mock_evidence_status = evidence_status.clone();
         let app = Router::new()
             .route(
                 "/aa/token",
                 get(|| async { axum::Json(json!({ "token": "mock-token" })) }),
             )
-            .route("/aa/evidence", get(|| async { axum::Json(json!({})) }))
+            .route(
+                "/aa/evidence",
+                get(move || {
+                    let status = mock_evidence_status.clone();
+                    async move {
+                        let code = axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
+                            .expect("valid mock status");
+                        (code, axum::Json(json!({ "error": "mock-evidence" })))
+                    }
+                }),
+            )
             .route(
                 "/kbs/v0/workload-resource/{*path}",
                 axum::routing::delete(move || {
-                    let status = mock_status.clone();
+                    let status = mock_delete_status.clone();
                     async move {
                         axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
                             .expect("valid mock status")
@@ -9252,6 +9255,7 @@ mod tests {
             exp: u64::MAX,
         };
 
+        // A DELETE that finds the resource already absent converges.
         let response = teardown(
             State(state.clone()),
             crate::jwt::TeardownAuth(claims.clone()),
@@ -9264,6 +9268,21 @@ mod tests {
 
         // A real upstream failure must still fail the teardown.
         delete_status.store(500, Ordering::SeqCst);
+        let response = teardown(
+            State(state.clone()),
+            crate::jwt::TeardownAuth(claims.clone()),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "teardown_partial_failure");
+        assert_eq!(body["deleted"], json!([]));
+
+        // Regression: an attestation-fetch 404 must not masquerade as erasure.
+        // The DELETE never runs here, so reporting success would leave both
+        // ciphertexts in KBS while CAP proceeds to destroy.
+        delete_status.store(404, Ordering::SeqCst);
+        evidence_status.store(404, Ordering::SeqCst);
         let response = teardown(State(state), crate::jwt::TeardownAuth(claims)).await;
         assert_eq!(response.status().as_u16(), 500);
         let body = read_json(response).await;
