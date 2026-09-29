@@ -3590,12 +3590,21 @@ pub async fn teardown(
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
 
-    // Delete seed-encrypted (required)
+    // Delete seed-encrypted (required). A 404 means a prior teardown already
+    // erased it: CAP retries teardown after transport timeouts, so a retry
+    // that follows a slow success must converge instead of wedging the delete
+    // at 500 forever.
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_encrypted_kbs_path)
         .await
     {
         Ok(()) => deleted.push("seed-encrypted"),
-        Err(e) => errors.push(format!("seed-encrypted:{e}")),
+        Err(e) => {
+            if e.to_string().contains(":404:") {
+                deleted.push("seed-encrypted");
+            } else {
+                errors.push(format!("seed-encrypted:{e}"));
+            }
+        }
     }
 
     // Delete seed-sealed (best effort -- 404 is OK since not all modes use it)
@@ -9189,5 +9198,78 @@ mod tests {
             RecoveryClaim::UnlockReservation
         );
         assert!(state.ownership.is_unlocking());
+    }
+
+    #[tokio::test]
+    async fn teardown_treats_already_erased_seed_as_success() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        // CAP retries teardown after transport timeouts. A retry that follows
+        // a slow-but-successful erasure must converge: the KBS resource delete
+        // then 404s, and treating that as failure would wedge the delete at
+        // 500 forever. Any other upstream failure stays terminal.
+        let delete_status = Arc::new(AtomicU16::new(404));
+        let mock_status = delete_status.clone();
+        let app = Router::new()
+            .route(
+                "/aa/token",
+                get(|| async { axum::Json(json!({ "token": "mock-token" })) }),
+            )
+            .route("/aa/evidence", get(|| async { axum::Json(json!({})) }))
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                axum::routing::delete(move || {
+                    let status = mock_status.clone();
+                    async move {
+                        axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
+                            .expect("valid mock status")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind teardown mock");
+        let addr = listener.local_addr().expect("teardown mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve teardown mock");
+        });
+
+        let signal_dir = test_signal_dir("teardown-idempotent");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            format!("http://{addr}"),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        let claims = crate::jwt::ApiTokenClaims {
+            org_id: "org-test".to_string(),
+            app_id: "app-test".to_string(),
+            instance_id: "instance-test-01".to_string(),
+            scopes: vec!["teardown".to_string()],
+            iat: 0,
+            exp: u64::MAX,
+        };
+
+        let response = teardown(
+            State(state.clone()),
+            crate::jwt::TeardownAuth(claims.clone()),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "teardown_complete");
+        assert_eq!(body["deleted"], json!(["seed-encrypted", "seed-sealed"]));
+
+        // A real upstream failure must still fail the teardown.
+        delete_status.store(500, Ordering::SeqCst);
+        let response = teardown(State(state), crate::jwt::TeardownAuth(claims)).await;
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "teardown_partial_failure");
+        assert_eq!(body["deleted"], json!([]));
+
+        server.abort();
     }
 }
