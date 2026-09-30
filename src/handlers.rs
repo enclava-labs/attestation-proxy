@@ -1071,7 +1071,9 @@ async fn restore_kbs_owner_seed_resource(
             )
             .await
         }
-        None => kbs::delete_kbs_workload_resource(state, resource_path).await,
+        None => kbs::delete_kbs_workload_resource(state, resource_path)
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -3590,26 +3592,23 @@ pub async fn teardown(
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
 
-    // Delete seed-encrypted (required)
+    // Delete seed-encrypted (required). A NotFound from the workload-resource
+    // DELETE itself means a prior teardown already erased it (CAP retries
+    // after transport timeouts) — the desired end state. The distinction is
+    // typed: only the DELETE's own 404 counts, so an attestation-fetch failure
+    // or any other upstream error still fails the teardown.
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_encrypted_kbs_path)
         .await
     {
-        Ok(()) => deleted.push("seed-encrypted"),
+        Ok(_erased) => deleted.push("seed-encrypted"),
         Err(e) => errors.push(format!("seed-encrypted:{e}")),
     }
 
-    // Delete seed-sealed (best effort -- 404 is OK since not all modes use it)
+    // Delete seed-sealed (best effort -- absent is OK since not all modes use it)
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_sealed_kbs_path).await
     {
-        Ok(()) => deleted.push("seed-sealed"),
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains(":404:") {
-                deleted.push("seed-sealed"); // Treat 404 as success for sealed
-            } else {
-                errors.push(format!("seed-sealed:{e}"));
-            }
-        }
+        Ok(_erased) => deleted.push("seed-sealed"),
+        Err(e) => errors.push(format!("seed-sealed:{e}")),
     }
 
     // Audit log
@@ -9189,5 +9188,107 @@ mod tests {
             RecoveryClaim::UnlockReservation
         );
         assert!(state.ownership.is_unlocking());
+    }
+
+    #[tokio::test]
+    async fn teardown_treats_already_erased_seed_as_success() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        // CAP retries teardown after transport timeouts. A retry whose DELETE
+        // finds the resource already absent must converge; any failure before
+        // the DELETE (e.g. the receipt-attestation fetch) or any other
+        // upstream status must still fail the teardown — an unrelated 404
+        // must never masquerade as erasure.
+        let delete_status = Arc::new(AtomicU16::new(404));
+        let evidence_status = Arc::new(AtomicU16::new(200));
+        let mock_delete_status = delete_status.clone();
+        let mock_evidence_status = evidence_status.clone();
+        let app = Router::new()
+            .route(
+                "/aa/token",
+                get(|| async { axum::Json(json!({ "token": "mock-token" })) }),
+            )
+            .route(
+                "/aa/evidence",
+                get(move || {
+                    let status = mock_evidence_status.clone();
+                    async move {
+                        let code = axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
+                            .expect("valid mock status");
+                        (code, axum::Json(json!({ "error": "mock-evidence" })))
+                    }
+                }),
+            )
+            .route(
+                "/kbs/v0/workload-resource/{*path}",
+                axum::routing::delete(move || {
+                    let status = mock_delete_status.clone();
+                    async move {
+                        axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
+                            .expect("valid mock status")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind teardown mock");
+        let addr = listener.local_addr().expect("teardown mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve teardown mock");
+        });
+
+        let signal_dir = test_signal_dir("teardown-idempotent");
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            format!("http://{addr}"),
+            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+        );
+        let claims = crate::jwt::ApiTokenClaims {
+            org_id: "org-test".to_string(),
+            app_id: "app-test".to_string(),
+            instance_id: "instance-test-01".to_string(),
+            scopes: vec!["teardown".to_string()],
+            iat: 0,
+            exp: u64::MAX,
+        };
+
+        // A DELETE that finds the resource already absent converges.
+        let response = teardown(
+            State(state.clone()),
+            crate::jwt::TeardownAuth(claims.clone()),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "teardown_complete");
+        assert_eq!(body["deleted"], json!(["seed-encrypted", "seed-sealed"]));
+
+        // A real upstream failure must still fail the teardown.
+        delete_status.store(500, Ordering::SeqCst);
+        let response = teardown(
+            State(state.clone()),
+            crate::jwt::TeardownAuth(claims.clone()),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "teardown_partial_failure");
+        assert_eq!(body["deleted"], json!([]));
+
+        // Regression: an attestation-fetch 404 must not masquerade as erasure.
+        // The DELETE never runs here, so reporting success would leave both
+        // ciphertexts in KBS while CAP proceeds to destroy.
+        delete_status.store(404, Ordering::SeqCst);
+        evidence_status.store(404, Ordering::SeqCst);
+        let response = teardown(State(state), crate::jwt::TeardownAuth(claims)).await;
+        assert_eq!(response.status().as_u16(), 500);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "teardown_partial_failure");
+        assert_eq!(body["deleted"], json!([]));
+
+        server.abort();
     }
 }

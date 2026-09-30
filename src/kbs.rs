@@ -328,6 +328,17 @@ pub enum WorkloadResourceWriteMode {
     Replace,
 }
 
+/// Whether a completed workload-resource request actually touched KBS. A 404
+/// from the workload-resource endpoint itself means the resource is absent —
+/// the desired end state for a retried DELETE. Only the request's own status
+/// maps here: anything failing before the request is sent (token, receipt
+/// attestation) and any other upstream status stays a hard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadResourceOutcome {
+    Applied,
+    NotFound,
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -454,7 +465,7 @@ async fn send_workload_resource_request(
     state: &crate::AppState,
     operation: &str,
     build_request: impl Fn(&str) -> reqwest::RequestBuilder,
-) -> Result<(), OwnershipError> {
+) -> Result<WorkloadResourceOutcome, OwnershipError> {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -479,7 +490,10 @@ async fn send_workload_resource_request(
             .map_err(|e| OwnershipError::Store(format!("kbs_workload_{operation}_failed:{e}")))?;
         let status = response.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(WorkloadResourceOutcome::Applied);
+        }
+        if status.as_u16() == 404 {
+            return Ok(WorkloadResourceOutcome::NotFound);
         }
         if status.as_u16() == 401 {
             if !session_refreshed && stale_session_401(response).await {
@@ -540,7 +554,7 @@ pub async fn put_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    send_workload_resource_request(state, "put", |token| {
+    let outcome = send_workload_resource_request(state, "put", |token| {
         let request = state
             .http_client
             .put(&workload_url)
@@ -554,6 +568,12 @@ pub async fn put_kbs_workload_resource(
         }
     })
     .await?;
+    if outcome == WorkloadResourceOutcome::NotFound {
+        // A 404 on PUT is not a completed outcome; keep the historical error shape.
+        return Err(OwnershipError::Store(
+            "kbs_workload_put_non_200:404:".to_string(),
+        ));
+    }
     // Evict cached entry to ensure read-after-write consistency
     evict_kbs_cache_entry(state, resource_path).await;
     Ok(())
@@ -561,10 +581,17 @@ pub async fn put_kbs_workload_resource(
 
 /// Delete ciphertext from KBS via the workload-resource endpoint.
 /// Uses DELETE /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
+///
+/// Returns `Ok(true)` when this call erased the resource and `Ok(false)` when
+/// the resource was already absent (the workload-resource DELETE's own 404) —
+/// which is the desired end state of an idempotent retry after a slow success.
+/// Anything failing before the DELETE is issued (token, receipt attestation)
+/// and any other upstream status is a hard `Err`: only the DELETE's own
+/// response can prove the resource is gone.
 pub async fn delete_kbs_workload_resource(
     state: &crate::AppState,
     resource_path: &str,
-) -> Result<(), OwnershipError> {
+) -> Result<bool, OwnershipError> {
     let mut envelope = sign_workload_receipt(state, ReceiptType::Teardown, resource_path, None)?;
     attach_receipt_attestation(state, &mut envelope).await?;
     let workload_url = format!(
@@ -572,19 +599,24 @@ pub async fn delete_kbs_workload_resource(
         workload_resource_base(&state.config.kbs_resource_url)
     );
 
-    send_workload_resource_request(state, "delete", |token| {
-        state
-            .http_client
-            .delete(&workload_url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("If-Match", "*")
-            .json(&envelope)
-            .timeout(std::time::Duration::from_secs(20))
-    })
-    .await?;
-    // Evict cached entry to ensure read-after-write consistency
+    let erased = matches!(
+        send_workload_resource_request(state, "delete", |token| {
+            state
+                .http_client
+                .delete(&workload_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-Match", "*")
+                .json(&envelope)
+                .timeout(std::time::Duration::from_secs(20))
+        })
+        .await?,
+        WorkloadResourceOutcome::Applied
+    );
+    // Evict the cached entry on both outcomes: whether this call erased the
+    // resource or a prior attempt did, the resource is absent and cached seed
+    // material must not survive a completed teardown.
     evict_kbs_cache_entry(state, resource_path).await;
-    Ok(())
+    Ok(erased)
 }
 
 #[cfg(test)]
