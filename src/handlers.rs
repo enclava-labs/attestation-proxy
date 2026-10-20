@@ -3595,8 +3595,8 @@ pub async fn teardown(
     // Delete seed-encrypted (required). A NotFound from the workload-resource
     // DELETE itself means a prior teardown already erased it (CAP retries
     // after transport timeouts) — the desired end state. The distinction is
-    // typed: only the DELETE's own 404 counts, so an attestation-fetch failure
-    // or any other upstream error still fails the teardown.
+    // typed: only the DELETE's own absence response counts, so an
+    // attestation-fetch failure or any other upstream error still fails.
     match kbs::delete_kbs_workload_resource(&state, &state.config.owner_seed_encrypted_kbs_path)
         .await
     {
@@ -9199,7 +9199,7 @@ mod tests {
         // the DELETE (e.g. the receipt-attestation fetch) or any other
         // upstream status must still fail the teardown — an unrelated 404
         // must never masquerade as erasure.
-        let delete_status = Arc::new(AtomicU16::new(404));
+        let delete_status = Arc::new(AtomicU16::new(412));
         let evidence_status = Arc::new(AtomicU16::new(200));
         let mock_delete_status = delete_status.clone();
         let mock_evidence_status = evidence_status.clone();
@@ -9227,7 +9227,8 @@ mod tests {
                         axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
                             .expect("valid mock status")
                     }
-                }),
+                })
+                .put(|| async { axum::http::StatusCode::PRECONDITION_FAILED }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9265,6 +9266,18 @@ mod tests {
         let body = read_json(response).await;
         assert_eq!(body["status"], "teardown_complete");
         assert_eq!(body["deleted"], json!(["seed-encrypted", "seed-sealed"]));
+
+        let write_error = kbs::put_kbs_workload_resource(
+            &state,
+            &state.config.owner_seed_encrypted_kbs_path,
+            b"ciphertext",
+            kbs::WorkloadResourceWriteMode::Create,
+        )
+        .await
+        .expect_err("a conditional PUT conflict must not count as absence");
+        assert!(write_error
+            .to_string()
+            .contains("kbs_workload_put_non_200:412:"));
 
         // A real upstream failure must still fail the teardown.
         delete_status.store(500, Ordering::SeqCst);

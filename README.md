@@ -123,6 +123,10 @@ Supported `receipt_type` values are `rekey`, `teardown`, and
 `receipt.signature`; `payload_canonical_bytes` is CE-v1 TLV and is the exact
 message signed by Ed25519.
 
+Teardown uses `DELETE` with `If-Match: *`. A KBS 404 or conditional 412 means
+the resource is already absent and completes deletion, including cache eviction.
+PUT conflicts, authorization failures and receipt-attestation failures still fail.
+
 ## Local development
 
 Run tests:
