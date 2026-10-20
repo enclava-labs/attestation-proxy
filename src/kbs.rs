@@ -328,11 +328,8 @@ pub enum WorkloadResourceWriteMode {
     Replace,
 }
 
-/// Whether a completed workload-resource request actually touched KBS. A 404
-/// from the workload-resource endpoint itself means the resource is absent —
-/// the desired end state for a retried DELETE. Only the request's own status
-/// maps here: anything failing before the request is sent (token, receipt
-/// attestation) and any other upstream status stays a hard error.
+/// A workload-resource 404, or DELETE's 412 with `If-Match: *`, means absent.
+/// Prerequisite failures and other upstream errors do not establish erasure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkloadResourceOutcome {
     Applied,
@@ -492,7 +489,7 @@ async fn send_workload_resource_request(
         if status.is_success() {
             return Ok(WorkloadResourceOutcome::Applied);
         }
-        if status.as_u16() == 404 {
+        if status.as_u16() == 404 || (operation == "delete" && status.as_u16() == 412) {
             return Ok(WorkloadResourceOutcome::NotFound);
         }
         if status.as_u16() == 401 {
@@ -583,8 +580,8 @@ pub async fn put_kbs_workload_resource(
 /// Uses DELETE /kbs/v0/workload-resource/{resource_path} with Bearer token auth.
 ///
 /// Returns `Ok(true)` when this call erased the resource and `Ok(false)` when
-/// the resource was already absent (the workload-resource DELETE's own 404) —
-/// which is the desired end state of an idempotent retry after a slow success.
+/// the resource was already absent (DELETE's own 404 or conditional 412).
+/// `If-Match: *` fails when the resource does not exist.
 /// Anything failing before the DELETE is issued (token, receipt attestation)
 /// and any other upstream status is a hard `Err`: only the DELETE's own
 /// response can prove the resource is gone.
