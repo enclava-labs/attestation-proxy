@@ -9225,7 +9225,9 @@ mod tests {
                     let status = mock_delete_status.clone();
                     async move {
                         assert_eq!(
-                            headers.get("if-match").and_then(|value| value.to_str().ok()),
+                            headers
+                                .get("if-match")
+                                .and_then(|value| value.to_str().ok()),
                             Some("*")
                         );
                         assert!(!headers.contains_key("if-none-match"));
