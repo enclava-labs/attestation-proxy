@@ -9221,9 +9221,14 @@ mod tests {
             )
             .route(
                 "/kbs/v0/workload-resource/{*path}",
-                axum::routing::delete(move || {
+                axum::routing::delete(move |headers: axum::http::HeaderMap| {
                     let status = mock_delete_status.clone();
                     async move {
+                        assert_eq!(
+                            headers.get("if-match").and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        assert!(!headers.contains_key("if-none-match"));
                         axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst))
                             .expect("valid mock status")
                     }
