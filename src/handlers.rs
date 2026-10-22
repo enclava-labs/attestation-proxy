@@ -861,25 +861,32 @@ const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_RECHECK_DELAY_MS: u64 = 2_000;
 
-// Error-path budget: a KBS-unreachable window (typically a trustee roll,
-// which takes ~10-30s+ to become ready) must be outlived or the boot latches
-// a terminal ownership error that only a pod reboot (or re-probe) clears.
+// Error-path budget: outlive a Trustee policy roll, then latch the explicit
+// ownership error. The wall-clock deadline and per-refresh cap keep the
+// bound finite: a stalling attempt cannot consume the whole window.
 #[cfg(test)]
-const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 4;
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 8;
 #[cfg(not(test))]
-const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 30;
+const OWNER_SEED_STARTUP_ERROR_ATTEMPTS: usize = 120;
 #[cfg(test)]
 const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_ERROR_DELAY_MS: u64 = 3_000;
-// Wall-clock bound for the same error path: upstream stalls (a KBS that
-// accepts connections but never answers) spend up to ~20s per CDH read plus
-// probe/token timeouts, so the attempt budget alone could hold startup (and
-// listener binding) open for tens of minutes.
 #[cfg(test)]
 const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 10_000;
 #[cfg(not(test))]
-const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 90_000;
+const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 300_000;
+#[cfg(test)]
+const OWNER_SEED_STARTUP_REFRESH_CAP_MS: u64 = 10_000;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_REFRESH_CAP_MS: u64 = 90_000;
+// Hard bound on the whole startup sequence: slow-but-successful unclaimed
+// polls restart the error window, so the sum of every refresh and retry is
+// clamped to this deadline from before the first refresh.
+#[cfg(test)]
+const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 10_000;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 480_000;
 #[cfg(test)]
 const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
@@ -1008,13 +1015,23 @@ async fn refresh_ownership_state(
     })
 }
 
-async fn maybe_refresh_unclaimed_state(state: &AppState) {
+async fn maybe_refresh_unclaimed_state(state: &AppState) -> Option<Response> {
     if !state.ownership.is_unclaimed() {
-        return;
+        return None;
     }
     if let Err(err) = refresh_ownership_state(state, true).await {
-        state.ownership.set_ownership_error(&err);
+        // A refresh that cannot finish must not answer with a state claim,
+        // but a transient dependency error (a Trustee roll) must not latch a
+        // healthy unclaimed pod terminal either: report the failure for this
+        // request and let the next poll re-check after the dependency
+        // returns. Startup and claim/write paths keep their own fail-closed
+        // budgets.
+        return Some(json_response(
+            503,
+            &json!({"error": "owner_seed_refresh_unavailable", "detail": err.to_string()}),
+        ));
     }
+    None
 }
 
 async fn load_owner_seed_material_with_revalidation(
@@ -1146,7 +1163,9 @@ pub async fn status(State(state): State<AppState>) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    maybe_refresh_unclaimed_state(&state).await;
+    if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
+        return refresh_failed;
+    }
     let mut body = state.ownership.state_json();
     let identity = fetch_ownership_identity(&state).await;
     body["instance_id"] = json!(state.config.instance_id);
@@ -1842,21 +1861,27 @@ pub async fn initialize_ownership_state(state: &AppState) {
     // error, not at loop entry: time spent in (even slow) successful
     // unclaimed polls must not shorten the error-retry window.
     let mut error_deadline: Option<tokio::time::Instant> = None;
+    // Hard bound on the whole sequence, set before the first refresh:
+    // slow-but-successful unclaimed polls restart the error window, so the
+    // sum of every refresh and retry clamps to this deadline.
+    let startup_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS);
     loop {
         // Independent budgets: unclaimed polls and error retries count
         // separately, so neither ordering of results shortens the other's
-        // budget. Every in-flight refresh is capped by the same duration —
+        // budget. Every in-flight refresh is capped by the per-refresh cap —
         // including the first, pre-error attempt — so a stalling upstream
         // (connections accepted, requests never answered) cannot stretch
         // startup past the bound even before any error has been returned;
         // once the error budget is set it binds tighter via min().
         let force_refresh = unclaimed_polls + error_attempts > 0;
         let attempt_cap = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS);
+            + std::time::Duration::from_millis(OWNER_SEED_STARTUP_REFRESH_CAP_MS);
         let refresh_deadline = match error_deadline {
             Some(budget) => attempt_cap.min(budget),
             None => attempt_cap,
-        };
+        }
+        .min(startup_deadline);
         let refreshed = match tokio::time::timeout_at(
             refresh_deadline,
             refresh_ownership_state(state, force_refresh),
@@ -1883,17 +1908,24 @@ pub async fn initialize_ownership_state(state: &AppState) {
                 {
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
-                ))
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(OWNER_SEED_STARTUP_RECHECK_DELAY_MS).min(
+                        startup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    ),
+                )
                 .await;
                 unclaimed_polls += 1;
             }
             Err(err) => {
                 let now = tokio::time::Instant::now();
-                let deadline = *error_deadline.get_or_insert(
-                    now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS),
-                );
+                let deadline = {
+                    let error_window = error_deadline.get_or_insert(
+                        now + std::time::Duration::from_millis(
+                            OWNER_SEED_STARTUP_ERROR_DEADLINE_MS,
+                        ),
+                    );
+                    (*error_window).min(startup_deadline)
+                };
                 if state.config.owner_ciphertext_backend == "kbs-resource"
                     && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
                     && now < deadline
@@ -2024,7 +2056,9 @@ pub async fn unlock(
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    maybe_refresh_unclaimed_state(&state).await;
+    if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
+        return refresh_failed;
+    }
     if state.ownership.is_unclaimed() {
         return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
     }
@@ -2804,7 +2838,9 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    maybe_refresh_unclaimed_state(&state).await;
+    if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
+        return refresh_failed;
+    }
     if !state.ownership.is_unclaimed() {
         return json_response(
             409,
@@ -2850,7 +2886,9 @@ pub async fn bootstrap_claim(
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
-    maybe_refresh_unclaimed_state(&state).await;
+    if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
+        return refresh_failed;
+    }
     if !state.ownership.is_unclaimed() {
         return json_response(
             409,
@@ -4015,6 +4053,358 @@ mod tests {
         );
     }
 
+    /// Password-mode state whose CDH passthrough stays reachable while the
+    /// direct KBS probe endpoint is a closed loopback port (transport-fails
+    /// on every poll).
+    fn state_with_unreachable_kbs_probe(
+        signal_dir: &Path,
+        base_url: String,
+        seed_path: &str,
+    ) -> AppState {
+        let mut state = build_state_with_mode(
+            signal_dir,
+            "password",
+            base_url,
+            Some(seed_path.to_string()),
+        );
+        let config = Arc::get_mut(&mut state.config).expect("unique config arc");
+        config.kbs_resource_url = "http://127.0.0.1:9/kbs/v0/resource".to_string();
+        state
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_recovers_absent_seed_after_sustained_outage() {
+        // Sustained outage, then a genuine 404: boot lands unclaimed, not
+        // latched.
+        let signal_dir = test_signal_dir("initialize-ownership-state-outage-absent");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let mut cdh = HashMap::new();
+        cdh.insert(seed_path.to_string(), vec![500; 6]);
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh,
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unclaimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_recovers_present_seed_after_sustained_outage() {
+        // Same outage, but the seed exists once the KBS returns: boot lands
+        // locked.
+        let signal_dir = test_signal_dir("initialize-ownership-state-outage-present");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let owner_seed = [0x77; 32];
+        let mut resources = HashMap::new();
+        resources.insert(
+            seed_path.to_string(),
+            owner_seed_envelope_json(owner_seed, "correct-password", "instance-test-01"),
+        );
+        let mut cdh = HashMap::new();
+        cdh.insert(seed_path.to_string(), vec![500; 6]);
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            resources,
+            cdh,
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("locked")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_latches_terminal_error_when_outage_exhausts_budget() {
+        // An outage that outlasts every poll stops within the bounded budget
+        // and latches the explicit ownership error instead of waiting forever.
+        let signal_dir = test_signal_dir("initialize-ownership-state-outage-exhaustion");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let mut cdh = HashMap::new();
+        cdh.insert(seed_path.to_string(), vec![500; 40]);
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh,
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("error")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_refresh_failure_does_not_latch_unclaimed_pod_and_recovers() {
+        // A poll in an unavailability window fails its request without
+        // latching the pod; the next poll after recovery serves the state.
+        let signal_dir = test_signal_dir("status-refresh-failure-no-latch");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let api_server = spawn_test_api_server_with_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        initialize_ownership_state(&state).await;
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unclaimed")
+        );
+
+        // The dependency goes down while the pod is serving.
+        api_server
+            .cdh_status_sequences
+            .lock()
+            .expect("cdh status sequence lock poisoned")
+            .insert(seed_path.to_string(), vec![500; 3]);
+        for _ in 0..3 {
+            let response = status(State(state.clone())).await;
+            assert_eq!(response.status().as_u16(), 503);
+            assert_eq!(
+                state
+                    .ownership
+                    .state_json()
+                    .get("state")
+                    .and_then(Value::as_str),
+                Some("unclaimed")
+            );
+        }
+
+        // The dependency returns: the next poll serves the legitimate state.
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("unclaimed"));
+    }
+
+    #[tokio::test]
+    async fn unclaimed_poll_denial_releases_no_state_or_challenge_until_legitimate_result() {
+        // While the direct probe reports denial (403), unclaimed polls must
+        // release neither a state answer nor a claim challenge; both flow
+        // only after the KBS returns a legitimate result (404, absent).
+        let signal_dir = test_signal_dir("status-denial-no-state-or-challenge");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let claims = test_identity_claims(&bootstrap_owner_pubkey_hash(&signing_key));
+        let api_server = spawn_test_api_server_with_kbs_direct_sequences(
+            owner_escrow_secret_json(None, None),
+            claims,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(seed_path.to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unclaimed")
+        );
+
+        // The probe starts denying the read (two status polls + two
+        // challenges, each consuming one CDH 500 + one probe 403).
+        api_server
+            .cdh_status_sequences
+            .lock()
+            .expect("cdh status sequence lock poisoned")
+            .insert(seed_path.to_string(), vec![500; 4]);
+        api_server
+            .kbs_direct_status_sequences
+            .lock()
+            .expect("kbs direct status sequence lock poisoned")
+            .insert(seed_path.to_string(), vec![403; 4]);
+        for _ in 0..2 {
+            let response = status(State(state.clone())).await;
+            assert_eq!(response.status().as_u16(), 503);
+            let response = bootstrap_challenge(State(state.clone())).await;
+            assert_eq!(response.status().as_u16(), 503);
+            let body = read_json(response).await;
+            assert!(
+                body.get("challenge").is_none(),
+                "a denied poll must not release a claim challenge"
+            );
+            assert_eq!(
+                state
+                    .ownership
+                    .state_json()
+                    .get("state")
+                    .and_then(Value::as_str),
+                Some("unclaimed")
+            );
+        }
+
+        // The legitimate result returns: polls and challenges flow again.
+        let response = status(State(state.clone())).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let response = bootstrap_challenge(State(state.clone())).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert!(body.get("challenge").is_some(), "challenge must be served");
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("unclaimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_ownership_state_permanent_kbs_denial_never_becomes_ready() {
+        // Persistent probe denial (403): the boot fails closed — the seed is
+        // never treated as absent or present.
+        let signal_dir = test_signal_dir("initialize-ownership-state-permanent-denial");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let mut cdh = HashMap::new();
+        cdh.insert(seed_path.to_string(), vec![500; 20]);
+        let mut direct = HashMap::new();
+        direct.insert(seed_path.to_string(), vec![403; 20]);
+        let api_server = spawn_test_api_server_with_kbs_direct_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            cdh,
+            HashMap::new(),
+            direct,
+        )
+        .await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            Some(seed_path.to_string()),
+        );
+
+        initialize_ownership_state(&state).await;
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("error")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_ownership_state_total_deadline_bounds_reset_compound() {
+        // Slow-but-successful unclaimed polls consume part of the total
+        // startup window; a subsequent failing refresh must latch the
+        // explicit error by the total deadline, not start a fresh full
+        // error window after the consumed time.
+        let signal_dir = test_signal_dir("initialize-ownership-state-total-deadline-compound");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let api_server = spawn_test_api_server_with_kbs_direct_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        // Each refresh reads two seed paths: four slow successful unclaimed
+        // polls (750ms per CDH call), then every further refresh fails
+        // slowly (2s per CDH call).
+        for _ in 0..20 {
+            api_server
+                .cdh_call_script
+                .lock()
+                .expect("cdh call script lock poisoned")
+                .push((2_000, 500));
+        }
+        for _ in 0..8 {
+            api_server
+                .cdh_call_script
+                .lock()
+                .expect("cdh call script lock poisoned")
+                .push((750, 404));
+        }
+
+        let started = tokio::time::Instant::now();
+        initialize_ownership_state(&state).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("error")
+        );
+        // The consumed successful-poll time must not be repaid with a fresh
+        // error window: latch within the total bound, well below the
+        // consumed window plus a full fresh error window.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(9),
+            "the slow successful polls must actually consume the window"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(13),
+            "latch must respect the total deadline including consumed time, took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn status_returns_documented_contract_fields() {
         let signal_dir = test_signal_dir("status-contract");
@@ -4115,7 +4505,14 @@ mod tests {
         prefix: &str,
         ready_contents: Option<&[u8]>,
         error_contents: Option<&[u8]>,
-    ) -> (AppState, PathBuf, PathBuf, TestSignalDir, TestTempFile) {
+    ) -> (
+        AppState,
+        PathBuf,
+        PathBuf,
+        TestSignalDir,
+        TestTempFile,
+        TestApiServer,
+    ) {
         let signal_dir = test_signal_dir(prefix);
         let signing_key = SigningKey::from_bytes(&[31u8; 32]);
         let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
@@ -4150,15 +4547,18 @@ mod tests {
                 .await
                 .expect("write init error file");
         }
-        // The cleanup guards are returned so they stay alive for the
-        // caller's status call and remove the temp paths (including any
-        // FIFO) when the test finishes, on success or panic.
-        (state, ready_path, error_path, signal_dir, token_file)
+        // Cleanup guards stay alive so the temp paths (including any FIFO)
+        // outlive the caller's status call. The mock API server is returned
+        // too: dropping it aborts the server task, and the caller's status
+        // refresh must hit a live dependency.
+        (
+            state, ready_path, error_path, signal_dir, token_file, api_server,
+        )
     }
 
     #[tokio::test]
     async fn status_reports_structured_bootstrap_error_while_not_ready() {
-        let (state, _ready_path, _error_path, _signal_dir, _token_file) = status_test_state_with_init_files(
+        let (state, _ready_path, _error_path, _signal_dir, _token_file, _api_server) = status_test_state_with_init_files(
             "status-bootstrap-error",
             Some(b"not-ready\n"),
             Some(
@@ -4221,7 +4621,7 @@ mod tests {
             b"luks_open_failed: SECRET-SYNTHETIC-PROSE /dev/csi0\n",
         ];
         for (index, error_contents) in cases.iter().enumerate() {
-            let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+            let (state, _ready_path, _error_path, _signal_dir, _token_file, _api_server) =
                 status_test_state_with_init_files(
                     &format!("status-bootstrap-generic-{index}"),
                     Some(b"not-ready\n"),
@@ -4260,7 +4660,7 @@ mod tests {
             br#"{"error":"acme_rate_limited","terminal":true,"retry_after":42}"#,
         ];
         for (index, error_contents) in cases.iter().enumerate() {
-            let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+            let (state, _ready_path, _error_path, _signal_dir, _token_file, _api_server) =
                 status_test_state_with_init_files(
                     &format!("status-bootstrap-null-deadline-{index}"),
                     Some(b"not-ready\n"),
@@ -4296,7 +4696,7 @@ mod tests {
             br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2026-09-09T12:34:56Z","detail":"SECRET-SYNTHETIC-PROSE"}"#
                 .to_vec();
         error_contents.resize(INIT_ERROR_MAX_BYTES + 5000, b' ');
-        let (state, _ready_path, _error_path, _signal_dir, _token_file) =
+        let (state, _ready_path, _error_path, _signal_dir, _token_file, _api_server) =
             status_test_state_with_init_files(
                 "status-bootstrap-oversized",
                 Some(b"not-ready\n"),
@@ -4322,7 +4722,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_bootstrap_error_unreadable_file_is_generic_failure() {
-        let (state, _ready_path, error_path, _signal_dir, _token_file) =
+        let (state, _ready_path, error_path, _signal_dir, _token_file, _api_server) =
             status_test_state_with_init_files("status-bootstrap-unreadable", None, None).await;
         tokio::fs::create_dir(&error_path)
             .await
@@ -4343,7 +4743,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_has_no_bootstrap_error_without_error_file() {
-        let (state, ready_path, _error_path, _signal_dir, _token_file) =
+        let (state, ready_path, _error_path, _signal_dir, _token_file, _api_server) =
             status_test_state_with_init_files(
                 "status-bootstrap-absent",
                 Some(b"not-ready\n"),
@@ -4363,7 +4763,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_suppresses_stale_bootstrap_error_once_ready() {
-        let (state, ready_path, _error_path, _signal_dir, _token_file) = status_test_state_with_init_files(
+        let (state, ready_path, _error_path, _signal_dir, _token_file, _api_server) = status_test_state_with_init_files(
             "status-bootstrap-ready",
             None,
             Some(
@@ -4466,7 +4866,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_suppresses_error_when_readiness_appears_during_error_probe() {
-        let (state, ready_path, error_path, _signal_dir, _token_file) =
+        let (state, ready_path, error_path, _signal_dir, _token_file, _api_server) =
             status_test_state_with_init_files("status-bootstrap-probe-race", None, None).await;
 
         let status_task = tokio::spawn(async move { status(State(state)).await });
@@ -7545,6 +7945,10 @@ mod tests {
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
         cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
         workload_resource_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        kbs_direct_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        /// Per-CDH-call script of (delay_ms, status), consumed in order;
+        /// empty means the normal resource/sequence behavior.
+        cdh_call_script: Arc<Mutex<Vec<(u64, u16)>>>,
     }
 
     struct TestApiServer {
@@ -7553,6 +7957,9 @@ mod tests {
         aa_evidence_runtime_data: Arc<Mutex<Vec<String>>>,
         owner_secret: Arc<Mutex<Value>>,
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
+        cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        kbs_direct_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        cdh_call_script: Arc<Mutex<Vec<(u64, u16)>>>,
     }
 
     impl TestApiServer {
@@ -7614,6 +8021,20 @@ mod tests {
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
     ) -> impl IntoResponse {
+        let scripted = state
+            .cdh_call_script
+            .lock()
+            .expect("cdh call script lock poisoned")
+            .pop();
+        if let Some((delay_ms, status)) = scripted {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            return (
+                StatusCode::from_u16(status).expect("valid scripted status"),
+                Json(json!({"error": "scripted"})),
+            )
+                .into_response();
+        }
+
         if let Some(status) = state
             .cdh_status_sequences
             .lock()
@@ -7648,6 +8069,26 @@ mod tests {
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
     ) -> impl IntoResponse {
+        if let Some(status) = state
+            .kbs_direct_status_sequences
+            .lock()
+            .expect("kbs direct status sequence lock poisoned")
+            .get_mut(&path)
+            .and_then(|statuses| {
+                if statuses.is_empty() {
+                    None
+                } else {
+                    Some(statuses.remove(0))
+                }
+            })
+        {
+            return (
+                StatusCode::from_u16(status).expect("valid direct kbs status"),
+                Json(json!({"error": "direct_kbs_transient"})),
+            )
+                .into_response();
+        }
+
         let resources = state
             .kbs_resources
             .lock()
@@ -7900,18 +8341,42 @@ mod tests {
         cdh_status_sequences: HashMap<String, Vec<u16>>,
         workload_resource_status_sequences: HashMap<String, Vec<u16>>,
     ) -> TestApiServer {
+        spawn_test_api_server_with_kbs_direct_sequences(
+            owner_secret,
+            aa_claims,
+            kbs_resources,
+            cdh_status_sequences,
+            workload_resource_status_sequences,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    async fn spawn_test_api_server_with_kbs_direct_sequences(
+        owner_secret: Value,
+        aa_claims: Value,
+        kbs_resources: HashMap<String, String>,
+        cdh_status_sequences: HashMap<String, Vec<u16>>,
+        workload_resource_status_sequences: HashMap<String, Vec<u16>>,
+        kbs_direct_status_sequences: HashMap<String, Vec<u16>>,
+    ) -> TestApiServer {
         let owner_secret = Arc::new(Mutex::new(owner_secret));
         let kbs_resources = Arc::new(Mutex::new(kbs_resources));
         let aa_evidence_runtime_data = Arc::new(Mutex::new(Vec::new()));
+        let cdh_status_sequences = Arc::new(Mutex::new(cdh_status_sequences));
+        let kbs_direct_status_sequences = Arc::new(Mutex::new(kbs_direct_status_sequences));
+        let cdh_call_script = Arc::new(Mutex::new(Vec::new()));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
             aa_evidence_runtime_data: aa_evidence_runtime_data.clone(),
             owner_secret: owner_secret.clone(),
             kbs_resources: kbs_resources.clone(),
-            cdh_status_sequences: Arc::new(Mutex::new(cdh_status_sequences)),
+            cdh_status_sequences: cdh_status_sequences.clone(),
             workload_resource_status_sequences: Arc::new(Mutex::new(
                 workload_resource_status_sequences,
             )),
+            kbs_direct_status_sequences: kbs_direct_status_sequences.clone(),
+            cdh_call_script: cdh_call_script.clone(),
         };
         let router = Router::new()
             .route(
@@ -7942,6 +8407,9 @@ mod tests {
             aa_evidence_runtime_data,
             owner_secret,
             kbs_resources,
+            cdh_status_sequences,
+            kbs_direct_status_sequences,
+            cdh_call_script,
         }
     }
 
