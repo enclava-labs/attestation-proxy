@@ -149,6 +149,21 @@ When Trustee KBS is exposed over an internal CA, set `KBS_RESOURCE_URL` to the
 HTTPS `/kbs/v0/resource` endpoint and provide either `KBS_RESOURCE_CA_CERT_PEM`
 or `KBS_RESOURCE_CA_CERT_PATH`.
 
+### Ownership reads during KBS unavailability
+
+A Trustee policy roll makes the KBS resource endpoint briefly unreachable.
+At startup the ownership probe retries inside a bounded window (attempt
+count, per-refresh cap, wall-clock deadline — worst case ~390s before the
+explicit terminal ownership error, within the CLI's 600s per-phase and 900s
+deploy health budgets). While the pod is unclaimed, any status/claim/unlock
+poll whose ownership re-check cannot complete is answered with
+`503 owner_seed_refresh_unavailable` and the pod stays unclaimed: a failed
+check never serves a state answer and never releases a claim challenge or
+seed material, whether the dependency is unavailable or denying the read.
+Permanent request-path denials therefore never release a challenge or seed;
+they persist as 503s until the KBS returns a legitimate result, while a
+boot-time denial is latched terminal by the startup budget.
+
 ## Container image
 
 Build the container image:
