@@ -4342,6 +4342,69 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn initialize_ownership_state_total_deadline_bounds_reset_compound() {
+        // Slow-but-successful unclaimed polls consume part of the total
+        // startup window; a subsequent failing refresh must latch the
+        // explicit error by the total deadline, not start a fresh full
+        // error window after the consumed time.
+        let signal_dir = test_signal_dir("initialize-ownership-state-total-deadline-compound");
+        let seed_path = "default/instance-test-01-owner/seed-encrypted";
+        let api_server = spawn_test_api_server_with_kbs_direct_sequences(
+            owner_escrow_secret_json(None, None),
+            json!({}),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .await;
+        let state =
+            state_with_unreachable_kbs_probe(&signal_dir.path, api_server.base_url(), seed_path);
+
+        // Each refresh reads two seed paths: four slow successful unclaimed
+        // polls (750ms per CDH call), then every further refresh fails
+        // slowly (2s per CDH call).
+        for _ in 0..20 {
+            api_server
+                .cdh_call_script
+                .lock()
+                .expect("cdh call script lock poisoned")
+                .push((2_000, 500));
+        }
+        for _ in 0..8 {
+            api_server
+                .cdh_call_script
+                .lock()
+                .expect("cdh call script lock poisoned")
+                .push((750, 404));
+        }
+
+        let started = tokio::time::Instant::now();
+        initialize_ownership_state(&state).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("error")
+        );
+        // The consumed successful-poll time must not be repaid with a fresh
+        // error window: latch within the total bound, well below the
+        // consumed window plus a full fresh error window.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(9),
+            "the slow successful polls must actually consume the window"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(13),
+            "latch must respect the total deadline including consumed time, took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn status_returns_documented_contract_fields() {
         let signal_dir = test_signal_dir("status-contract");
@@ -7883,6 +7946,9 @@ mod tests {
         cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
         workload_resource_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
         kbs_direct_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        /// Per-CDH-call script of (delay_ms, status), consumed in order;
+        /// empty means the normal resource/sequence behavior.
+        cdh_call_script: Arc<Mutex<Vec<(u64, u16)>>>,
     }
 
     struct TestApiServer {
@@ -7893,6 +7959,7 @@ mod tests {
         kbs_resources: Arc<Mutex<HashMap<String, String>>>,
         cdh_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
         kbs_direct_status_sequences: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+        cdh_call_script: Arc<Mutex<Vec<(u64, u16)>>>,
     }
 
     impl TestApiServer {
@@ -7954,6 +8021,20 @@ mod tests {
         AxumState(state): AxumState<TestApiState>,
         AxumPath(path): AxumPath<String>,
     ) -> impl IntoResponse {
+        let scripted = state
+            .cdh_call_script
+            .lock()
+            .expect("cdh call script lock poisoned")
+            .pop();
+        if let Some((delay_ms, status)) = scripted {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            return (
+                StatusCode::from_u16(status).expect("valid scripted status"),
+                Json(json!({"error": "scripted"})),
+            )
+                .into_response();
+        }
+
         if let Some(status) = state
             .cdh_status_sequences
             .lock()
@@ -8284,6 +8365,7 @@ mod tests {
         let aa_evidence_runtime_data = Arc::new(Mutex::new(Vec::new()));
         let cdh_status_sequences = Arc::new(Mutex::new(cdh_status_sequences));
         let kbs_direct_status_sequences = Arc::new(Mutex::new(kbs_direct_status_sequences));
+        let cdh_call_script = Arc::new(Mutex::new(Vec::new()));
         let state = TestApiState {
             aa_token_response: json!({ "token": jwt_for_claims(&aa_claims) }),
             aa_evidence_runtime_data: aa_evidence_runtime_data.clone(),
@@ -8294,6 +8376,7 @@ mod tests {
                 workload_resource_status_sequences,
             )),
             kbs_direct_status_sequences: kbs_direct_status_sequences.clone(),
+            cdh_call_script: cdh_call_script.clone(),
         };
         let router = Router::new()
             .route(
@@ -8326,6 +8409,7 @@ mod tests {
             kbs_resources,
             cdh_status_sequences,
             kbs_direct_status_sequences,
+            cdh_call_script,
         }
     }
 
