@@ -153,9 +153,10 @@ or `KBS_RESOURCE_CA_CERT_PATH`.
 
 A Trustee policy roll makes the KBS resource endpoint briefly unreachable.
 At startup the ownership probe retries inside a bounded window (attempt
-count, per-refresh cap, wall-clock deadline — worst case ~390s before the
-explicit terminal ownership error, within the CLI's 600s per-phase and 900s
-deploy health budgets). While the pod is unclaimed, any status/claim/unlock
+count, per-refresh cap, wall-clock deadline) under a hard total startup
+deadline of 480s that bounds the whole sequence before the explicit
+terminal ownership error — within the CLI's 600s per-phase and 900s
+deploy health budgets. While the pod is unclaimed, any status/claim/unlock
 poll whose ownership re-check cannot complete is answered with
 `503 owner_seed_refresh_unavailable` and the pod stays unclaimed: a failed
 check never serves a state answer and never releases a claim challenge or

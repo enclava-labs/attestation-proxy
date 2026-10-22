@@ -880,6 +880,13 @@ const OWNER_SEED_STARTUP_ERROR_DEADLINE_MS: u64 = 300_000;
 const OWNER_SEED_STARTUP_REFRESH_CAP_MS: u64 = 10_000;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_REFRESH_CAP_MS: u64 = 90_000;
+// Hard bound on the whole startup sequence: slow-but-successful unclaimed
+// polls restart the error window, so the sum of every refresh and retry is
+// clamped to this deadline from before the first refresh.
+#[cfg(test)]
+const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 10_000;
+#[cfg(not(test))]
+const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 480_000;
 #[cfg(test)]
 const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
@@ -1854,6 +1861,11 @@ pub async fn initialize_ownership_state(state: &AppState) {
     // error, not at loop entry: time spent in (even slow) successful
     // unclaimed polls must not shorten the error-retry window.
     let mut error_deadline: Option<tokio::time::Instant> = None;
+    // Hard bound on the whole sequence, set before the first refresh:
+    // slow-but-successful unclaimed polls restart the error window, so the
+    // sum of every refresh and retry clamps to this deadline.
+    let startup_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS);
     loop {
         // Independent budgets: unclaimed polls and error retries count
         // separately, so neither ordering of results shortens the other's
@@ -1868,7 +1880,8 @@ pub async fn initialize_ownership_state(state: &AppState) {
         let refresh_deadline = match error_deadline {
             Some(budget) => attempt_cap.min(budget),
             None => attempt_cap,
-        };
+        }
+        .min(startup_deadline);
         let refreshed = match tokio::time::timeout_at(
             refresh_deadline,
             refresh_ownership_state(state, force_refresh),
@@ -1895,17 +1908,24 @@ pub async fn initialize_ownership_state(state: &AppState) {
                 {
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    OWNER_SEED_STARTUP_RECHECK_DELAY_MS,
-                ))
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(OWNER_SEED_STARTUP_RECHECK_DELAY_MS).min(
+                        startup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    ),
+                )
                 .await;
                 unclaimed_polls += 1;
             }
             Err(err) => {
                 let now = tokio::time::Instant::now();
-                let deadline = *error_deadline.get_or_insert(
-                    now + std::time::Duration::from_millis(OWNER_SEED_STARTUP_ERROR_DEADLINE_MS),
-                );
+                let deadline = {
+                    let error_window = error_deadline.get_or_insert(
+                        now + std::time::Duration::from_millis(
+                            OWNER_SEED_STARTUP_ERROR_DEADLINE_MS,
+                        ),
+                    );
+                    (*error_window).min(startup_deadline)
+                };
                 if state.config.owner_ciphertext_backend == "kbs-resource"
                     && error_attempts + 1 < OWNER_SEED_STARTUP_ERROR_ATTEMPTS
                     && now < deadline
