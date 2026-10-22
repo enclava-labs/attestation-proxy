@@ -1180,7 +1180,13 @@ pub async fn status(State(state): State<AppState>) -> Response {
     let config_ready =
         crate::config_store::is_config_ready(std::path::Path::new(&state.config.cap_config_dir));
     body["config_ready"] = json!(config_ready);
-    if let Some(bootstrap_error) = bootstrap_error_for_status(&state).await {
+    // Init diagnostics may outlive an attempt; readiness suppresses stale
+    // metadata.
+    let (last_init_stage, bootstrap_error) = bootstrap_diagnostics_for_status(&state).await;
+    if let Some(stage) = last_init_stage {
+        body["last_init_stage"] = json!(stage);
+    }
+    if let Some(bootstrap_error) = bootstrap_error {
         body["bootstrap_error"] = bootstrap_error;
     }
     // A live ACME certificate cooldown is observable, non-terminal state:
@@ -1206,6 +1212,29 @@ const INIT_ERROR_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 60;
 const INIT_ERROR_CODE_RATE_LIMITED: &str = "acme_rate_limited";
 const INIT_ERROR_CODE_CERTIFICATE_ISSUANCE_FAILED: &str = "acme_certificate_issuance_failed";
 const INIT_ERROR_CODE_INIT_FAILED: &str = "enclava_init_failed";
+
+/// Maximum number of bytes ever read from the enclava-init stage file. The
+/// producer writes one short fixed phrase plus a newline; anything larger is
+/// out of contract and never surfaced.
+const INIT_STAGE_MAX_BYTES: usize = 256;
+/// The exact fixed-vocabulary phases enclava-init records via `record_stage`
+/// (atomic write of `<phase>\n` to the stage file), in boot order. Only an
+/// exact byte match of `<phase>\n` is surfaced; anything else — unknown,
+/// malformed, overlong, dynamic, or non-UTF-8 content — is never echoed.
+const INIT_STAGE_VOCABULARY: [&str; 12] = [
+    "loading config",
+    "validating signed config",
+    "verifying trustee policy",
+    "waiting for owner seed",
+    "opening luks volumes",
+    "preparing mount ownership",
+    "provisioning static tls certificate",
+    "writing component seeds",
+    "waiting for workload containers",
+    "binding workload mount namespaces",
+    "seeding caddy runtime handoff",
+    "marking ready",
+];
 
 /// Structured bootstrap init-failure diagnostic surfaced via `/status` while
 /// enclava-init is not ready. Contains only recognized exact codes and a
@@ -1443,31 +1472,81 @@ async fn probe_init_error_file(path: &str) -> InitErrorFileProbe {
     InitErrorFileProbe::Loaded(bytes)
 }
 
-/// Optional bounded bootstrap diagnostic for `/status`, included only while
-/// the enclava-init ready sentinel does not report ready, so a ready process
-/// never reports a stale `bootstrap_error`. The error file is probed first
-/// and readiness is the FINAL observation: if init finishes while the error
-/// probe is in flight, the recorded error is stale and suppressed. An absent
-/// error file yields no diagnostic; unreadable, oversized, legacy, or
-/// malformed content collapses to the generic terminal failure without
-/// echoing raw file bytes.
-async fn bootstrap_error_for_status(state: &AppState) -> Option<Value> {
-    let error_file = state.config.enclava_init_error_file.trim();
-    if error_file.is_empty() {
-        return None;
-    }
-    let diagnostic = match probe_init_error_file(error_file).await {
-        InitErrorFileProbe::Absent => return None,
-        InitErrorFileProbe::Unreadable | InitErrorFileProbe::Oversized => {
-            BootstrapInitError::generic().status_json()
-        }
-        InitErrorFileProbe::Loaded(bytes) => parse_bootstrap_init_error(&bytes).status_json(),
-    };
+/// One status read of the bootstrap diagnostics. An already-ready process
+/// performs no stage or error I/O at all; otherwise it runs the bounded
+/// error probe and a single stage-file read shared by both JSON surfaces,
+/// with readiness as the FINAL observation after every awaited read — init
+/// finishing while the reads are in flight suppresses both stale
+/// diagnostics. Returns `(last_init_stage, bootstrap_error)`.
+async fn bootstrap_diagnostics_for_status(
+    state: &AppState,
+) -> (Option<&'static str>, Option<Value>) {
     let ready_file = state.config.enclava_init_ready_file.trim();
     if !ready_file.is_empty() && enclava_init_ready_file_is_ready(state).await == Ok(true) {
+        return (None, None);
+    }
+    let error_file = state.config.enclava_init_error_file.trim();
+    let diagnostic = if error_file.is_empty() {
+        None
+    } else {
+        match probe_init_error_file(error_file).await {
+            InitErrorFileProbe::Absent => None,
+            InitErrorFileProbe::Unreadable | InitErrorFileProbe::Oversized => {
+                Some(BootstrapInitError::generic().status_json())
+            }
+            InitErrorFileProbe::Loaded(bytes) => {
+                Some(parse_bootstrap_init_error(&bytes).status_json())
+            }
+        }
+    };
+    let stage = read_init_stage(state).await;
+    if !ready_file.is_empty() && enclava_init_ready_file_is_ready(state).await == Ok(true) {
+        return (None, None);
+    }
+    let mut diagnostic = diagnostic;
+    if let (Some(stage), Some(diagnostic)) = (stage, diagnostic.as_mut()) {
+        diagnostic["last_init_stage"] = json!(stage);
+    }
+    (stage, diagnostic)
+}
+
+/// The stage file shares the init surface directory with the ready
+/// sentinel.
+fn init_stage_file_from_ready(ready_file: &str) -> Option<std::path::PathBuf> {
+    let parent = std::path::Path::new(ready_file).parent()?;
+    if parent.as_os_str().is_empty() {
         return None;
     }
-    Some(diagnostic)
+    Some(parent.join("init-stage"))
+}
+
+/// The last recorded enclava-init stage, from an exact
+/// `<fixed phrase>\n` byte match of the bounded stage file: unknown,
+/// malformed, oversized, or non-UTF-8 content is never surfaced. The file
+/// persists across init container restarts within the pod, so the phase is
+/// a LAST RECORDED step that may be from a previous attempt — never
+/// current truth, never a readiness or security input.
+async fn read_init_stage(state: &AppState) -> Option<&'static str> {
+    let ready_file = state.config.enclava_init_ready_file.trim();
+    let stage_file = init_stage_file_from_ready(ready_file)?;
+    let mut file = tokio::fs::File::open(stage_file).await.ok()?;
+    let mut bytes = [0u8; INIT_STAGE_MAX_BYTES + 1];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let read = file.read(&mut bytes[filled..]).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    if filled > INIT_STAGE_MAX_BYTES {
+        return None;
+    }
+    let staged = bytes[..filled].strip_suffix(b"\n")?;
+    INIT_STAGE_VOCABULARY
+        .iter()
+        .find(|phase| phase.as_bytes() == staged)
+        .copied()
 }
 
 /// GET /v1/attestation/info
@@ -4557,6 +4636,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_last_init_stage_for_slow_and_fatal_bootstrap_states() {
+        // A recorded stage surfaces as an unattributed LAST RECORDED phase
+        // both on the status body (ongoing stall) and inside the existing
+        // generic bootstrap_error object (fatal), never replacing the error.
+        let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-init-stage-valid",
+            None,
+            Some(br#"{"error":"enclava_init_failed","terminal":true}"#),
+        )
+        .await;
+        fs::write(
+            init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived"),
+            "waiting for owner seed\n",
+        )
+        .expect("write stage file");
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("last_init_stage").and_then(Value::as_str),
+            Some("waiting for owner seed")
+        );
+        let boot = body
+            .get("bootstrap_error")
+            .expect("generic failure must stay present");
+        assert_eq!(
+            boot.get("error").and_then(Value::as_str),
+            Some("enclava_init_failed")
+        );
+        assert_eq!(
+            boot.get("last_init_stage").and_then(Value::as_str),
+            Some("waiting for owner seed")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_never_echoes_unrecognized_init_stage_content() {
+        // Only an exact `<fixed phase>\n` byte match is surfaced. Unknown
+        // phrases, host-controlled dynamic details, a missing trailing
+        // newline, multi-line content, non-UTF-8 bytes, and overlong files
+        // are all absent from the response; the generic failure is unchanged.
+        let overlong = vec![b'x'; 300];
+        let contents: Vec<&[u8]> = vec![
+            b"host controlled dynamic detail #4711",
+            b"waiting for owner seed",
+            b"marking ready\ntrailing garbage\n",
+            &[0xff, 0xfe, b'a', b'\n'],
+            &overlong,
+        ];
+        for content in contents {
+            let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+                "status-init-stage-malformed",
+                None,
+                Some(br#"{"error":"enclava_init_failed","terminal":true}"#),
+            )
+            .await;
+            fs::write(
+                init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived"),
+                content,
+            )
+            .expect("write stage file");
+
+            let response = status(State(state)).await;
+            assert_eq!(response.status().as_u16(), 200);
+            let body = read_json(response).await;
+            assert!(
+                body.get("last_init_stage").is_none(),
+                "unrecognized stage content must not surface: {content:?}"
+            );
+            let boot = body.get("bootstrap_error").expect("generic failure kept");
+            assert_eq!(
+                boot.get("error").and_then(Value::as_str),
+                Some("enclava_init_failed")
+            );
+            assert!(boot.get("last_init_stage").is_none());
+            assert!(
+                !body.to_string().contains("host controlled"),
+                "raw stage content must never be echoed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_omits_init_stage_once_ready() {
+        // A ready boot serves no stage diagnostic and skips the stage-file
+        // read entirely.
+        let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-init-stage-ready",
+            Some(b"ready\n"),
+            Some(br#"{"error":"enclava_init_failed","terminal":true}"#),
+        )
+        .await;
+        fs::write(
+            init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived"),
+            "marking ready\n",
+        )
+        .expect("write stage file");
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert!(body.get("last_init_stage").is_none());
+        assert!(body.get("bootstrap_error").is_none());
+    }
+
+    #[tokio::test]
     async fn status_reports_structured_bootstrap_error_while_not_ready() {
         let (state, _ready_path, _error_path, _signal_dir, _token_file, _api_server) = status_test_state_with_init_files(
             "status-bootstrap-error",
@@ -4893,6 +5079,47 @@ mod tests {
         assert!(
             body.get("bootstrap_error").is_none(),
             "readiness observed after the error probe must suppress the stale terminal error: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_readiness_during_stage_read_suppresses_stage_and_error_together() {
+        // Readiness appearing while the STAGE read is parked is still the
+        // final observation: the fixed phrase released afterwards and the
+        // recorded generic error are both suppressed.
+        let (state, ready_path, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-stage-read-race",
+            None,
+            Some(br#"{"error":"enclava_init_failed","terminal":true}"#),
+        )
+        .await;
+        let stage_path =
+            init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived");
+
+        let status_task = tokio::spawn(async move { status(State(state)).await });
+        // Same rendezvous fixture as the error-probe race, parked on the
+        // stage FIFO instead.
+        let (mut writer, status_task) =
+            rendezvous_with_error_probe(status_task, &stage_path, Duration::from_secs(5)).await;
+        tokio::fs::write(&ready_path, b"ready\n")
+            .await
+            .expect("mark init ready while the stage read is parked");
+        std::io::Write::write_all(&mut writer, b"waiting for owner seed\n")
+            .expect("release the fixed phrase");
+        drop(writer);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), status_task)
+            .await
+            .expect("status completes")
+            .expect("status task");
+        let body = read_json(response).await;
+        assert!(
+            body.get("last_init_stage").is_none(),
+            "readiness observed after the stage read must suppress the phase: {body}"
+        );
+        assert!(
+            body.get("bootstrap_error").is_none(),
+            "readiness observed after the reads must suppress the error too: {body}"
         );
     }
 
