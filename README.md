@@ -59,6 +59,25 @@ a stale `bootstrap_error`, and recovery clears the stale error file before
 sending a new owner seed. The diagnostic is informational only and grants no
 authorization.
 
+### Last recorded init stage
+
+While enclava-init has not reported ready, `GET /status` may additionally
+include `last_init_stage`: the last phase recorded by enclava-init in its
+fixed-vocabulary stage file (for example `"waiting for owner seed"`). The
+same allowlisted phase is attached as `last_init_stage` inside the
+`bootstrap_error` object while a recorded failure is reported. The field is
+an unattributed diagnostic only: the stage file persists across init
+container restarts within the pod, so the phase may be from a previous
+attempt; it names a LAST RECORDED step, never current truth, carries no
+causality for the failure, and never feeds readiness or security decisions.
+Only an exact match of the fixed producer vocabulary is ever surfaced —
+unknown, malformed, oversized, or non-UTF-8 stage content is omitted, never
+echoed. A ready process serves no stage diagnostic and skips the stage-file
+read. The stage path is derived from the ready sentinel path (producer
+defaults `/run/enclava/init-ready` and `/run/enclava/init-stage` share the
+init surface directory); an empty ready path disables the readiness
+feature and with it this diagnostic.
+
 ## Attestation REPORT_DATA binding
 
 `GET /v1/attestation` rejects caller-supplied `runtime_data`. Because this
