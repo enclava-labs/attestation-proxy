@@ -2356,7 +2356,7 @@ async fn unlock_owner_seed_material(
     let outcome = state
         .ownership
         .poll_password_handoff_result_for_slots(&slots, unlock_poll_timeout_seconds())?;
-    render_password_handoff_outcome(state, outcome, owner_seed).await
+    render_password_handoff_outcome(state, outcome)
 }
 
 async fn unlock_owner_seed_via_init_socket(
@@ -2743,10 +2743,9 @@ async fn finalize_rewrapped_owner_seed(
     unlock_owner_seed_material(state, owner_seed).await
 }
 
-async fn render_password_handoff_outcome(
+fn render_password_handoff_outcome(
     state: &AppState,
     outcome: HandoffOutcome,
-    owner_seed: &[u8; 32],
 ) -> Result<Option<String>, OwnershipError> {
     match outcome {
         HandoffOutcome::Unlocked => {

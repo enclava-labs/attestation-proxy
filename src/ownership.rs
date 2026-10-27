@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 pub const UNLOCK_MAX_ATTEMPTS: usize = 5;
 pub const UNLOCK_WINDOW_SECONDS: u64 = 60;
