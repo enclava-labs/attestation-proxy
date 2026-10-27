@@ -355,12 +355,8 @@ impl OwnershipGuard {
         observation: OwnershipObservation,
     ) -> RecoveryClaim {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
-        // Only the password envelope is resumable ownership material.
-        // Auto-unlock is hard-disabled: a sealed-only legacy instance is
-        // never resumed from the seal (that would re-arm automatic
-        // unsealing) — it resolves through mnemonic recovery or explicit
-        // cleanup instead.
-        if observation.encrypted_present {
+        // A legacy seal still proves ownership; it must never reopen claim.
+        if observation.encrypted_present || observation.sealed_present {
             match machine.state {
                 OwnershipState::Locked => {
                     machine.unlock_generation += 1;
@@ -370,19 +366,6 @@ impl OwnershipGuard {
                 }
                 _ => RecoveryClaim::Conflict,
             }
-        } else if observation.sealed_present
-            && matches!(
-                machine.state,
-                OwnershipState::Locked | OwnershipState::Unlocking
-            )
-        {
-            // A legacy seal without a password envelope: fail closed as
-            // locked — the only existing seed material must never become
-            // claimable or be silently replaced; the unlock path answers
-            // with a recovery requirement.
-            machine.state = OwnershipState::Locked;
-            machine.error = None;
-            RecoveryClaim::UnlockReservation
         } else if matches!(machine.state, OwnershipState::Unlocking)
             && machine.unlock_generation == generation
         {

@@ -9417,14 +9417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_claim_fails_closed_on_sealed_seed_only() {
-        // Torn state: the encrypted envelope is gone but the sealed seed
-        // remains. Auto-unlock is hard-disabled, so the recovery probe must
-        // NOT resume from the seal (that would silently re-arm automatic
-        // unsealing) and must NOT mark the instance claimable (a fresh
-        // claim would overwrite the only existing seed): the claim resolves
-        // to a locked unlock reservation whose password path answers with a
-        // recovery requirement.
+    async fn recovery_claim_reserves_sealed_only_material() {
         let signal_dir = test_signal_dir("claim-sealed-only");
         let state = build_state_with_mode(
             &signal_dir.path,
@@ -9455,15 +9448,17 @@ mod tests {
             ),
             RecoveryClaim::UnlockReservation
         );
-        assert!(state.ownership.is_locked());
+        assert!(state.ownership.is_unlocking());
+        assert!(matches!(
+            state.ownership.begin_unlock_attempt(),
+            Err(OwnershipError::NotLocked)
+        ));
 
-        // The cancellation guard must not resurrect a reservation: the
-        // machine is locked, not a bare Unlocking reservation.
         drop(RecoveryCancelGuard {
             ownership: state.ownership.clone(),
             generation,
         });
-        assert!(state.ownership.is_locked());
+        assert!(state.ownership.is_unlocking());
     }
 
     #[tokio::test]
@@ -9536,86 +9531,88 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_claim_does_not_clobber_a_concurrent_unlock_reservation() {
-        let signal_dir = test_signal_dir("recovery-claim-race");
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "password",
-            "http://127.0.0.1:9".to_string(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        state
-            .ownership
-            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
-                "owner_seed_probe_unexpected_status:400".to_string(),
-            ));
+        for sealed_present in [false, true] {
+            let signal_dir = test_signal_dir("recovery-claim-race");
+            let state = build_state_with_mode(
+                &signal_dir.path,
+                "password",
+                "http://127.0.0.1:9".to_string(),
+                Some("default/instance-test-01-owner/seed-encrypted".to_string()),
+            );
+            state
+                .ownership
+                .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                    "owner_seed_probe_unexpected_status:400".to_string(),
+                ));
 
-        // Deterministic interleaving of the race: our recovery holds its
-        // reservation (generation G) across the refresh awaits; meanwhile a
-        // concurrent /unlock sees the recovered Locked state, reserves it
-        // (generation G+1) and spawns its unlock task.
-        let generation = state
-            .ownership
-            .begin_recovery_from_error()
-            .expect("reserve recovery");
-        // ... refresh completes: material present -> Locked.
-        state.ownership.set_locked();
-        // ... the concurrent request wins the lock.
-        state
-            .ownership
-            .begin_unlock_attempt()
-            .expect("concurrent unlock reservation");
+            // Deterministic interleaving of the race: our recovery holds its
+            // reservation (generation G) across the refresh awaits; meanwhile a
+            // concurrent /unlock sees the recovered Locked state, reserves it
+            // (generation G+1) and spawns its unlock task.
+            let generation = state
+                .ownership
+                .begin_recovery_from_error()
+                .expect("reserve recovery");
+            // ... refresh completes: material present -> Locked.
+            state.ownership.set_locked();
+            // ... the concurrent request wins the lock.
+            state
+                .ownership
+                .begin_unlock_attempt()
+                .expect("concurrent unlock reservation");
 
-        // The claim must report the conflict without touching the state
-        // (the old catch-all here clobbered the running unlock to
-        // Unclaimed).
-        assert_eq!(
-            state.ownership.claim_recovered_state(
+            // The claim must report the conflict without touching the state
+            // (the old catch-all here clobbered the running unlock to
+            // Unclaimed).
+            assert_eq!(
+                state.ownership.claim_recovered_state(
+                    generation,
+                    OwnershipObservation {
+                        encrypted_present: !sealed_present,
+                        sealed_present,
+                    }
+                ),
+                RecoveryClaim::Conflict
+            );
+            assert!(state.ownership.is_unlocking());
+            assert!(!state.ownership.is_unclaimed());
+
+            // The recovering request's guard dropping after the Conflict (the
+            // request returns) must not clobber the concurrent request's
+            // reservation: the generation check keeps the restore inert.
+            drop(RecoveryCancelGuard {
+                ownership: state.ownership.clone(),
                 generation,
-                OwnershipObservation {
-                    encrypted_present: true,
-                    sealed_present: false,
-                }
-            ),
-            RecoveryClaim::Conflict
-        );
-        assert!(state.ownership.is_unlocking());
-        assert!(!state.ownership.is_unclaimed());
+            });
+            assert!(
+                state.ownership.is_unlocking(),
+                "a foreign reservation must survive the recovering request's guard drop"
+            );
 
-        // The recovering request's guard dropping after the Conflict (the
-        // request returns) must not clobber the concurrent request's
-        // reservation: the generation check keeps the restore inert.
-        drop(RecoveryCancelGuard {
-            ownership: state.ownership.clone(),
-            generation,
-        });
-        assert!(
-            state.ownership.is_unlocking(),
-            "a foreign reservation must survive the recovering request's guard drop"
-        );
-
-        // Sanity: without the interleaving, the same sequence claims the
-        // reservation atomically.
-        state
-            .ownership
-            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
-                "recovery_cancelled".to_string(),
-            ));
-        let generation = state
-            .ownership
-            .begin_recovery_from_error()
-            .expect("reserve recovery again");
-        state.ownership.set_locked();
-        assert_eq!(
-            state.ownership.claim_recovered_state(
-                generation,
-                OwnershipObservation {
-                    encrypted_present: true,
-                    sealed_present: false,
-                }
-            ),
-            RecoveryClaim::UnlockReservation
-        );
-        assert!(state.ownership.is_unlocking());
+            // Sanity: without the interleaving, the same sequence claims the
+            // reservation atomically.
+            state
+                .ownership
+                .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
+                    "recovery_cancelled".to_string(),
+                ));
+            let generation = state
+                .ownership
+                .begin_recovery_from_error()
+                .expect("reserve recovery again");
+            state.ownership.set_locked();
+            assert_eq!(
+                state.ownership.claim_recovered_state(
+                    generation,
+                    OwnershipObservation {
+                        encrypted_present: !sealed_present,
+                        sealed_present,
+                    }
+                ),
+                RecoveryClaim::UnlockReservation
+            );
+            assert!(state.ownership.is_unlocking());
+        }
     }
 
     #[tokio::test]
