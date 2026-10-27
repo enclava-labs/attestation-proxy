@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 pub const UNLOCK_MAX_ATTEMPTS: usize = 5;
 pub const UNLOCK_WINDOW_SECONDS: u64 = 60;
@@ -38,7 +38,6 @@ pub const SIGNAL_APP_DATA_SLOT: &str = "app-data";
 pub const SIGNAL_TLS_DATA_SLOT: &str = "tls-data";
 pub const OWNER_SEED_ENVELOPE_VERSION: &str = "enclava-owner-seed-wrap-v1";
 pub const OWNER_SEED_WRAP_INFO: &[u8] = b"enclava-owner-seed-wrap-v1";
-pub const OWNER_SEED_SEAL_INFO: &[u8] = b"enclava-owner-seed-seal-v1";
 pub const OWNER_LUKS_APP_DATA_INFO: &[u8] = b"enclava-luks-app-data-v1";
 pub const OWNER_LUKS_TLS_DATA_INFO: &[u8] = b"enclava-luks-tls-data-v1";
 pub const OWNER_ED25519_SEED_INFO: &[u8] = b"enclava-owner-ed25519-seed-v1";
@@ -193,8 +192,6 @@ pub enum RecoveryClaim {
     /// unlock reservation without a second budget charge (the recovery
     /// probe already recorded the attempt; the spawn section follows).
     UnlockReservation,
-    /// Our preserved reservation with auto-unlock material visible.
-    AutoUnlockResume,
     /// Our bare reservation with no seed: the claimable `Unclaimed`
     /// transition was applied.
     Unclaimed,
@@ -254,7 +251,6 @@ struct OwnershipMachine {
     /// drift with error-string formatting.
     error_reprobeable: bool,
     attempts: VecDeque<Instant>,
-    auto_unlock_enabled: bool,
     /// Bumped on every transition into `Unlocking`. Identifies WHICH
     /// reservation currently owns the state, so a recovery flow can tell
     /// its own (possibly preserved) reservation from a concurrent
@@ -317,7 +313,6 @@ impl OwnershipGuard {
                 error: None,
                 error_reprobeable: false,
                 attempts: VecDeque::new(),
-                auto_unlock_enabled: false,
                 unlock_generation: 0,
             }),
         }
@@ -350,7 +345,7 @@ impl OwnershipGuard {
     /// owns `generation`. Under one lock: a `Locked` result of our refresh
     /// becomes THIS request's unlock reservation (prearmed semantics — the
     /// recovery probe already charged the budget); our own preserved bare
-    /// `Unlocking` reservation resolves to an auto-unlock resume or, when
+    /// `Unlocking` reservation resolves to the unlock reservation or, when
     /// the seed is gone, the claimable `Unclaimed` transition; a state now
     /// owned by someone else (a concurrent request's unlock reservation or
     /// a completed unlock) is reported as `Conflict` and never clobbered.
@@ -360,43 +355,10 @@ impl OwnershipGuard {
         observation: OwnershipObservation,
     ) -> RecoveryClaim {
         let mut machine = self.machine.lock().expect("ownership lock poisoned");
-        // Resumable material: the encrypted seed, or (auto-unlock mode)
-        // a sealed seed alone — a torn state where the encrypted envelope
-        // was deleted but the seal remains must resume the existing
-        // ownership, not become claimable by a different owner.
-        let material_present = observation.encrypted_present
-            || (observation.sealed_present && self.is_auto_unlock_mode());
-        if material_present {
+        // A legacy seal still proves ownership; it must never reopen claim.
+        if observation.encrypted_present || observation.sealed_present {
             match machine.state {
                 OwnershipState::Locked => {
-                    machine.unlock_generation += 1;
-                    machine.state = OwnershipState::Unlocking;
-                    machine.error = None;
-                    RecoveryClaim::UnlockReservation
-                }
-                OwnershipState::Unlocking
-                    if self.is_auto_unlock_mode() && machine.auto_unlock_enabled =>
-                {
-                    // Hand the reservation to the spawned auto-unlock task:
-                    // advance the generation so the recovering request's
-                    // cancellation guard (which holds ours) becomes inert —
-                    // without this, a sealed-only resume keeps our
-                    // generation and the guard's drop would replace the
-                    // handed-off state with a re-probeable Error.
-                    machine.unlock_generation += 1;
-                    machine.error = None;
-                    RecoveryClaim::AutoUnlockResume
-                }
-                OwnershipState::Unlocking
-                    if self.is_auto_unlock_mode() && observation.sealed_present =>
-                {
-                    // A /disable-auto-unlock cleared the flag between our
-                    // refresh's set_unlocking and this claim: the material
-                    // snapshot is ours (auto mode + sealed observed means
-                    // the refresh wrote this Unlocking — a concurrent
-                    // request's reservation needed a Locked window the
-                    // refresh precluded), so resolve to the normal unlock
-                    // path instead of stranding the reservation.
                     machine.unlock_generation += 1;
                     machine.state = OwnershipState::Unlocking;
                     machine.error = None;
@@ -410,7 +372,6 @@ impl OwnershipGuard {
             machine.state = OwnershipState::Unclaimed;
             machine.error = None;
             machine.attempts.clear();
-            machine.auto_unlock_enabled = false;
             RecoveryClaim::Unclaimed
         } else {
             RecoveryClaim::Conflict
@@ -474,7 +435,6 @@ impl OwnershipGuard {
             machine.state = OwnershipState::Unclaimed;
             machine.error = None;
             machine.attempts.clear();
-            machine.auto_unlock_enabled = false;
         }
     }
 
@@ -482,7 +442,6 @@ impl OwnershipGuard {
         if let Ok(mut machine) = self.machine.lock() {
             machine.state = OwnershipState::Unclaimed;
             machine.error = None;
-            machine.auto_unlock_enabled = false;
         }
     }
 
@@ -550,12 +509,6 @@ impl OwnershipGuard {
     pub fn error_is_reprobeable(&self) -> bool {
         let machine = self.machine.lock().expect("ownership lock poisoned");
         matches!(machine.state, OwnershipState::Error) && machine.error_reprobeable
-    }
-
-    pub fn set_auto_unlock_enabled(&self, enabled: bool) {
-        if let Ok(mut machine) = self.machine.lock() {
-            machine.auto_unlock_enabled = enabled;
-        }
     }
 
     pub fn derive_luks_key(
@@ -753,22 +706,6 @@ impl OwnershipGuard {
         let mut owner_seed = Zeroizing::new([0u8; 32]);
         owner_seed.copy_from_slice(&entropy);
         Ok(owner_seed)
-    }
-
-    pub fn derive_sealing_wrap_key(
-        &self,
-        instance_id: &str,
-    ) -> Result<Zeroizing<[u8; 32]>, OwnershipError> {
-        if instance_id.is_empty() {
-            return Err(OwnershipError::InstanceIdMissing);
-        }
-        let base_key = auto_unlock_wrap_root_key(instance_id);
-        let salt = Sha256::digest(instance_id.as_bytes());
-        let hkdf = SensitiveState::new(Hkdf::<Sha256>::new(Some(salt.as_slice()), &base_key[..]));
-        let mut derived = Zeroizing::new([0u8; 32]);
-        hkdf.expand(OWNER_SEED_SEAL_INFO, &mut derived[..])
-            .map_err(|err| OwnershipError::Kdf(err.to_string()))?;
-        Ok(derived)
     }
 
     pub fn signed_owner_audit_event(
@@ -1047,7 +984,9 @@ impl OwnershipGuard {
             "state": state_name(machine.state),
             "mode": self.mode.name(),
             "error": machine.error,
-            "auto_unlock_enabled": machine.auto_unlock_enabled,
+            // Auto-unlock is hard-disabled; the field is kept for schema
+            // compatibility and can never report an engaged auto unlock.
+            "auto_unlock_enabled": false,
         })
     }
 
@@ -1083,13 +1022,6 @@ impl OwnershipGuard {
         matches!(self.current_state(), OwnershipState::Unlocked)
     }
 
-    pub fn auto_unlock_enabled(&self) -> bool {
-        self.machine
-            .lock()
-            .expect("ownership lock poisoned")
-            .auto_unlock_enabled
-    }
-
     pub fn health_status(&self) -> (u16, Value) {
         let timestamp = chrono_timestamp();
         if !self.mode.requires_manual_unlock() {
@@ -1118,7 +1050,8 @@ impl OwnershipGuard {
                 "state": state,
                 "service": "attestation-proxy",
                 "timestamp": timestamp,
-                "auto_unlock_enabled": machine.auto_unlock_enabled,
+                // Schema compatibility: automatic unlocking is impossible.
+                "auto_unlock_enabled": false,
             }),
         )
     }
@@ -1135,22 +1068,6 @@ impl OwnershipGuard {
     fn unlock_window() -> Duration {
         Duration::from_secs(UNLOCK_WINDOW_SECONDS)
     }
-}
-
-fn auto_unlock_wrap_root_key(instance_id: &str) -> Zeroizing<[u8; 32]> {
-    // Access to seed-sealed is already gated by KBS attestation policy. SNP launch
-    // derived keys are not stable across CAP's dynamic pod recreation path, so
-    // using them here strands valid auto-unlock apps in locked state.
-    let digest = Sha256::digest(
-        [
-            b"enclava-kbs-attested-auto-unlock-v1:".as_slice(),
-            instance_id.as_bytes(),
-        ]
-        .concat(),
-    );
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&digest[..32]);
-    Zeroizing::new(key)
 }
 
 fn state_name(state: OwnershipState) -> &'static str {
@@ -1265,26 +1182,6 @@ mod tests {
             Err(OwnershipError::RateLimited),
             "restoring unclaimed state must retain recovery attempts"
         );
-    }
-
-    #[test]
-    fn auto_unlock_wrap_key_is_stable_for_instance() {
-        let signal_dir = test_signal_dir("auto-unlock-wrap-key");
-        let guard =
-            OwnershipGuard::new_with_signal_dir("auto-unlock".to_string(), signal_dir.path.clone());
-
-        let first = guard
-            .derive_sealing_wrap_key("instance-test-01")
-            .expect("derive first wrap key");
-        let second = guard
-            .derive_sealing_wrap_key("instance-test-01")
-            .expect("derive second wrap key");
-        let other = guard
-            .derive_sealing_wrap_key("instance-test-02")
-            .expect("derive other wrap key");
-
-        assert_eq!(&first[..], &second[..]);
-        assert_ne!(&first[..], &other[..]);
     }
 
     #[test]
@@ -1557,7 +1454,7 @@ mod tests {
                 "instance-abc",
                 "password",
                 "recover",
-                json!({"warning": "auto_unlock_reseal_failed"}),
+                json!({"warning": "transient_warning"}),
             )
             .expect("sign owner audit event");
         let payload = event.get("payload").cloned().expect("payload");

@@ -3,8 +3,12 @@
 Small Rust HTTP sidecar for confidential workloads.
 
 It serves guest attestation data, proxies KBS/CDH resource reads, and manages
-storage ownership flows such as unlock, password change, recovery, and
-auto-unlock.
+storage ownership flows such as unlock, password change, and recovery.
+Auto-unlock is hard-disabled: legacy `auto-unlock` mode instances boot locked
+and unlock only with the owner password, and no code path creates, refreshes,
+or decrypts a sealed seed copy. A legacy sealed copy without a password
+envelope keeps the instance locked — it can never be claimed over or
+replaced; mnemonic recovery (`POST /recover`) is the owner's way back.
 
 ## Main endpoints
 
@@ -17,8 +21,8 @@ auto-unlock.
 - `POST /unlock`
 - `POST /change-password`
 - `POST /recover`
-- `POST /enable-auto-unlock`
-- `POST /disable-auto-unlock`
+- `POST /enable-auto-unlock` — always refused with `403 {"error": "auto_unlock_disabled"}` before any secret is read or written
+- `POST /disable-auto-unlock` — password-authenticated cleanup that removes the legacy `seed-sealed` copy and preserves the password envelope
 - `POST /receipts/sign`
 
 The full cross-repo runtime contract lives in
