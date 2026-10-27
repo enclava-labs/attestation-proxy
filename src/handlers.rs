@@ -887,10 +887,6 @@ const OWNER_SEED_STARTUP_REFRESH_CAP_MS: u64 = 90_000;
 const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 10_000;
 #[cfg(not(test))]
 const OWNER_SEED_STARTUP_TOTAL_DEADLINE_MS: u64 = 480_000;
-#[cfg(test)]
-const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_millis(10);
-#[cfg(not(test))]
-const AUTO_UNLOCK_STARTUP_DELAY: Duration = Duration::from_secs(30);
 
 fn validate_bootstrap_signature(
     challenge_b64: &str,
@@ -991,16 +987,13 @@ async fn refresh_ownership_state(
     }
 
     let material = load_owner_seed_material(state).await?;
-    let claimed = material.encrypted.is_some();
-    state
-        .ownership
-        .set_auto_unlock_enabled(material.sealed.is_some());
-    if claimed {
-        if state.ownership.is_auto_unlock_mode() && material.sealed.is_some() {
-            state.ownership.set_unlocking();
-        } else {
-            state.ownership.set_locked();
-        }
+    // Auto-unlock is hard-disabled: a legacy sealed copy never engages an
+    // unlock. Any owner material (password envelope or legacy seal) holds
+    // the instance locked — a pod whose only seed material is an obsolete
+    // seal must never present as claimable, so a fresh claim cannot
+    // overwrite the only existing seed.
+    if material.encrypted.is_some() || material.sealed.is_some() {
+        state.ownership.set_locked();
     } else if state.ownership.is_unlocking() {
         // Preserve an active unlock/recovery reservation while KBS still has no
         // visible envelope; the in-flight operation owns the state transition.
@@ -1010,7 +1003,7 @@ async fn refresh_ownership_state(
         state.ownership.set_unclaimed();
     }
     Ok(OwnershipObservation {
-        encrypted_present: claimed,
+        encrypted_present: material.encrypted.is_some(),
         sealed_present: material.sealed.is_some(),
     })
 }
@@ -1909,26 +1902,6 @@ pub async fn cdh_resource(State(state): State<AppState>, Path(path): Path<String
     }
 }
 
-pub async fn internal_owner_seed(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-) -> Response {
-    let requested = path.trim_start_matches('/');
-    let requested = requested
-        .strip_prefix("kbs/v0/resource/")
-        .unwrap_or(requested);
-    let expected = state.config.owner_seed_encrypted_kbs_path.trim();
-    if !state.ownership.is_auto_unlock_mode() || requested != expected {
-        return json_response(404, &json!({"error": "not_found"}));
-    }
-
-    let seed = state.startup_owner_seed.read().await;
-    let Some(seed) = seed.as_ref() else {
-        return json_response(423, &json!({"error": "owner_seed_not_ready"}));
-    };
-    bytes_response(200, seed.to_vec(), "application/octet-stream")
-}
-
 pub async fn initialize_ownership_state(state: &AppState) {
     if !(state.ownership.is_password_mode() || state.ownership.is_auto_unlock_mode()) {
         return;
@@ -2022,87 +1995,6 @@ pub async fn initialize_ownership_state(state: &AppState) {
     }
 }
 
-/// Spawn the startup auto-unlock task if auto-unlock material is enabled.
-/// Returns whether a task was actually spawned: callers that promise work
-/// in flight (the 202 resume arm) must handle a `false` (e.g. a concurrent
-/// /disable-auto-unlock cleared the flag between their check and this
-/// call) by falling back instead of stranding the `Unlocking` state.
-pub fn spawn_auto_unlock_if_needed(state: AppState) -> bool {
-    if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
-        return false;
-    }
-
-    tokio::spawn(async move {
-        // Give enclava-init time to bind the unlock socket and finish early setup.
-        tokio::time::sleep(AUTO_UNLOCK_STARTUP_DELAY).await;
-        let _ = attestation::fetch_kbs_token_claims(&state).await;
-        let material = match load_owner_seed_material(&state).await {
-            Ok(material) => material,
-            Err(err) => {
-                state.ownership.set_ownership_error(&err);
-                return;
-            }
-        };
-        let sealed = match material.sealed {
-            Some(sealed) => sealed,
-            None => {
-                state.ownership.set_locked();
-                return;
-            }
-        };
-        let wrap_key = match state
-            .ownership
-            .derive_sealing_wrap_key(&state.config.instance_id)
-        {
-            Ok(key) => key,
-            Err(_) => {
-                state.ownership.set_locked();
-                return;
-            }
-        };
-        let owner_seed = match state.ownership.decrypt_owner_seed(&sealed, &wrap_key) {
-            Ok(seed) => seed,
-            Err(_) => {
-                state.ownership.set_locked();
-                return;
-            }
-        };
-
-        match unlock_startup_auto_unlock_material(&state, &owner_seed).await {
-            Ok(warning) => emit_signed_owner_audit_event(
-                &state,
-                &owner_seed,
-                "auto_unlock_resumed",
-                json!({
-                    "auto_unlock_enabled": true,
-                    "warning": warning,
-                }),
-            ),
-            Err(err) => state.ownership.set_ownership_error(&err),
-        }
-    });
-    true
-}
-
-async fn unlock_startup_auto_unlock_material(
-    state: &AppState,
-    owner_seed: &[u8; 32],
-) -> Result<Option<String>, OwnershipError> {
-    if state.ownership.is_auto_unlock_mode()
-        && !state.config.enclava_init_unlock_socket.trim().is_empty()
-    {
-        *state.startup_owner_seed.write().await = Some(Zeroizing::new(*owner_seed));
-        state.ownership.set_unlocked();
-        spawn_enclava_init_ready_watch(
-            state.clone(),
-            std::time::Duration::from_secs(unlock_poll_timeout_seconds()),
-        );
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
-    }
-
-    unlock_owner_seed_material(state, owner_seed).await
-}
-
 /// Restores the re-probeable error latch if the recovery section of
 /// `unlock` is cancelled (client disconnect / handler future dropped)
 /// while the ownership machine still holds THIS recovery's bare
@@ -2191,19 +2083,6 @@ pub async fn unlock(
                             // request under one lock - a concurrent /unlock
                             // cannot slip in between and be clobbered. Fall
                             // through to the spawn section.
-                        }
-                        RecoveryClaim::AutoUnlockResume => {
-                            // Auto-unlock material became visible on our
-                            // preserved reservation: resume the startup
-                            // auto-unlock path so the 202 means work is in
-                            // flight. If a concurrent /disable-auto-unlock
-                            // cleared the flag between the claim and the
-                            // spawn, no task engages — fall through to the
-                            // normal unlock path instead of stranding the
-                            // Unlocking state behind a 202.
-                            if spawn_auto_unlock_if_needed(state.clone()) {
-                                return json_response(202, &json!({"state": "unlocking"}));
-                            }
                         }
                         RecoveryClaim::Unclaimed => {
                             // The seed is gone (e.g. torn down while the
@@ -2352,6 +2231,16 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
     let owner_seed_resource = match load_owner_seed_material_with_revalidation(state).await {
         Ok(material) => match material.encrypted {
             Some(resource) => resource,
+            None if material.sealed.is_some() => {
+                // Fail closed: an owner seed still exists as a legacy sealed
+                // copy. It must never become claimable or be replaced by a
+                // fresh seed; mnemonic recovery is the way back.
+                state.ownership.set_locked();
+                return json_response(
+                    409,
+                    &json!({"error": "owner_seed_recovery_required", "state": "locked"}),
+                );
+            }
             None => {
                 state.ownership.set_unclaimed();
                 return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
@@ -2391,7 +2280,7 @@ async fn unlock_password_mode(state: &AppState, password: &mut Zeroizing<Vec<u8>
                 &owner_seed,
                 "unlock",
                 json!({
-                    "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+                    "auto_unlock_enabled": false,
                     "warning": warning.clone(),
                 }),
             );
@@ -2451,27 +2340,6 @@ fn render_level1_handoff_outcome(state: &AppState, outcome: HandoffOutcome) -> R
     }
 }
 
-async fn maybe_refresh_auto_unlock_seal(
-    state: &AppState,
-    owner_seed: &[u8; 32],
-) -> Result<Option<String>, OwnershipError> {
-    if !state.ownership.is_auto_unlock_mode() || !state.ownership.auto_unlock_enabled() {
-        return Ok(None);
-    }
-    let wrap_key = state
-        .ownership
-        .derive_sealing_wrap_key(&state.config.instance_id)?;
-    let sealed = state.ownership.encrypt_owner_seed(owner_seed, &wrap_key)?;
-    update_owner_seed_material(
-        state,
-        EscrowValueUpdate::Keep,
-        EscrowValueUpdate::Set(&sealed),
-    )
-    .await
-    .map(|_| None)
-    .or_else(|_| Ok(Some("auto_unlock_reseal_failed".to_string())))
-}
-
 async fn unlock_owner_seed_material(
     state: &AppState,
     owner_seed: &[u8; 32],
@@ -2498,13 +2366,13 @@ async fn unlock_owner_seed_via_init_socket(
     let timeout = std::time::Duration::from_secs(unlock_poll_timeout_seconds());
     if enclava_init_ready_file_is_ready(state).await? {
         state.ownership.set_unlocked();
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+        return Ok(None);
     }
 
     request_owner_seed_unlock(state, owner_seed, timeout).await?;
     state.ownership.set_unlocked();
     spawn_enclava_init_ready_watch(state.clone(), timeout);
-    maybe_refresh_auto_unlock_seal(state, owner_seed).await
+    Ok(None)
 }
 
 async fn request_owner_seed_unlock(
@@ -2762,7 +2630,6 @@ async fn wait_for_enclava_init_ready(
     loop {
         match tokio::fs::read_to_string(ready_file).await {
             Ok(value) if value.trim() == "ready" => {
-                *state.startup_owner_seed.write().await = None;
                 return Ok(());
             }
             Ok(_) => {}
@@ -2806,7 +2673,6 @@ async fn wait_for_enclava_init_ready(
                 // the error file was being probed, success wins over the
                 // now-stale recorded failure.
                 if enclava_init_ready_file_is_ready(state).await == Ok(true) {
-                    *state.startup_owner_seed.write().await = None;
                     return Ok(());
                 }
                 return Err(err);
@@ -2872,7 +2738,7 @@ async fn finalize_rewrapped_owner_seed(
             .ownership
             .clear_password_handoff_retry_files_for_slots(&slots)?;
         state.ownership.set_unlocked();
-        return maybe_refresh_auto_unlock_seal(state, owner_seed).await;
+        return Ok(None);
     }
     unlock_owner_seed_material(state, owner_seed).await
 }
@@ -2885,7 +2751,7 @@ async fn render_password_handoff_outcome(
     match outcome {
         HandoffOutcome::Unlocked => {
             state.ownership.set_unlocked();
-            maybe_refresh_auto_unlock_seal(state, owner_seed).await
+            Ok(None)
         }
         HandoffOutcome::WrongPassword => Err(OwnershipError::WrongPassword),
         HandoffOutcome::Fatal(message) => {
@@ -3050,7 +2916,6 @@ pub async fn bootstrap_claim(
             &json!({"error": "claim_failed", "detail": err.to_string()}),
         );
     }
-    state.ownership.set_auto_unlock_enabled(false);
     state.ownership.set_locked();
 
     match unlock_owner_seed_material(&state, &owner_seed).await {
@@ -3188,7 +3053,7 @@ pub async fn change_password(
         &owner_seed,
         "change_password",
         json!({
-            "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+            "auto_unlock_enabled": false,
             "owner_public_key": state
                 .ownership
                 .owner_public_key_b64url(&owner_seed)
@@ -3333,7 +3198,7 @@ pub async fn recover(
                 &owner_seed,
                 "recover",
                 json!({
-                    "auto_unlock_enabled": state.ownership.auto_unlock_enabled(),
+                    "auto_unlock_enabled": false,
                     "owner_public_key": owner_pubkey.clone(),
                     "warning": warning.clone(),
                 }),
@@ -3353,101 +3218,12 @@ pub async fn recover(
     }
 }
 
-pub async fn enable_auto_unlock(
-    State(state): State<AppState>,
-    Json(mut payload): Json<UnlockRequest>,
-) -> Response {
-    let mut password = take_secret_bytes(&mut payload.password);
-    if password.is_empty() {
-        return json_response(400, &json!({"error": "password_required"}));
-    }
-    if let Some(response) = begin_rate_limited_secret_operation(&state) {
-        return response;
-    }
-    let material = match load_owner_seed_material_with_revalidation(&state).await {
-        Ok(material) if material.encrypted.is_some() => material,
-        Ok(_) => return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"})),
-        Err(err) => {
-            return json_response(
-                500,
-                &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-            )
-        }
-    };
-    let wrap_key = match state
-        .ownership
-        .derive_password_wrap_key(&mut password, &state.config.instance_id)
-    {
-        Ok(key) => key,
-        Err(err) => {
-            return json_response(
-                500,
-                &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-            )
-        }
-    };
-    let owner_seed = match state.ownership.decrypt_owner_seed(
-        material.encrypted.as_ref().expect("encrypted present"),
-        &wrap_key,
-    ) {
-        Ok(seed) => seed,
-        Err(OwnershipError::WrongPassword) => {
-            return json_response(401, &json!({"error": "wrong_password"}))
-        }
-        Err(err) => {
-            return json_response(
-                500,
-                &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-            )
-        }
-    };
-    let seal_key = match state
-        .ownership
-        .derive_sealing_wrap_key(&state.config.instance_id)
-    {
-        Ok(key) => key,
-        Err(err) => {
-            return json_response(
-                500,
-                &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-            )
-        }
-    };
-    let sealed = match state.ownership.encrypt_owner_seed(&owner_seed, &seal_key) {
-        Ok(sealed) => sealed,
-        Err(err) => {
-            return json_response(
-                500,
-                &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-            )
-        }
-    };
-    if let Err(err) = update_owner_seed_material(
-        &state,
-        EscrowValueUpdate::Keep,
-        EscrowValueUpdate::Set(&sealed),
-    )
-    .await
-    {
-        return json_response(
-            500,
-            &json!({"error": "enable_auto_unlock_failed", "detail": err.to_string()}),
-        );
-    }
-    state.ownership.set_auto_unlock_enabled(true);
-    emit_signed_owner_audit_event(
-        &state,
-        &owner_seed,
-        "enable_auto_unlock",
-        json!({
-            "auto_unlock_enabled": true,
-            "owner_public_key": state
-                .ownership
-                .owner_public_key_b64url(&owner_seed)
-                .unwrap_or_default(),
-        }),
-    );
-    json_response(200, &json!({"status": "auto_unlock_enabled"}))
+/// POST /enable-auto-unlock — auto-unlock is hard-disabled. The refusal
+/// happens before any secret is read, written, or rate-limit charged, in
+/// every ownership mode, on both this route and its
+/// /.well-known/confidential alias.
+pub async fn enable_auto_unlock() -> Response {
+    json_response(403, &json!({"error": "auto_unlock_disabled"}))
 }
 
 pub async fn disable_auto_unlock(
@@ -3508,7 +3284,6 @@ pub async fn disable_auto_unlock(
             &json!({"error": "disable_auto_unlock_failed", "detail": err.to_string()}),
         );
     }
-    state.ownership.set_auto_unlock_enabled(false);
     emit_signed_owner_audit_event(
         &state,
         &owner_seed,
@@ -7637,19 +7412,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_unlock_enable_disable_and_startup_resume_round_trip() {
-        let signal_dir = test_signal_dir("auto-unlock");
-        mark_password_slots_unlocked(&signal_dir.path);
+    async fn enable_auto_unlock_is_disabled() {
+        let response = enable_auto_unlock().await;
+        assert_eq!(response.status().as_u16(), 403);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "auto_unlock_disabled"})
+        );
+    }
 
-        let signing_key = SigningKey::from_bytes(&[10u8; 32]);
-        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+    #[tokio::test]
+    async fn legacy_auto_mode_boots_locked_and_unlocks_manually_without_resealing() {
+        let signal_dir = test_signal_dir("legacy-auto-manual-unlock");
+        let owner_seed = [0x2a; 32];
+        let encrypted_path = "default/instance-test-01-owner/seed-encrypted";
+        let sealed_path = "default/instance-test-01-owner/seed-sealed";
+        let encrypted = owner_seed_envelope_json(owner_seed, "claim-password", "instance-test-01");
+        let sealed = "legacy-auto-sealed-bytes".to_string();
+        let mut resources = HashMap::new();
+        resources.insert(encrypted_path.to_string(), encrypted);
+        resources.insert(sealed_path.to_string(), sealed.clone());
+        let kbs_server =
+            spawn_test_api_server(owner_escrow_secret_json(None, None), json!({}), resources).await;
+        let state = build_state_with_mode(
+            &signal_dir.path,
+            "auto-unlock",
+            kbs_server.base_url(),
+            Some(encrypted_path.to_string()),
+        );
+
+        // Startup must land locked: no automatic unsealing engages for
+        // legacy auto material.
+        initialize_ownership_state(&state).await;
+        let body = state.ownership.state_json();
+        assert_eq!(body.get("state").and_then(Value::as_str), Some("locked"));
+        assert_eq!(
+            body.get("mode").and_then(Value::as_str),
+            Some("auto-unlock")
+        );
+        assert_eq!(body.get("auto_unlock_enabled"), Some(&Value::Bool(false)));
+        assert_eq!(state.ownership.health_status().0, 423);
+
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_APP_DATA_SLOT)).expect("create app slot");
+        fs::create_dir_all(signal_dir.path.join(SIGNAL_TLS_DATA_SLOT)).expect("create tls slot");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_APP_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write app unlocked sentinel");
+        fs::write(
+            signal_dir
+                .path
+                .join(SIGNAL_TLS_DATA_SLOT)
+                .join(SIGNAL_UNLOCKED_FILE),
+            "unlocked_at=now",
+        )
+        .expect("write tls unlocked sentinel");
+
+        let response = unlock(
+            State(state.clone()),
+            Json(UnlockRequest {
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 202);
+        let body = wait_for_ownership_state(&state, "unlocked").await;
+        assert_eq!(body["state"], "unlocked");
+
+        // Manual unlock must not produce a new sealed copy or rewrite the
+        // legacy ciphertext.
+        assert_eq!(
+            kbs_server.kbs_resource(sealed_path),
+            Some(sealed),
+            "unlock must not rewrite or remove the legacy sealed copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_auto_unlock_removes_only_the_sealed_copy() {
+        let signal_dir = test_signal_dir("disable-auto-unlock-cleanup");
+        let encrypted =
+            owner_seed_envelope_json([0x2d; 32], "claim-password", "instance-test-01").into_bytes();
+        let sealed = b"legacy-auto-sealed-bytes".to_vec();
         let api_server = spawn_test_api_server(
-            owner_escrow_secret_json(None, None),
-            test_identity_claims(&bootstrap_hash),
+            owner_escrow_secret_json(Some(&encrypted), Some(&sealed)),
+            json!({}),
             HashMap::new(),
         )
         .await;
-        let token_file = test_temp_file("auto-unlock-token", "test-token");
+        let token_file = test_temp_file("disable-auto-unlock-cleanup-token", "test-token");
         let state = build_state_with_secret_backend(
             &signal_dir.path,
             "auto-unlock",
@@ -7657,49 +7512,19 @@ mod tests {
             &token_file.path,
         );
         initialize_ownership_state(&state).await;
+        let before = api_server.secret_json();
 
-        let _ = claim_owner(&state, &signing_key, "claim-password").await;
-        clear_password_slot_artifacts(&signal_dir.path);
-        mark_password_slots_unlocked(&signal_dir.path);
-
-        let enable = enable_auto_unlock(
+        // Wrong password fails closed before any deletion.
+        let wrong = disable_auto_unlock(
             State(state.clone()),
             Json(UnlockRequest {
-                password: Zeroizing::new("claim-password".to_string()),
+                password: Zeroizing::new("wrong-password".to_string()),
             }),
         )
         .await;
-        assert_eq!(enable.status().as_u16(), 200);
-        assert_eq!(
-            read_json(enable).await,
-            json!({"status": "auto_unlock_enabled"})
-        );
-        assert!(state.ownership.auto_unlock_enabled());
-        let secret = api_server.secret_json();
-        assert!(
-            decode_secret_field(&secret, "seed-sealed").is_some(),
-            "enable-auto-unlock should persist the sealed seed copy"
-        );
-
-        let restart_signal_dir = test_signal_dir("auto-unlock-restart");
-        mark_password_slots_unlocked(&restart_signal_dir.path);
-        let restart_state = build_state_with_secret_backend(
-            &restart_signal_dir.path,
-            "auto-unlock",
-            api_server.base_url(),
-            &token_file.path,
-        );
-        initialize_ownership_state(&restart_state).await;
-        spawn_auto_unlock_if_needed(restart_state.clone());
-        sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            restart_state
-                .ownership
-                .state_json()
-                .get("state")
-                .and_then(Value::as_str),
-            Some("unlocked")
-        );
+        assert_eq!(wrong.status().as_u16(), 401);
+        assert_eq!(read_json(wrong).await, json!({"error": "wrong_password"}));
+        assert_eq!(api_server.secret_json(), before);
 
         let disable = disable_auto_unlock(
             State(state.clone()),
@@ -7713,119 +7538,24 @@ mod tests {
             read_json(disable).await,
             json!({"status": "auto_unlock_disabled"})
         );
-        assert!(!state.ownership.auto_unlock_enabled());
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("auto_unlock_enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
         let secret = api_server.secret_json();
         assert!(
             decode_secret_field(&secret, "seed-sealed").is_none(),
             "disable-auto-unlock should remove the sealed seed copy"
         );
-    }
-
-    #[tokio::test]
-    async fn startup_auto_unlock_with_init_socket_unblocks_proxy_without_socket_handoff() {
-        let signal_dir = test_signal_dir("auto-unlock-init-socket");
-        mark_password_slots_unlocked(&signal_dir.path);
-
-        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
-        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
-        let api_server = spawn_test_api_server(
-            owner_escrow_secret_json(None, None),
-            test_identity_claims(&bootstrap_hash),
-            HashMap::new(),
-        )
-        .await;
-        let token_file = test_temp_file("auto-unlock-init-socket-token", "test-token");
-        let state = build_state_with_secret_backend(
-            &signal_dir.path,
-            "auto-unlock",
-            api_server.base_url(),
-            &token_file.path,
-        );
-        initialize_ownership_state(&state).await;
-
-        let _ = claim_owner(&state, &signing_key, "claim-password").await;
-        clear_password_slot_artifacts(&signal_dir.path);
-        mark_password_slots_unlocked(&signal_dir.path);
-
-        let enable = enable_auto_unlock(
-            State(state.clone()),
-            Json(UnlockRequest {
-                password: Zeroizing::new("claim-password".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(enable.status().as_u16(), 200);
-        let secret = api_server.secret_json();
-        let encrypted = decode_secret_field(&secret, "seed-encrypted").expect("seed-encrypted");
-        let expected_owner_seed =
-            decrypt_owner_seed_with_password(&state, &encrypted, "claim-password");
-
-        let restart_signal_dir = test_signal_dir("auto-unlock-init-socket-restart");
-        let mut restart_state = build_state_with_secret_backend(
-            &restart_signal_dir.path,
-            "auto-unlock",
-            api_server.base_url(),
-            &token_file.path,
-        );
-        {
-            let config = Arc::get_mut(&mut restart_state.config).expect("unique config arc");
-            config.enclava_init_unlock_socket = restart_signal_dir
-                .path
-                .join("missing-init.sock")
-                .display()
-                .to_string();
-            config.enclava_init_ready_file = restart_signal_dir
-                .path
-                .join("init-ready")
-                .display()
-                .to_string();
-            config.enclava_init_error_file = restart_signal_dir
-                .path
-                .join("init-error")
-                .display()
-                .to_string();
-        }
-        initialize_ownership_state(&restart_state).await;
-
-        spawn_auto_unlock_if_needed(restart_state.clone());
-        sleep(Duration::from_millis(150)).await;
-
         assert_eq!(
-            restart_state
-                .ownership
-                .state_json()
-                .get("state")
-                .and_then(Value::as_str),
-            Some("unlocked")
-        );
-        assert_eq!(restart_state.ownership.health_status().0, 200);
-        let owner_seed_response = internal_owner_seed(
-            State(restart_state.clone()),
-            Path("default/instance-test-01-owner/seed-encrypted".to_string()),
-        )
-        .await;
-        assert_eq!(owner_seed_response.status().as_u16(), 200);
-        assert_eq!(
-            read_bytes(owner_seed_response).await.as_ref(),
-            expected_owner_seed.as_slice()
-        );
-        let owner_seed_kbs_style_response = internal_owner_seed(
-            State(restart_state.clone()),
-            Path("kbs/v0/resource/default/instance-test-01-owner/seed-encrypted".to_string()),
-        )
-        .await;
-        assert_eq!(owner_seed_kbs_style_response.status().as_u16(), 200);
-        assert_eq!(
-            read_bytes(owner_seed_kbs_style_response).await.as_ref(),
-            expected_owner_seed.as_slice()
-        );
-        assert!(
-            !restart_signal_dir
-                .path
-                .join(SIGNAL_APP_DATA_SLOT)
-                .join(SIGNAL_KEY_FILE)
-                .exists(),
-            "auto mode with enclava-init should not use password handoff files"
+            decode_secret_field(&secret, "seed-encrypted"),
+            Some(encrypted),
+            "disable-auto-unlock must preserve the password envelope"
         );
     }
 
@@ -8056,7 +7786,6 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
-            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
                 signal_dir.to_path_buf(),
@@ -8096,7 +7825,6 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
-            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 mode.to_string(),
                 signal_dir.to_path_buf(),
@@ -8112,12 +7840,6 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&body).expect("response json")
-    }
-
-    async fn read_bytes(response: Response) -> Bytes {
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read response body")
     }
 
     struct TestSignalDir {
@@ -8870,7 +8592,6 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
-            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "password".to_string(),
                 signal_dir.path.clone(),
@@ -9070,7 +8791,6 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(HashMap::<String, KbsCacheEntry>::new())),
-            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "password".to_string(),
                 signal_dir.path.clone(),
@@ -9381,7 +9101,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlock_recovery_resumes_auto_unlock_after_reprobe() {
+    async fn unlock_recovery_reprobe_in_auto_mode_unlocks_manually() {
+        // Legacy auto mode with a latched environmental error: the re-probe
+        // takes a normal unlock reservation resolved by the PASSWORD path —
+        // automatic unsealing never engages, and the legacy sealed copy is
+        // left untouched for explicit cleanup.
         let signal_dir = test_signal_dir("auto-unlock-reprobe");
         mark_password_slots_unlocked(&signal_dir.path);
 
@@ -9406,17 +9130,8 @@ mod tests {
         clear_password_slot_artifacts(&signal_dir.path);
         mark_password_slots_unlocked(&signal_dir.path);
 
-        let enable = enable_auto_unlock(
-            State(state.clone()),
-            Json(UnlockRequest {
-                password: Zeroizing::new("claim-password".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(enable.status().as_u16(), 200);
-
-        // Simulate the wedge: a restart boot latched the environmental error
-        // (auto-unlock never engaged because the seed was unreachable).
+        // Simulate a legacy auto boot: the stale sealed copy is still in the
+        // escrow and the restart latched the environmental error.
         let restart_signal_dir = test_signal_dir("auto-unlock-reprobe-restart");
         mark_password_slots_unlocked(&restart_signal_dir.path);
         let restart_state = build_state_with_secret_backend(
@@ -9425,6 +9140,13 @@ mod tests {
             api_server.base_url(),
             &token_file.path,
         );
+        update_owner_seed_material(
+            &restart_state,
+            EscrowValueUpdate::Keep,
+            EscrowValueUpdate::Set(b"legacy-auto-sealed-bytes"),
+        )
+        .await
+        .expect("seed legacy sealed copy");
         restart_state
             .ownership
             .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
@@ -9439,14 +9161,16 @@ mod tests {
         )
         .await;
 
-        // The re-probe must not just report Unlocking: it resumes the
-        // auto-unlock operation.
-        // The re-probe must not just report Unlocking: it resumes the
-        // auto-unlock operation.
         assert_eq!(response.status().as_u16(), 202);
         assert_eq!(read_json(response).await["state"], "unlocking");
         let body = wait_for_ownership_state(&restart_state, "unlocked").await;
         assert_eq!(body["state"], "unlocked");
+        let secret = api_server.secret_json();
+        assert_eq!(
+            decode_secret_field(&secret, "seed-sealed"),
+            Some(b"legacy-auto-sealed-bytes".to_vec()),
+            "reprobe unlock must not rewrite or remove the legacy sealed copy"
+        );
         api_server.task.abort();
     }
 
@@ -9669,13 +9393,8 @@ mod tests {
             .ownership
             .begin_recovery_from_error()
             .expect("reserve recovery");
-        // The refresh's writes for observed material (auto mode, both
-        // resources): resume transition + enabled flag.
-        state.ownership.set_unlocking();
-        state.ownership.set_auto_unlock_enabled(true);
-        // The concurrent disable's machine write (its KBS removal of the
-        // sealed resource is not visible to the claim's observation).
-        state.ownership.set_auto_unlock_enabled(false);
+        // The refresh's write for observed password material: locked.
+        state.ownership.set_locked();
 
         assert_eq!(
             state.ownership.claim_recovered_state(
@@ -9699,33 +9418,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_unlock_resume_reports_unspawned_after_concurrent_disable() {
-        // A /disable-auto-unlock that lands between the recovery claim and
-        // the spawn handoff must not strand the Unlocking state behind a
-        // 202: the helper reports that no task engaged so the caller can
-        // fall back to the normal unlock path.
-        let signal_dir = test_signal_dir("resume-disable-race");
-        let state = build_state_with_mode(
-            &signal_dir.path,
-            "auto-unlock",
-            "http://127.0.0.1:9".to_string(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        // The resume precondition: material enabled.
-        state.ownership.set_auto_unlock_enabled(true);
-        assert!(spawn_auto_unlock_if_needed(state.clone()));
-        // The disable interleave clears the flag; the next handoff attempt
-        // reports no-spawn instead of silently doing nothing.
-        state.ownership.set_auto_unlock_enabled(false);
-        assert!(!spawn_auto_unlock_if_needed(state.clone()));
-    }
-
-    #[tokio::test]
-    async fn recovery_claim_resumes_auto_mode_with_sealed_seed_only() {
+    async fn recovery_claim_fails_closed_on_sealed_seed_only() {
         // Torn state: the encrypted envelope is gone but the sealed seed
-        // remains. In auto-unlock mode the existing ownership must RESUME
-        // from the seal — falling to the claimable Unclaimed transition
-        // here would let a different owner take over the instance.
+        // remains. Auto-unlock is hard-disabled, so the recovery probe must
+        // NOT resume from the seal (that would silently re-arm automatic
+        // unsealing) and must NOT mark the instance claimable (a fresh
+        // claim would overwrite the only existing seed): the claim resolves
+        // to a locked unlock reservation whose password path answers with a
+        // recovery requirement.
         let signal_dir = test_signal_dir("claim-sealed-only");
         let state = build_state_with_mode(
             &signal_dir.path,
@@ -9743,11 +9443,9 @@ mod tests {
             .ownership
             .begin_recovery_from_error()
             .expect("reserve recovery");
-        // Mirror refresh's write: observing a sealed seed enables the
-        // auto-unlock material flag before the claim runs.
-        state.ownership.set_auto_unlock_enabled(true);
-        // refresh observed: encrypted absent, sealed present; the machine
-        // still holds our bare reservation (refresh preserves it).
+        // Mirror refresh's write for owned (sealed-only) material: locked.
+        state.ownership.set_locked();
+        // refresh observed: encrypted absent, sealed present.
         assert_eq!(
             state.ownership.claim_recovered_state(
                 generation,
@@ -9756,49 +9454,85 @@ mod tests {
                     sealed_present: true,
                 }
             ),
-            RecoveryClaim::AutoUnlockResume
+            RecoveryClaim::UnlockReservation
         );
+        assert!(state.ownership.is_locked());
 
-        // The handed-off reservation must be invisible to the recovering
-        // request's cancellation guard: dropping it after the claim leaves
-        // the resumed state intact (the claim advanced the generation).
+        // The cancellation guard must not resurrect a reservation: the
+        // machine is locked, not a bare Unlocking reservation.
         drop(RecoveryCancelGuard {
             ownership: state.ownership.clone(),
             generation,
         });
-        assert!(
-            state.ownership.is_unlocking(),
-            "a handed-off resume must survive the recovering request's guard drop"
+        assert!(state.ownership.is_locked());
+    }
+
+    #[tokio::test]
+    async fn sealed_only_instance_fails_closed_without_becoming_claimable() {
+        let signal_dir = test_signal_dir("sealed-only-fail-closed");
+        let sealed = b"legacy-auto-sealed-bytes".to_vec();
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, Some(&sealed)),
+            json!({}),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("sealed-only-fail-closed-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "auto-unlock",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+        let before = api_server.secret_json();
+
+        // Boot lands locked, never claimable: the only existing seed
+        // material must not be replaceable by a fresh claim.
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("locked")
         );
 
-        // Password mode with the same torn material cannot resume: it must
-        // fall through to the claimable transition instead.
-        let password_state = build_state_with_mode(
-            &test_signal_dir("claim-sealed-only-pw").path,
-            "password",
-            "http://127.0.0.1:9".to_string(),
-            Some("default/instance-test-01-owner/seed-encrypted".to_string()),
-        );
-        password_state
-            .ownership
-            .set_ownership_error(&OwnershipError::OwnerSeedUnavailable(
-                "owner_seed_probe_unexpected_status:400".to_string(),
-            ));
-        let generation = password_state
-            .ownership
-            .begin_recovery_from_error()
-            .expect("reserve password recovery");
-        password_state.ownership.set_auto_unlock_enabled(true);
+        let claim = bootstrap_claim(
+            State(state.clone()),
+            Json(BootstrapClaimRequest {
+                challenge: "unused".to_string(),
+                bootstrap_pubkey: "unused".to_string(),
+                signature: "unused".to_string(),
+                password: Zeroizing::new("attacker-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(claim.status().as_u16(), 409);
         assert_eq!(
-            password_state.ownership.claim_recovered_state(
-                generation,
-                OwnershipObservation {
-                    encrypted_present: false,
-                    sealed_present: true,
-                }
-            ),
-            RecoveryClaim::Unclaimed
+            read_json(claim).await.get("error"),
+            Some(&json!("already_claimed"))
         );
+
+        // Password unlock cannot decrypt the seal; it demands recovery
+        // instead of flipping the instance claimable.
+        let mut password = Zeroizing::new(b"any-password".to_vec());
+        let response = unlock_password_mode(&state, &mut password).await;
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "owner_seed_recovery_required", "state": "locked"})
+        );
+        assert_eq!(
+            state
+                .ownership
+                .state_json()
+                .get("state")
+                .and_then(Value::as_str),
+            Some("locked")
+        );
+        assert_eq!(api_server.secret_json(), before);
+        api_server.task.abort();
     }
 
     #[tokio::test]

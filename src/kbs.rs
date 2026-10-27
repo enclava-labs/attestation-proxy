@@ -773,7 +773,6 @@ mod tests {
             http_client: reqwest::Client::new(),
             aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
             kbs_resource_cache: Arc::new(RwLock::new(cache_map)),
-            startup_owner_seed: Arc::new(RwLock::new(None)),
             ownership: Arc::new(OwnershipGuard::new_with_signal_dir(
                 "level1".to_string(),
                 signal_dir.clone(),
@@ -886,7 +885,6 @@ mod tests {
             kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
@@ -996,7 +994,6 @@ mod tests {
             kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
@@ -1087,7 +1084,6 @@ mod tests {
             kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
@@ -1160,7 +1156,6 @@ mod tests {
             kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            startup_owner_seed: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),

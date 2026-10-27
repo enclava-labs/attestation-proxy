@@ -70,14 +70,12 @@ async fn main() {
         http_client,
         aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
         kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
-        startup_owner_seed: Arc::new(RwLock::new(None)),
         bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
         receipt_signer: Arc::new(ReceiptSigner::ephemeral()),
         tls_leaf_spki_sha256: tls_material.spki_sha256,
     };
 
     handlers::initialize_ownership_state(&state).await;
-    handlers::spawn_auto_unlock_if_needed(state.clone());
 
     // If CAP config management is not configured (no signing pubkey), write .ready sentinel
     // immediately so bootstrap.sh does not block waiting for config that will never arrive (D-07).
@@ -315,10 +313,7 @@ fn app_router(state: AppState, expose_config_routes: bool) -> Router {
             )
             .route("/config", get(handlers::config_list))
     } else {
-        router.route(
-            "/internal/owner-seed/{*path}",
-            get(handlers::internal_owner_seed),
-        )
+        router
     };
 
     router
@@ -412,7 +407,6 @@ mod main {
                 http_client: reqwest::Client::new(),
                 aa_token_cache: Arc::new(RwLock::new(AaTokenCache::new())),
                 kbs_resource_cache: Arc::new(RwLock::new(HashMap::new())),
-                startup_owner_seed: Arc::new(RwLock::new(None)),
                 ownership: Arc::new(OwnershipGuard::new("password".to_string())),
                 bootstrap_challenges: Arc::new(Mutex::new(VecDeque::new())),
                 receipt_signer: Arc::new(ReceiptSigner::ephemeral()),
