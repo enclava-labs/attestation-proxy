@@ -3364,9 +3364,10 @@ pub async fn config_put(
     if let Err(response) = require_config_storage_ready(&state).await {
         return response;
     }
-    if let Err(error) = enforce_config_generation(&state, claims.deployment_generation) {
-        return config_generation_rejection(error);
-    }
+    let _generation_guard = match enforce_config_generation(&state, claims.deployment_generation) {
+        Ok(guard) => guard,
+        Err(error) => return config_generation_rejection(error),
+    };
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     let config_options =
         crate::config_store::ConfigStoreOptions::with_file_gid(state.config.cap_config_file_gid);
@@ -3425,9 +3426,10 @@ pub async fn config_delete(
     if let Err(response) = require_config_storage_ready(&state).await {
         return response;
     }
-    if let Err(error) = enforce_config_generation(&state, claims.deployment_generation) {
-        return config_generation_rejection(error);
-    }
+    let _generation_guard = match enforce_config_generation(&state, claims.deployment_generation) {
+        Ok(guard) => guard,
+        Err(error) => return config_generation_rejection(error),
+    };
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     match crate::config_store::delete_config(config_dir, &key) {
         Ok(existed) => {
@@ -3458,9 +3460,12 @@ pub async fn config_delete(
 fn enforce_config_generation(
     state: &AppState,
     token_generation: Option<i64>,
-) -> Result<(), crate::generation_fence::GenerationFenceError> {
+) -> Result<
+    crate::generation_fence::ConfigGenerationGuard,
+    crate::generation_fence::GenerationFenceError,
+> {
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
-    crate::generation_fence::admit_config_write(config_dir, token_generation)
+    crate::generation_fence::admit_and_hold(config_dir, token_generation)
 }
 
 fn config_generation_rejection(error: crate::generation_fence::GenerationFenceError) -> Response {
@@ -3469,7 +3474,7 @@ fn config_generation_rejection(error: crate::generation_fence::GenerationFenceEr
             token_generation,
             accepted_generation,
         } => json_response(
-            409,
+            403,
             &json!({
                 "error": "config_generation_superseded",
                 "detail": "config token deployment_generation is older than the generation this TEE has already accepted",

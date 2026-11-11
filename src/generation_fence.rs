@@ -7,9 +7,11 @@
 //! generation 0, so pre-fence tokens keep working until a positive generation
 //! has written, then cannot overwrite it.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -75,8 +77,48 @@ pub fn read_accepted_generation(config_dir: &Path) -> Result<Option<i64>, Genera
     }
 }
 
-/// Persist the accepted generation before the config value is written, so a
-/// crash cannot leave the new value stored without the fence that protects it.
+/// Holds an exclusive lock across the generation check and the config
+/// mutation. Drop releases the lock.
+#[derive(Debug)]
+pub struct ConfigGenerationGuard {
+    _lock: File,
+}
+
+/// Admit this token and keep the generation lock until the caller finishes
+/// the config write or delete. Concurrent admits cannot rewind the mark.
+pub fn admit_and_hold(
+    config_dir: &Path,
+    token_generation: Option<i64>,
+) -> Result<ConfigGenerationGuard, GenerationFenceError> {
+    fs::create_dir_all(config_dir)
+        .map_err(|error| GenerationFenceError::Io(format!("create_dir:{error}")))?;
+    let lock = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(config_dir.join(".accepted_deployment_generation.lock"))
+        .map_err(|error| GenerationFenceError::Io(format!("open_lock:{error}")))?;
+    // SAFETY: `lock` is an open file descriptor owned by this function, and
+    // LOCK_EX is a valid flock operation on that descriptor.
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(GenerationFenceError::Io(format!(
+            "flock:{}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let accepted = read_accepted_generation(config_dir)?;
+    let Some(next) = authorize_config_write(token_generation, accepted)? else {
+        return Ok(ConfigGenerationGuard { _lock: lock });
+    };
+    if Some(next) != accepted {
+        persist_accepted_generation(config_dir, next)?;
+    }
+    Ok(ConfigGenerationGuard { _lock: lock })
+}
+
+/// Persist a generation that the caller has already decided is allowed, and
+/// never install a value lower than the mark currently on disk.
 pub fn persist_accepted_generation(
     config_dir: &Path,
     generation: i64,
@@ -84,11 +126,25 @@ pub fn persist_accepted_generation(
     if generation < 0 {
         return Err(GenerationFenceError::Invalid);
     }
+    let current = read_accepted_generation(config_dir)?;
+    if let Some(accepted) = current.filter(|accepted| generation < *accepted) {
+        return Err(GenerationFenceError::Superseded {
+            token_generation: generation,
+            accepted_generation: accepted,
+        });
+    }
     fs::create_dir_all(config_dir)
         .map_err(|error| GenerationFenceError::Io(format!("create_dir:{error}")))?;
     let target = config_dir.join(ACCEPTED_GENERATION_FILE);
-    let tmp = config_dir.join(format!("{ACCEPTED_GENERATION_FILE}.tmp"));
-    let mut file = fs::OpenOptions::new()
+    let tmp = config_dir.join(format!(
+        "{ACCEPTED_GENERATION_FILE}.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = File::options()
         .write(true)
         .create(true)
         .truncate(true)
@@ -101,21 +157,9 @@ pub fn persist_accepted_generation(
     drop(file);
     fs::rename(&tmp, &target)
         .map_err(|error| GenerationFenceError::Io(format!("rename:{error}")))?;
-    Ok(())
-}
-
-/// Advance the on-disk mark if this token is allowed to write.
-pub fn admit_config_write(
-    config_dir: &Path,
-    token_generation: Option<i64>,
-) -> Result<(), GenerationFenceError> {
-    let accepted = read_accepted_generation(config_dir)?;
-    let Some(next) = authorize_config_write(token_generation, accepted)? else {
-        return Ok(());
-    };
-    if Some(next) != accepted {
-        persist_accepted_generation(config_dir, next)?;
-    }
+    File::open(config_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| GenerationFenceError::Io(format!("sync_dir:{error}")))?;
     Ok(())
 }
 
@@ -130,8 +174,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        admit_config_write(&dir, Some(12)).expect("first writer sets the mark");
-        let rejected = admit_config_write(&dir, Some(11)).expect_err("older generation");
+        admit_and_hold(&dir, Some(12)).expect("first writer sets the mark");
+        let rejected = admit_and_hold(&dir, Some(11)).expect_err("older generation");
         assert_eq!(
             rejected,
             GenerationFenceError::Superseded {
@@ -139,8 +183,8 @@ mod tests {
                 accepted_generation: 12,
             }
         );
-        admit_config_write(&dir, Some(12)).expect("same generation is a retry");
-        admit_config_write(&dir, None).expect_err("pre-fence token is generation 0");
+        admit_and_hold(&dir, Some(12)).expect("same generation is a retry");
+        admit_and_hold(&dir, None).expect_err("pre-fence token is generation 0");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -152,5 +196,36 @@ mod tests {
         assert_eq!(authorize_config_write(Some(4), Some(4)).unwrap(), Some(4));
         assert_eq!(authorize_config_write(Some(9), Some(4)).unwrap(), Some(9));
         assert!(authorize_config_write(Some(-1), None).is_err());
+    }
+
+    #[test]
+    fn concurrent_admits_keep_the_higher_mark() {
+        let dir = env::temp_dir().join(format!(
+            "enclava-generation-fence-race-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let left = {
+            let dir = dir.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                admit_and_hold(&dir, Some(5))
+            })
+        };
+        let right = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                admit_and_hold(&dir, Some(9))
+            })
+        };
+        let _ = left.join().expect("left admit");
+        let _ = right.join().expect("right admit");
+        assert_eq!(read_accepted_generation(&dir).unwrap(), Some(9));
+        assert!(admit_and_hold(&dir, Some(5)).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
