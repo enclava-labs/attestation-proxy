@@ -31,6 +31,10 @@ pub struct ApiTokenClaims {
     pub iat: u64,
     /// Expiry timestamp (Unix seconds).
     pub exp: u64,
+    /// Apply-job generation the token may write as. Absent claims are
+    /// generation 0 so pre-fence tokens keep working until a fenced write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<i64>,
 }
 
 /// Errors from JWT verification.
@@ -271,6 +275,7 @@ mod tests {
             scopes: vec!["config:write".to_string()],
             iat: now,
             exp: now + 300,
+            deployment_generation: None,
         }
     }
 
