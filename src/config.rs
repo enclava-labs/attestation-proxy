@@ -20,6 +20,8 @@ pub struct Config {
     pub kbs_resource_ca_cert_pem: String,
     pub kbs_resource_ca_cert_path: String,
     pub kbs_resource_cache_seconds: f64,
+    pub kbs_probe_send_attempts: u32,
+    pub kbs_probe_send_retry_sleep_seconds: f64,
     pub kbs_resource_failure_cache_seconds: f64,
     pub attestation_profile: String,
     pub attestation_runtime_class: String,
@@ -129,6 +131,8 @@ impl Config {
             aa_token_refresh_skew_seconds: env_f64("AA_TOKEN_REFRESH_SKEW_SECONDS", 5.0),
             aa_token_fetch_attempts: env_u32("AA_TOKEN_FETCH_ATTEMPTS", 3),
             aa_token_fetch_retry_sleep_seconds: env_f64("AA_TOKEN_FETCH_RETRY_SLEEP_SECONDS", 1.0),
+            kbs_probe_send_attempts: env_u32("KBS_PROBE_SEND_ATTEMPTS", 5),
+            kbs_probe_send_retry_sleep_seconds: env_f64("KBS_PROBE_SEND_RETRY_SLEEP_SECONDS", 5.0),
             kbs_resource_url: env_or(
                 "KBS_RESOURCE_URL",
                 "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource",
@@ -229,6 +233,8 @@ impl Config {
             aa_token_refresh_skew_seconds: 5.0,
             aa_token_fetch_attempts: 3,
             aa_token_fetch_retry_sleep_seconds: 1.0,
+            kbs_probe_send_attempts: 5,
+            kbs_probe_send_retry_sleep_seconds: 0.01,
             kbs_resource_url:
                 "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
                     .into(),
@@ -362,6 +368,8 @@ mod tests {
         assert_eq!(config.aa_token_refresh_skew_seconds, 5.0);
         assert_eq!(config.aa_token_fetch_attempts, 3);
         assert_eq!(config.aa_token_fetch_retry_sleep_seconds, 1.0);
+        assert_eq!(config.kbs_probe_send_attempts, 5);
+        assert_eq!(config.kbs_probe_send_retry_sleep_seconds, 5.0);
         assert_eq!(
             config.kbs_resource_url,
             "http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource"
