@@ -265,15 +265,38 @@ pub async fn probe_direct_kbs_resource_status(
         resource_path.trim_start_matches('/'),
     );
 
-    let response = state
-        .http_client
-        .get(&resource_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/octet-stream")
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| OwnershipError::Store(format!("kbs_resource_probe_failed:{e}")))?;
+    // Transport errors (refused/reset/timeout) are the mid-roll KBS window: a
+    // trustee roll restarts KBS and one blip otherwise latches as a permanent
+    // probe failure. Bounded retries bridge a pod restart; HTTP statuses are
+    // never retried here (the caller owns status semantics).
+    // shortcut: bridges ~20s of churn at the defaults; a longer roll still
+    // latches, until the caller's re-probe half lands (the deeper fix)
+    let mut attempt = 0_u32;
+    let response = loop {
+        attempt += 1;
+        match state
+            .http_client
+            .get(&resource_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/octet-stream")
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(response) => break response,
+            Err(_) if attempt < state.config.kbs_probe_send_attempts => {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(
+                    state.config.kbs_probe_send_retry_sleep_seconds,
+                ))
+                .await;
+            }
+            Err(err) => {
+                return Err(OwnershipError::Store(format!(
+                    "kbs_resource_probe_failed:{err}"
+                )))
+            }
+        }
+    };
 
     Ok(response.status().as_u16())
 }
@@ -819,6 +842,83 @@ mod tests {
         };
         assert!(!entry.is_valid());
         assert!(!entry.has_valid_error());
+    }
+
+    #[tokio::test]
+    async fn probe_retries_transport_failures_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A KBS mid-roll: accepts TCP and drops it (refused/reset shape).
+        // The accept counter proves the retry count exactly, no timing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind drop listener");
+        let addr = listener.local_addr().expect("drop listener addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = accepts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.expect("accept");
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                drop(sock); // reset: every probe send fails at transport
+            }
+        });
+
+        // The AA serves tokens normally (only the resource endpoint churns).
+        let aa_app = axum::Router::new().route(
+            "/aa/token",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "token": "t" })) }),
+        );
+        let aa_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind aa mock");
+        let aa_addr = aa_listener.local_addr().expect("aa mock addr");
+        let aa_server = tokio::spawn(async move {
+            axum::serve(aa_listener, aa_app)
+                .await
+                .expect("serve aa mock");
+        });
+
+        let mut config = crate::config::Config::from_env_for_test();
+        config.aa_token_url = format!("http://{aa_addr}/aa/token");
+        config.kbs_resource_url = format!("http://{addr}/kbs/v0/resource");
+        config.kbs_probe_send_attempts = 5;
+        config.kbs_probe_send_retry_sleep_seconds = 0.01;
+        let state = crate::AppState {
+            ownership: std::sync::Arc::new(crate::ownership::OwnershipGuard::new(
+                "password".to_string(),
+            )),
+            config: std::sync::Arc::new(config),
+            http_client: reqwest::Client::new(),
+            aa_token_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::attestation::AaTokenCache::new(),
+            )),
+            kbs_resource_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            bootstrap_challenges: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            receipt_signer: std::sync::Arc::new(crate::receipts::ReceiptSigner::ephemeral()),
+            tls_leaf_spki_sha256: [0_u8; 32],
+        };
+
+        let err = probe_direct_kbs_resource_status(&state, "default/o/seed-encrypted")
+            .await
+            .expect_err("transport failure must surface, not succeed");
+        assert!(
+            matches!(&err, OwnershipError::Store(msg) if msg.starts_with("kbs_resource_probe_failed:")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            5,
+            "retries must be exactly the bounded attempts"
+        );
+
+        server.abort();
+        aa_server.abort();
     }
 
     #[tokio::test]
