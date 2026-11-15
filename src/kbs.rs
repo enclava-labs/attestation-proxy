@@ -251,6 +251,7 @@ pub async fn fetch_kbs_resource(
 /// Probe the direct KBS resource endpoint with bearer auth and return its HTTP status.
 /// This is used to classify CDH passthrough failures for owner-seed reads without
 /// relying on AA/CDH's current "500 for missing resource" behavior.
+const KBS_PROBE_SEND_TOTAL_DEADLINE_S: u64 = 30;
 pub async fn probe_direct_kbs_resource_status(
     state: &crate::AppState,
     resource_path: &str,
@@ -265,13 +266,20 @@ pub async fn probe_direct_kbs_resource_status(
         resource_path.trim_start_matches('/'),
     );
 
-    // Transport errors (refused/reset/timeout) are the mid-roll KBS window: a
-    // trustee roll restarts KBS and one blip otherwise latches as a permanent
-    // probe failure. Bounded retries bridge a pod restart; HTTP statuses are
-    // never retried here (the caller owns status semantics).
-    // shortcut: bridges ~20s of churn at the defaults; a longer roll still
-    // latches, until the caller's re-probe half lands (the deeper fix)
+    // Transport failures are the mid-roll KBS window: a trustee roll restarts
+    // KBS and one blip otherwise latches as a permanent probe failure. Bounded
+    // retries bridge a pod restart; HTTP statuses are never retried here (the
+    // caller owns status semantics). All transport error classes retry: the
+    // observed churn signature is mid-request reset (`error sending request`),
+    // and refused/timeout share the window. The total deadline bounds the
+    // hanging-KBS shape (each attempt can burn its 20s request timeout) and the
+    // permanent-misconfig burn.
+    // shortcut: bridges ~20s of fast-failure churn at the defaults; a longer
+    // roll still latches, until the caller's re-probe half lands (the deeper fix)
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(KBS_PROBE_SEND_TOTAL_DEADLINE_S);
     let mut attempt = 0_u32;
+    let mut first_err: Option<String> = None;
     let response = loop {
         attempt += 1;
         match state
@@ -284,16 +292,23 @@ pub async fn probe_direct_kbs_resource_status(
             .await
         {
             Ok(response) => break response,
-            Err(_) if attempt < state.config.kbs_probe_send_attempts => {
+            Err(err)
+                if attempt < state.config.kbs_probe_send_attempts
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                first_err.get_or_insert_with(|| err.to_string());
                 tokio::time::sleep(std::time::Duration::from_secs_f64(
-                    state.config.kbs_probe_send_retry_sleep_seconds,
+                    state.config.kbs_probe_send_retry_sleep_seconds.max(0.0),
                 ))
                 .await;
             }
             Err(err) => {
+                // keep the first error's class too: the last attempt's can look
+                // transient even when the failure is a permanent misconfig
+                let first = first_err.unwrap_or_else(|| err.to_string());
                 return Err(OwnershipError::Store(format!(
-                    "kbs_resource_probe_failed:{err}"
-                )))
+                    "kbs_resource_probe_failed:attempts={attempt} first=({first}) last=({err})"
+                )));
             }
         }
     };
