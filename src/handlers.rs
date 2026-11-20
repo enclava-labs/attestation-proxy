@@ -27,8 +27,9 @@ use crate::escrow::{self, EscrowValueUpdate, OwnerSeedMaterial};
 use crate::kbs;
 use crate::ownership::utc_now;
 use crate::ownership::{
-    BootstrapChallenge, HandoffOutcome, OwnershipError, OwnershipObservation, RecoveryClaim,
-    BOOTSTRAP_CHALLENGE_MAX_ACTIVE, SIGNAL_APP_DATA_SLOT, SIGNAL_TLS_DATA_SLOT,
+    BootstrapChallenge, BootstrapChallengePurpose, HandoffOutcome, OwnershipError,
+    OwnershipObservation, RecoveryClaim, BOOTSTRAP_CHALLENGE_MAX_ACTIVE, SIGNAL_APP_DATA_SLOT,
+    SIGNAL_TLS_DATA_SLOT,
 };
 use crate::receipts::SignReceiptRequest;
 use crate::AppState;
@@ -99,6 +100,28 @@ pub struct RecoverRequest {
 
 #[derive(serde::Deserialize)]
 pub struct BootstrapClaimRequest {
+    pub challenge: String,
+    pub bootstrap_pubkey: String,
+    pub signature: String,
+    pub password: Zeroizing<String>,
+}
+
+/// Optional body of the bootstrap challenge endpoint. Absent or `"claim"`
+/// keeps the legacy claim-challenge request shape; `"export-mnemonic"` mints a
+/// challenge for the recovery-mnemonic re-export.
+#[derive(serde::Deserialize)]
+pub struct BootstrapChallengeRequest {
+    pub purpose: Option<String>,
+}
+
+/// Recovery-mnemonic re-export over the ownership channel: the claim-time
+/// proof shape (challenge signed by the pinned bootstrap key) plus the unlock
+/// password that unwraps the owner-seed envelope. Both factors were presented
+/// at claim time; requiring both again keeps the re-export at the claim's
+/// authority level instead of minting a password-only oracle for the root
+/// recovery secret.
+#[derive(serde::Deserialize)]
+pub struct BootstrapMnemonicExportRequest {
     pub challenge: String,
     pub bootstrap_pubkey: String,
     pub signature: String,
@@ -267,7 +290,12 @@ fn prune_bootstrap_challenges(
     }
 }
 
-fn record_bootstrap_challenge(state: &AppState, challenge_b64: String, expires_at: Instant) {
+fn record_bootstrap_challenge(
+    state: &AppState,
+    challenge_b64: String,
+    expires_at: Instant,
+    purpose: BootstrapChallengePurpose,
+) {
     let mut challenges = state
         .bootstrap_challenges
         .lock()
@@ -279,20 +307,24 @@ fn record_bootstrap_challenge(state: &AppState, challenge_b64: String, expires_a
     challenges.push_back(BootstrapChallenge {
         challenge_b64,
         expires_at,
+        purpose,
     });
 }
 
-fn consume_bootstrap_challenge(state: &AppState, challenge_b64: &str) -> bool {
+fn consume_bootstrap_challenge(
+    state: &AppState,
+    challenge_b64: &str,
+    purpose: BootstrapChallengePurpose,
+) -> bool {
     let mut challenges = state
         .bootstrap_challenges
         .lock()
         .expect("bootstrap challenge lock poisoned");
     let now = Instant::now();
     prune_bootstrap_challenges(&mut challenges, now);
-    let Some(index) = challenges
-        .iter()
-        .position(|challenge| challenge.challenge_b64 == challenge_b64)
-    else {
+    let Some(index) = challenges.iter().position(|challenge| {
+        challenge.challenge_b64 == challenge_b64 && challenge.purpose == purpose
+    }) else {
         return false;
     };
     challenges.remove(index);
@@ -2778,18 +2810,40 @@ fn unlock_poll_timeout_seconds() -> u64 {
     crate::ownership::HANDOFF_DEFAULT_TIMEOUT_SECONDS
 }
 
-pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
+pub async fn bootstrap_challenge(
+    State(state): State<AppState>,
+    body: Option<Json<BootstrapChallengeRequest>>,
+) -> Response {
+    let Some(purpose) = BootstrapChallengePurpose::parse(
+        body.as_ref().and_then(|Json(body)| body.purpose.as_deref()),
+    ) else {
+        return json_response(
+            400,
+            &json!({"error": "bootstrap_challenge_purpose_invalid"}),
+        );
+    };
     if !state.ownership.requires_manual_unlock() {
         return json_response(404, &json!({"error": "not_found"}));
     }
     if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
         return refresh_failed;
     }
-    if !state.ownership.is_unclaimed() {
-        return json_response(
-            409,
-            &json!({"error": "already_claimed", "state": state.ownership.state_json()}),
-        );
+    // Claim challenges exist only while unclaimed; re-export challenges only
+    // once ownership exists to re-export from.
+    match purpose {
+        BootstrapChallengePurpose::Claim if !state.ownership.is_unclaimed() => {
+            return json_response(
+                409,
+                &json!({"error": "already_claimed", "state": state.ownership.state_json()}),
+            );
+        }
+        BootstrapChallengePurpose::ExportMnemonic if state.ownership.is_unclaimed() => {
+            return json_response(
+                409,
+                &json!({"error": "unclaimed", "state": state.ownership.state_json()}),
+            );
+        }
+        _ => {}
     }
 
     let identity = fetch_ownership_identity(&state).await;
@@ -2810,7 +2864,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
     let expires_at = Instant::now()
         + std::time::Duration::from_secs(state.config.ownership_challenge_ttl_seconds as u64);
-    record_bootstrap_challenge(&state, challenge_b64.clone(), expires_at);
+    record_bootstrap_challenge(&state, challenge_b64.clone(), expires_at, purpose);
 
     json_response(
         200,
@@ -2818,6 +2872,7 @@ pub async fn bootstrap_challenge(State(state): State<AppState>) -> Response {
             "instance_id": state.config.instance_id,
             "challenge": challenge_b64,
             "nonce": challenge_b64,
+            "purpose": purpose.name(),
             "expires_in_seconds": state.config.ownership_challenge_ttl_seconds,
         }),
     )
@@ -2843,7 +2898,8 @@ pub async fn bootstrap_claim(
         return json_response(400, &json!({"error": "password_required"}));
     }
 
-    let challenge_ok = consume_bootstrap_challenge(&state, &payload.challenge);
+    let challenge_ok =
+        consume_bootstrap_challenge(&state, &payload.challenge, BootstrapChallengePurpose::Claim);
     if !challenge_ok {
         return json_response(400, &json!({"error": "bootstrap_challenge_invalid"}));
     }
@@ -2956,6 +3012,151 @@ pub async fn bootstrap_claim(
             )
         }
     }
+}
+
+/// Attested, tenant-authenticated recovery-mnemonic re-export over the
+/// ownership channel (enclava-labs/cap#404).
+///
+/// The claim response is the only delivery of the one-time mnemonic; when it
+/// is lost after the TEE committed ownership (a transport cut at the wrong
+/// instant), the owner previously had no way to re-obtain it. This re-derives
+/// the mnemonic from the escrowed owner-seed envelope and delivers it over the
+/// same attested, SPKI-pinned channel, authenticated at the claim's authority
+/// level: a fresh single-use challenge signed by the bootstrap key pinned in
+/// the workload identity, PLUS the unlock password that unwraps the envelope.
+/// Either factor alone is weaker than the claim; together they match it.
+///
+/// The envelope is read, never rewritten, so a re-export cannot race or alter
+/// ownership state. Every export is rate-limited with the other secret
+/// operations (it must never become a password oracle) and audited like
+/// `change_password`.
+pub async fn bootstrap_mnemonic_export(
+    State(state): State<AppState>,
+    Json(mut payload): Json<BootstrapMnemonicExportRequest>,
+) -> Response {
+    if !state.ownership.requires_manual_unlock() {
+        return json_response(404, &json!({"error": "not_found"}));
+    }
+    // Share the secret-operation attempt budget with unlock / change-password
+    // / recover: the password check below must be as brute-forceable as the
+    // others and no more.
+    if let Some(response) = begin_rate_limited_secret_operation(&state) {
+        return response;
+    }
+    if payload.password.trim().is_empty() {
+        return json_response(400, &json!({"error": "password_required"}));
+    }
+
+    let challenge_ok = consume_bootstrap_challenge(
+        &state,
+        &payload.challenge,
+        BootstrapChallengePurpose::ExportMnemonic,
+    );
+    if !challenge_ok {
+        return json_response(400, &json!({"error": "bootstrap_challenge_invalid"}));
+    }
+
+    let identity = fetch_ownership_identity(&state).await;
+    let expected_hash = match identity.bootstrap_owner_pubkey_hash {
+        Some(hash) => hash,
+        None => {
+            return json_response(
+                409,
+                &json!({"error": "bootstrap_owner_pubkey_hash_missing", "claims_error": identity.claims_error}),
+            );
+        }
+    };
+
+    if let Err(err) = validate_bootstrap_signature(
+        &payload.challenge,
+        &payload.bootstrap_pubkey,
+        &payload.signature,
+        &expected_hash,
+    ) {
+        return json_response(
+            401,
+            &json!({"error": "bootstrap_signature_invalid", "detail": err.to_string()}),
+        );
+    }
+
+    if let Some(refresh_failed) = maybe_refresh_unclaimed_state(&state).await {
+        return refresh_failed;
+    }
+    if state.ownership.is_unclaimed() {
+        return json_response(409, &json!({"error": "unclaimed", "state": "unclaimed"}));
+    }
+    let material = match load_owner_seed_material_with_revalidation(&state).await {
+        Ok(material) => material,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "mnemonic_export_failed", "detail": err.to_string()}),
+            );
+        }
+    };
+    let Some(encrypted) = material.encrypted.as_ref() else {
+        // Ownership exists but no password envelope to re-derive from (a
+        // legacy sealed-only app, or seed material lost): there is no source
+        // left to export from, and no new seed may be minted here.
+        return json_response(
+            409,
+            &json!({"error": "owner_seed_envelope_missing", "state": state.ownership.state_json()}),
+        );
+    };
+
+    let mut password = take_secret_bytes(&mut payload.password);
+    let wrap_key = match state
+        .ownership
+        .derive_password_wrap_key(&mut password, &state.config.instance_id)
+    {
+        Ok(key) => key,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "mnemonic_export_failed", "detail": err.to_string()}),
+            );
+        }
+    };
+    let owner_seed = match state.ownership.decrypt_owner_seed(encrypted, &wrap_key) {
+        Ok(seed) => seed,
+        Err(OwnershipError::WrongPassword) => {
+            return json_response(401, &json!({"error": "wrong_password"}))
+        }
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "mnemonic_export_failed", "detail": err.to_string()}),
+            );
+        }
+    };
+
+    let mnemonic = match state.ownership.owner_seed_mnemonic(&owner_seed) {
+        Ok(mnemonic) => mnemonic,
+        Err(err) => {
+            return json_response(
+                500,
+                &json!({"error": "mnemonic_export_failed", "detail": err.to_string()}),
+            );
+        }
+    };
+    let owner_pubkey = state
+        .ownership
+        .owner_public_key_b64url(&owner_seed)
+        .unwrap_or_default();
+    emit_signed_owner_audit_event(
+        &state,
+        &owner_seed,
+        "export_mnemonic",
+        json!({ "owner_public_key": owner_pubkey.clone() }),
+    );
+    json_response(
+        200,
+        &json!({
+            "status": "MNEMONIC_EXPORTED",
+            "owner_public_key": owner_pubkey,
+            "owner_seed_mnemonic": mnemonic,
+        }),
+    )
 }
 
 pub async fn change_password(
@@ -4123,7 +4324,7 @@ mod tests {
         for _ in 0..2 {
             let response = status(State(state.clone())).await;
             assert_eq!(response.status().as_u16(), 503);
-            let response = bootstrap_challenge(State(state.clone())).await;
+            let response = bootstrap_challenge(State(state.clone()), None).await;
             assert_eq!(response.status().as_u16(), 503);
             let body = read_json(response).await;
             assert!(
@@ -4143,7 +4344,7 @@ mod tests {
         // The legitimate result returns: polls and challenges flow again.
         let response = status(State(state.clone())).await;
         assert_eq!(response.status().as_u16(), 200);
-        let response = bootstrap_challenge(State(state.clone())).await;
+        let response = bootstrap_challenge(State(state.clone()), None).await;
         assert_eq!(response.status().as_u16(), 200);
         let body = read_json(response).await;
         assert!(body.get("challenge").is_some(), "challenge must be served");
@@ -6500,8 +6701,8 @@ mod tests {
         );
         initialize_ownership_state(&state).await;
 
-        let challenge1 = read_json(bootstrap_challenge(State(state.clone())).await).await;
-        let challenge2 = read_json(bootstrap_challenge(State(state.clone())).await).await;
+        let challenge1 = read_json(bootstrap_challenge(State(state.clone()), None).await).await;
+        let challenge2 = read_json(bootstrap_challenge(State(state.clone()), None).await).await;
         let challenge1_b64 = challenge1
             .get("challenge")
             .and_then(Value::as_str)
@@ -6646,6 +6847,316 @@ mod tests {
         assert_eq!(
             read_json(limited).await,
             json!({"error": "rate_limited", "retry_after": 60})
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery-mnemonic re-export (enclava-labs/cap#404)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mnemonic_reexport_returns_the_claim_mnemonic_to_a_reauthenticated_owner() {
+        let signal_dir = test_signal_dir("mnemonic-export");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[14u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("mnemonic-export-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let claim = claim_owner(&state, &signing_key, "claim-password").await;
+        let claimed_mnemonic = claim
+            .get("owner_seed_mnemonic")
+            .and_then(Value::as_str)
+            .expect("claim delivers the one-time mnemonic")
+            .to_string();
+        let claimed_pubkey = claim
+            .get("owner_public_key")
+            .and_then(Value::as_str)
+            .expect("claim owner public key")
+            .to_string();
+
+        // The re-export is the SAME mnemonic, re-derived from the escrowed
+        // envelope -- never a fresh seed (which would silently orphan the
+        // storage the claim just keyed).
+        let response = export_mnemonic_with_password(&state, &signing_key, "claim-password").await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("MNEMONIC_EXPORTED")
+        );
+        assert_eq!(
+            body.get("owner_seed_mnemonic").and_then(Value::as_str),
+            Some(claimed_mnemonic.as_str()),
+            "the re-export must return the claim's exact mnemonic"
+        );
+        assert_eq!(
+            body.get("owner_public_key").and_then(Value::as_str),
+            Some(claimed_pubkey.as_str())
+        );
+
+        // Idempotent: re-exporting again keeps delivering the same mnemonic.
+        let response = export_mnemonic_with_password(&state, &signing_key, "claim-password").await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("owner_seed_mnemonic").and_then(Value::as_str),
+            Some(claimed_mnemonic.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mnemonic_reexport_is_rate_limited_and_rejects_wrong_passwords() {
+        let signal_dir = test_signal_dir("mnemonic-export-rate-limit");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[15u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("mnemonic-export-rate-limit-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+
+        // The password check is an oracle surface: it must share the
+        // unlock/change-password/recover attempt budget exactly.
+        for _ in 0..5 {
+            let response =
+                export_mnemonic_with_password(&state, &signing_key, "wrong-password").await;
+            assert_eq!(response.status().as_u16(), 401);
+            assert_eq!(
+                read_json(response).await,
+                json!({"error": "wrong_password"})
+            );
+        }
+
+        let limited = export_mnemonic_with_password(&state, &signing_key, "wrong-password").await;
+        assert_eq!(limited.status().as_u16(), 429);
+        assert_eq!(
+            read_json(limited).await,
+            json!({"error": "rate_limited", "retry_after": 60})
+        );
+    }
+
+    #[tokio::test]
+    async fn mnemonic_reexport_binds_the_challenge_to_its_purpose_and_consumes_it_once() {
+        let signal_dir = test_signal_dir("mnemonic-export-challenge-binding");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[16u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("mnemonic-export-binding-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        // A claim-purpose challenge minted while unclaimed must never become a
+        // re-export after the claim (cross-protocol nonce reuse).
+        let claim_challenge =
+            read_json(bootstrap_challenge(State(state.clone()), None).await).await;
+        let claim_challenge_b64 = claim_challenge
+            .get("challenge")
+            .and_then(Value::as_str)
+            .expect("claim challenge")
+            .to_string();
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+
+        let sign_over = |challenge_b64: &str| {
+            let challenge_bytes = BASE64_URL_SAFE_NO_PAD
+                .decode(challenge_b64.as_bytes())
+                .expect("decode challenge");
+            let signature = signing_key.sign(&challenge_bytes);
+            BootstrapMnemonicExportRequest {
+                challenge: challenge_b64.to_string(),
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: Zeroizing::new("claim-password".to_string()),
+            }
+        };
+
+        let response =
+            bootstrap_mnemonic_export(State(state.clone()), Json(sign_over(&claim_challenge_b64)))
+                .await;
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "bootstrap_challenge_invalid"})
+        );
+
+        // A re-export challenge is single-use: a captured request cannot be
+        // replayed.
+        let export_challenge_b64 = export_challenge(&state).await;
+        let response =
+            bootstrap_mnemonic_export(State(state.clone()), Json(sign_over(&export_challenge_b64)))
+                .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let response =
+            bootstrap_mnemonic_export(State(state.clone()), Json(sign_over(&export_challenge_b64)))
+                .await;
+        assert_eq!(response.status().as_u16(), 400);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "bootstrap_challenge_invalid"})
+        );
+    }
+
+    #[tokio::test]
+    async fn mnemonic_reexport_rejects_an_unpinned_bootstrap_key() {
+        let signal_dir = test_signal_dir("mnemonic-export-signature");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[17u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("mnemonic-export-signature-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+
+        // Right proof shape, wrong key: the workload identity pins the
+        // bootstrap pubkey hash, and only that owner may re-export.
+        let attacker_key = SigningKey::from_bytes(&[18u8; 32]);
+        let challenge_b64 = export_challenge(&state).await;
+        let challenge_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(challenge_b64.as_bytes())
+            .expect("decode challenge");
+        let signature = attacker_key.sign(&challenge_bytes);
+        let response = bootstrap_mnemonic_export(
+            State(state.clone()),
+            Json(BootstrapMnemonicExportRequest {
+                challenge: challenge_b64,
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(attacker_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 401);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "bootstrap_signature_invalid", "detail": "envelope_error: bootstrap_pubkey_hash_mismatch"})
+        );
+    }
+
+    #[tokio::test]
+    async fn mnemonic_reexport_refuses_unclaimed_ownership_and_a_missing_envelope() {
+        let signal_dir = test_signal_dir("mnemonic-export-no-source");
+        mark_password_slots_unlocked(&signal_dir.path);
+
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        let bootstrap_hash = bootstrap_owner_pubkey_hash(&signing_key);
+        let api_server = spawn_test_api_server(
+            owner_escrow_secret_json(None, None),
+            test_identity_claims(&bootstrap_hash),
+            HashMap::new(),
+        )
+        .await;
+        let token_file = test_temp_file("mnemonic-export-no-source-token", "test-token");
+        let state = build_state_with_secret_backend(
+            &signal_dir.path,
+            "password",
+            api_server.base_url(),
+            &token_file.path,
+        );
+        initialize_ownership_state(&state).await;
+
+        // Unclaimed: nothing exists to re-export, and the challenge endpoint
+        // refuses to mint for the export purpose; a hand-recorded challenge
+        // still ends at the explicit 409.
+        let unclaimed_challenge = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        record_bootstrap_challenge(
+            &state,
+            unclaimed_challenge.clone(),
+            Instant::now() + Duration::from_secs(60),
+            BootstrapChallengePurpose::ExportMnemonic,
+        );
+        let challenge_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(unclaimed_challenge.as_bytes())
+            .expect("decode challenge");
+        let signature = signing_key.sign(&challenge_bytes);
+        let response = bootstrap_mnemonic_export(
+            State(state.clone()),
+            Json(BootstrapMnemonicExportRequest {
+                challenge: unclaimed_challenge,
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: Zeroizing::new("claim-password".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(
+            read_json(response).await,
+            json!({"error": "unclaimed", "state": "unclaimed"})
+        );
+        let challenge = export_challenge_request_body(&state).await;
+        assert_eq!(
+            challenge.get("error").and_then(Value::as_str),
+            Some("unclaimed"),
+            "the export challenge endpoint must refuse unclaimed ownership"
+        );
+
+        // Claimed but the envelope is gone (seed material lost): the export
+        // must fail closed instead of minting a NEW seed that could never
+        // match the keyed storage.
+        let _ = claim_owner(&state, &signing_key, "claim-password").await;
+        update_owner_seed_material(&state, EscrowValueUpdate::Remove, EscrowValueUpdate::Remove)
+            .await
+            .expect("remove envelope");
+        let response = export_mnemonic_with_password(&state, &signing_key, "claim-password").await;
+        assert_eq!(response.status().as_u16(), 409);
+        let body = read_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("owner_seed_envelope_missing")
         );
     }
 
@@ -8482,7 +8993,7 @@ mod tests {
     }
 
     async fn claim_owner(state: &AppState, signing_key: &SigningKey, password: &str) -> Value {
-        let challenge = bootstrap_challenge(State(state.clone())).await;
+        let challenge = bootstrap_challenge(State(state.clone()), None).await;
         let challenge_body = read_json(challenge).await;
         assert!(
             challenge_body.get("error").is_none(),
@@ -8513,6 +9024,62 @@ mod tests {
             "bootstrap claim failed: {body}"
         );
         body
+    }
+
+    /// Mint a re-export-purpose challenge: the challenge endpoint must serve
+    /// claimed apps for this purpose (the claim purpose keeps refusing them).
+    async fn export_challenge(state: &AppState) -> String {
+        let challenge_body = export_challenge_request_body(state).await;
+        assert!(
+            challenge_body.get("error").is_none(),
+            "export challenge failed: {challenge_body}"
+        );
+        assert_eq!(
+            challenge_body.get("purpose").and_then(Value::as_str),
+            Some("export-mnemonic")
+        );
+        challenge_body
+            .get("challenge")
+            .and_then(Value::as_str)
+            .expect("challenge")
+            .to_string()
+    }
+
+    /// Raw re-export-purpose challenge answer, for asserting refusals too.
+    async fn export_challenge_request_body(state: &AppState) -> Value {
+        let challenge = bootstrap_challenge(
+            State(state.clone()),
+            Some(Json(BootstrapChallengeRequest {
+                purpose: Some("export-mnemonic".to_string()),
+            })),
+        )
+        .await;
+        read_json(challenge).await
+    }
+
+    /// Full re-export round trip over the claim-time proof shape: a fresh
+    /// challenge signed by the pinned bootstrap key, plus the unlock password.
+    async fn export_mnemonic_with_password(
+        state: &AppState,
+        signing_key: &SigningKey,
+        password: &str,
+    ) -> Response {
+        let challenge_b64 = export_challenge(state).await;
+        let challenge_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(challenge_b64.as_bytes())
+            .expect("decode challenge");
+        let signature = signing_key.sign(&challenge_bytes);
+        bootstrap_mnemonic_export(
+            State(state.clone()),
+            Json(BootstrapMnemonicExportRequest {
+                challenge: challenge_b64,
+                bootstrap_pubkey: BASE64_URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().as_bytes()),
+                signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                password: Zeroizing::new(password.to_string()),
+            }),
+        )
+        .await
     }
 
     fn decrypt_owner_seed_with_password(

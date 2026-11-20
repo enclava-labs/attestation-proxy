@@ -211,6 +211,38 @@ pub enum HandoffOutcome {
 pub struct BootstrapChallenge {
     pub challenge_b64: String,
     pub expires_at: Instant,
+    pub purpose: BootstrapChallengePurpose,
+}
+
+/// Protocol step a bootstrap challenge is minted for. The purpose is minted
+/// and consumed together so a challenge issued for one step can never be
+/// replayed into the other: a claim challenge can only become a claim, and a
+/// mnemonic re-export challenge can only become a re-export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapChallengePurpose {
+    /// First-time ownership claim (`POST /bootstrap/claim`).
+    Claim,
+    /// Recovery-mnemonic re-export (`POST /bootstrap/mnemonic`).
+    ExportMnemonic,
+}
+
+impl BootstrapChallengePurpose {
+    /// Parse the wire purpose; the empty string keeps the legacy
+    /// claim-challenge request shape (no body) working.
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some("") | Some("claim") => Some(Self::Claim),
+            Some("export-mnemonic") => Some(Self::ExportMnemonic),
+            Some(_) => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::ExportMnemonic => "export-mnemonic",
+        }
+    }
 }
 
 const ALLOWED_PATHS: &[&str] = &[
@@ -230,6 +262,7 @@ const ALLOWED_PATHS: &[&str] = &[
     "/.well-known/confidential/disable-auto-unlock",
     "/.well-known/confidential/bootstrap/challenge",
     "/.well-known/confidential/bootstrap/claim",
+    "/.well-known/confidential/bootstrap/mnemonic",
     "/.well-known/confidential/logs",
     "/status",
     "/.well-known/confidential/status",
