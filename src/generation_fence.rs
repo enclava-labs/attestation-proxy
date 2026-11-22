@@ -207,23 +207,37 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        // Each racer must drop its fence guard before its thread exits: the
+        // guard holds the flock's file descriptor, and a spawned thread's
+        // return value stays alive inside its JoinHandle until join()
+        // consumes it. With ordered joins below, a second-joined racer that
+        // exits while holding the fence keeps the fd open forever — the
+        // first join then blocks on a lock no live thread will release, and
+        // the suite hangs (observed as the 6h CI timeout on this branch).
+        // Dropping at thread end mirrors the real caller, which releases the
+        // fence when its config write completes.
         let left = {
             let dir = dir.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                admit_and_hold(&dir, Some(5))
+                let fenced = admit_and_hold(&dir, Some(5));
+                drop(fenced);
             })
         };
         let right = {
             let dir = dir.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                admit_and_hold(&dir, Some(9))
+                let fenced = admit_and_hold(&dir, Some(9));
+                drop(fenced);
             })
         };
-        let _ = left.join().expect("left admit");
-        let _ = right.join().expect("right admit");
+        left.join().expect("left racer must not panic");
+        right.join().expect("right racer must not panic");
+        // Either interleaving is legal: 5 admits first and 9 raises the mark,
+        // or 9 admits first and 5 is superseded. Both must leave 9 as the
+        // accepted generation.
         assert_eq!(read_accepted_generation(&dir).unwrap(), Some(9));
         assert!(admit_and_hold(&dir, Some(5)).is_err());
         let _ = fs::remove_dir_all(&dir);
