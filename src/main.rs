@@ -292,6 +292,10 @@ fn app_router(state: AppState, expose_config_routes: bool) -> Router {
             post(handlers::bootstrap_claim),
         )
         .route(
+            "/.well-known/confidential/bootstrap/mnemonic",
+            post(handlers::bootstrap_mnemonic_export),
+        )
+        .route(
             "/.well-known/confidential/logs",
             get(handlers::encrypted_logs),
         );
