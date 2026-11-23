@@ -3364,6 +3364,10 @@ pub async fn config_put(
     if let Err(response) = require_config_storage_ready(&state).await {
         return response;
     }
+    let _generation_guard = match enforce_config_generation(&state, claims.deployment_generation) {
+        Ok(guard) => guard,
+        Err(error) => return config_generation_rejection(error),
+    };
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     let config_options =
         crate::config_store::ConfigStoreOptions::with_file_gid(state.config.cap_config_file_gid);
@@ -3422,6 +3426,10 @@ pub async fn config_delete(
     if let Err(response) = require_config_storage_ready(&state).await {
         return response;
     }
+    let _generation_guard = match enforce_config_generation(&state, claims.deployment_generation) {
+        Ok(guard) => guard,
+        Err(error) => return config_generation_rejection(error),
+    };
     let config_dir = std::path::Path::new(&state.config.cap_config_dir);
     match crate::config_store::delete_config(config_dir, &key) {
         Ok(existed) => {
@@ -3445,6 +3453,45 @@ pub async fn config_delete(
         Err(e) => json_response(
             500,
             &json!({"error": "config_delete_failed", "detail": e.to_string()}),
+        ),
+    }
+}
+
+fn enforce_config_generation(
+    state: &AppState,
+    token_generation: Option<i64>,
+) -> Result<
+    crate::generation_fence::ConfigGenerationGuard,
+    crate::generation_fence::GenerationFenceError,
+> {
+    let config_dir = std::path::Path::new(&state.config.cap_config_dir);
+    crate::generation_fence::admit_and_hold(config_dir, token_generation)
+}
+
+fn config_generation_rejection(error: crate::generation_fence::GenerationFenceError) -> Response {
+    match error {
+        crate::generation_fence::GenerationFenceError::Superseded {
+            token_generation,
+            accepted_generation,
+        } => json_response(
+            403,
+            &json!({
+                "error": "config_generation_superseded",
+                "detail": "config token deployment_generation is older than the generation this TEE has already accepted",
+                "token_generation": token_generation,
+                "accepted_generation": accepted_generation,
+            }),
+        ),
+        crate::generation_fence::GenerationFenceError::Invalid => json_response(
+            401,
+            &json!({
+                "error": "invalid_deployment_generation",
+                "detail": "config token deployment_generation must be non-negative",
+            }),
+        ),
+        error => json_response(
+            500,
+            &json!({"error": "config_generation_fence_failed", "detail": error.to_string()}),
         ),
     }
 }
@@ -8565,6 +8612,7 @@ mod tests {
             scopes: vec![scope.to_string()],
             iat: now,
             exp: now + 300,
+            deployment_generation: None,
         }
     }
 
@@ -8627,6 +8675,50 @@ mod tests {
         // Verify file was written
         let content = fs::read(dir.join("DATABASE_URL")).expect("config file should exist");
         assert_eq!(content, b"postgres://localhost/mydb");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn config_put_and_delete_reject_a_superseded_deployment_generation() {
+        let dir = test_config_dir("put-generation-fence");
+        let state = build_config_test_state(&dir);
+        let mut current = test_api_claims("instance-test-01", "config:write");
+        current.deployment_generation = Some(12);
+
+        let response = config_put(
+            State(state.clone()),
+            crate::jwt::ConfigAuth(current.clone()),
+            Path("SSH_AUTHORIZED_KEYS".to_string()),
+            Bytes::from_static(b"ssh-ed25519 AAAA newer"),
+        )
+        .await;
+        let body = read_json(response).await;
+        assert_eq!(body["status"], "ok");
+
+        let mut stale = test_api_claims("instance-test-01", "config:write");
+        stale.deployment_generation = Some(11);
+        let rejected = config_put(
+            State(state.clone()),
+            crate::jwt::ConfigAuth(stale.clone()),
+            Path("SSH_AUTHORIZED_KEYS".to_string()),
+            Bytes::from_static(b"ssh-ed25519 AAAA stale"),
+        )
+        .await;
+        let rejected_body = read_json(rejected).await;
+        assert_eq!(rejected_body["error"], "config_generation_superseded");
+        let content = fs::read(dir.join("SSH_AUTHORIZED_KEYS")).expect("newer write remains");
+        assert_eq!(content, b"ssh-ed25519 AAAA newer");
+
+        let deleted = config_delete(
+            State(state),
+            crate::jwt::ConfigAuth(stale),
+            Path("SSH_AUTHORIZED_KEYS".to_string()),
+        )
+        .await;
+        let deleted_body = read_json(deleted).await;
+        assert_eq!(deleted_body["error"], "config_generation_superseded");
+        assert!(dir.join("SSH_AUTHORIZED_KEYS").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -9686,6 +9778,7 @@ mod tests {
             scopes: vec!["teardown".to_string()],
             iat: 0,
             exp: u64::MAX,
+            deployment_generation: None,
         };
 
         // A DELETE that finds the resource already absent converges.
