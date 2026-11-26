@@ -1206,6 +1206,11 @@ const INIT_ERROR_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 60;
 /// the `failed_step` key (cap#428). The step is a SIBLING of the code,
 /// never a replacement: only an exact match against this table is kept,
 /// and an unrecognized value never affects the rest of the diagnostic.
+/// PAIRED COPIES of this contract: the producer's `InitFailedStep::as_str`
+/// (enclava-labs/cap, crates/enclava-init/src/safe_diagnostics.rs) and the
+/// CLI's `TERMINAL_BOOTSTRAP_FAILED_STEPS` (enclava-labs/cap,
+/// crates/enclava-cli/src/tee_client.rs). The three hand-maintained copies
+/// are pinned together by `init_failed_steps_match_the_producer_contract`.
 const INIT_FAILED_STEPS: [&str; 8] = [
     "tls_decode_failed",
     "tls_validate_failed",
@@ -9875,6 +9880,38 @@ mod tests {
     }
 
     // --- cap#428: the allowlisted failed_step sibling ---
+
+    #[test]
+    fn init_failed_steps_match_the_producer_contract() {
+        // An INDEPENDENT literal, not the constant under test: if someone
+        // edits INIT_FAILED_STEPS (a typo, a duplicate, a dropped entry),
+        // this pin catches the drift against the producer's contract
+        // (cap's InitFailedStep::as_str) even though every other test
+        // builds its inputs from the constant and would pass vacuously.
+        // The producer's rendered literal, from its own contract test, is
+        // exercised end-to-end by the exact-match parse test below.
+        assert_eq!(
+            INIT_FAILED_STEPS,
+            [
+                "tls_decode_failed",
+                "tls_validate_failed",
+                "tls_write_failed",
+                "tls_handoff_failed",
+                "bind_sentinel_failed",
+                "bind_source_failed",
+                "bind_target_create_failed",
+                "bind_mount_failed",
+            ]
+        );
+        assert!(
+            INIT_FAILED_STEPS.iter().all(|step| INIT_FAILED_STEPS
+                .iter()
+                .filter(|other| **other == *step)
+                .count()
+                == 1),
+            "no duplicates in the step vocabulary"
+        );
+    }
 
     #[test]
     fn parse_keeps_each_allowlisted_failed_step_on_an_exact_match() {
