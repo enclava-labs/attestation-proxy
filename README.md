@@ -44,7 +44,15 @@ sourced from the enclava-init error file:
 
 `error` is one of the exact recognized codes `acme_rate_limited`,
 `acme_certificate_issuance_failed`, or `enclava_init_failed`; `terminal` is
-always `true` (a terminal bootstrap failure); `retry_after` is `null` or a
+always `true` (a terminal bootstrap failure); `failed_step` is emitted ONLY
+for the generic `enclava_init_failed` code and only when the error file
+carried an exact step literal from the fixed init vocabulary
+(`tls_decode_failed`, `tls_validate_failed`, `tls_write_failed`,
+`tls_handoff_failed`, `bind_sentinel_failed`, `bind_source_failed`,
+`bind_target_create_failed`, `bind_mount_failed`) — an instrumented failing
+step for operators, absent otherwise (a broker failure never carries one).
+The key is omitted, not `null`, when no step is present; `retry_after` is
+`null` or a
 validated canonical RFC3339 UTC deadline (`YYYY-MM-DDTHH:MM:SSZ`, seconds
 `00`-`59` — leap seconds and offsets are not canonical broker output and are
 rejected — exactly as emitted by the broker chain). The proxy independently

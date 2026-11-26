@@ -1202,6 +1202,26 @@ const INIT_ERROR_MAX_BYTES: usize = 4096;
 /// Independent proxy-side re-check of the producer's Retry-After bound: a
 /// deadline may lie at most 365 days in the future of the observation time.
 const INIT_ERROR_RETRY_AFTER_MAX_FUTURE_SECONDS: i64 = 365 * 24 * 60 * 60;
+/// The fixed failing-step vocabulary the init's error file may carry on
+/// the `failed_step` key (cap#428). The step is a SIBLING of the code,
+/// never a replacement: only an exact match against this table is kept,
+/// and an unrecognized value never affects the rest of the diagnostic.
+/// PAIRED COPIES of this contract: the producer's `InitFailedStep::as_str`
+/// (enclava-labs/cap, crates/enclava-init/src/safe_diagnostics.rs) and the
+/// CLI's `TERMINAL_BOOTSTRAP_FAILED_STEPS` (enclava-labs/cap,
+/// crates/enclava-cli/src/tee_client.rs). The three hand-maintained copies
+/// are pinned together by `init_failed_steps_match_the_producer_contract`.
+const INIT_FAILED_STEPS: [&str; 8] = [
+    "tls_decode_failed",
+    "tls_validate_failed",
+    "tls_write_failed",
+    "tls_handoff_failed",
+    "bind_sentinel_failed",
+    "bind_source_failed",
+    "bind_target_create_failed",
+    "bind_mount_failed",
+];
+
 const INIT_ERROR_CODE_RATE_LIMITED: &str = "acme_rate_limited";
 const INIT_ERROR_CODE_CERTIFICATE_ISSUANCE_FAILED: &str = "acme_certificate_issuance_failed";
 const INIT_ERROR_CODE_INIT_FAILED: &str = "enclava_init_failed";
@@ -1235,6 +1255,7 @@ const INIT_STAGE_VOCABULARY: [&str; 12] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BootstrapInitError {
     code: &'static str,
+    step: Option<&'static str>,
     retry_after: Option<String>,
 }
 
@@ -1245,18 +1266,25 @@ impl BootstrapInitError {
     fn generic() -> Self {
         Self {
             code: INIT_ERROR_CODE_INIT_FAILED,
+            step: None,
             retry_after: None,
         }
     }
 
-    /// Exact wire contract for the `bootstrap_error` status object: only the
-    /// three documented fields, nothing echoed from the error file.
+    /// Exact wire contract for the `bootstrap_error` status object: the
+    /// three documented fields plus `failed_step`, emitted ONLY when the
+    /// error file carried an allowlisted step literal — nothing echoed
+    /// from the error file.
     fn status_json(&self) -> Value {
-        json!({
+        let mut object = json!({
             "error": self.code,
             "terminal": true,
             "retry_after": self.retry_after,
-        })
+        });
+        if let Some(step) = self.step {
+            object["failed_step"] = json!(step);
+        }
+        object
     }
 
     /// Stable, fixed-vocabulary detail for ownership error strings and logs.
@@ -1276,7 +1304,9 @@ impl BootstrapInitError {
 /// bytes can reach status responses or error strings. An invalid `retry_after`
 /// value (bad format, wrong type, or outside the producer bound) degrades to
 /// `null` while the recognized safe terminal code is retained; the raw value
-/// is never echoed.
+/// is never echoed. The `failed_step` sibling (cap#428) is kept only on an
+/// exact match against the fixed step vocabulary and never influences the
+/// code, the deadline, or the collapse decision.
 fn parse_bootstrap_init_error(bytes: &[u8]) -> BootstrapInitError {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1306,6 +1336,21 @@ fn parse_bootstrap_init_error_at(bytes: &[u8], now_unix: i64) -> BootstrapInitEr
     if fields.get("terminal").and_then(Value::as_bool) != Some(true) {
         return BootstrapInitError::generic();
     }
+    // The failing step (cap#428): a SIBLING field, kept only for the
+    // generic init failure (the producer's contract: a broker failure
+    // keeps its acme code and carries no step) and only on an exact match
+    // against the fixed vocabulary. A non-string, unknown, lookalike,
+    // prefixed, or overlong value is simply dropped — the diagnostic is
+    // otherwise completely unaffected (never collapsed).
+    let step = (code == INIT_ERROR_CODE_INIT_FAILED)
+        .then(|| {
+            fields
+                .get("failed_step")
+                .and_then(Value::as_str)
+                .and_then(|step| INIT_FAILED_STEPS.iter().find(|known| **known == step))
+                .copied()
+        })
+        .flatten();
     let retry_after = match fields.get("retry_after") {
         None | Some(Value::Null) => None,
         // An invalid deadline (bad format, wrong type, or outside the
@@ -1316,7 +1361,11 @@ fn parse_bootstrap_init_error_at(bytes: &[u8], now_unix: i64) -> BootstrapInitEr
         }
         Some(_) => None,
     };
-    BootstrapInitError { code, retry_after }
+    BootstrapInitError {
+        code,
+        step,
+        retry_after,
+    }
 }
 
 /// A deadline is valid only if it parses as the canonical broker format and
@@ -9828,5 +9877,268 @@ mod tests {
         assert_eq!(body["deleted"], json!([]));
 
         server.abort();
+    }
+
+    // --- cap#428: the allowlisted failed_step sibling ---
+
+    #[test]
+    fn init_failed_steps_match_the_producer_contract() {
+        // An INDEPENDENT literal, not the constant under test: if someone
+        // edits INIT_FAILED_STEPS (a typo, a duplicate, a dropped entry),
+        // this pin catches the drift against the producer's contract
+        // (cap's InitFailedStep::as_str) even though every other test
+        // builds its inputs from the constant and would pass vacuously.
+        // The producer's rendered literal, from its own contract test, is
+        // exercised end-to-end by the exact-match parse test below.
+        assert_eq!(
+            INIT_FAILED_STEPS,
+            [
+                "tls_decode_failed",
+                "tls_validate_failed",
+                "tls_write_failed",
+                "tls_handoff_failed",
+                "bind_sentinel_failed",
+                "bind_source_failed",
+                "bind_target_create_failed",
+                "bind_mount_failed",
+            ]
+        );
+        assert!(
+            INIT_FAILED_STEPS.iter().all(|step| INIT_FAILED_STEPS
+                .iter()
+                .filter(|other| **other == *step)
+                .count()
+                == 1),
+            "no duplicates in the step vocabulary"
+        );
+    }
+
+    #[test]
+    fn parse_keeps_each_allowlisted_failed_step_on_an_exact_match() {
+        let now_unix = 1_800_000_000i64;
+        for step in INIT_FAILED_STEPS {
+            let payload = format!(
+                r#"{{"error":"enclava_init_failed","terminal":true,"failed_step":"{step}"}}"#
+            );
+            let parsed = parse_bootstrap_init_error_at(payload.as_bytes(), now_unix);
+            assert_eq!(parsed.code, "enclava_init_failed");
+            assert_eq!(parsed.step, Some(step));
+        }
+    }
+
+    #[test]
+    fn parse_drops_unrecognized_failed_step_values_without_collapsing() {
+        let now_unix = 1_800_000_000i64;
+        for step in [
+            "tls_decode_failed ",
+            " tls_decode_failed",
+            "TLS_DECODE_FAILED",
+            "tls_decode_failed2",
+            "tls-decode-failed",
+            "enclava_init_failed",
+            "provider said: ROFS",
+            "tls_decode_failedX00",
+            &"x".repeat(300),
+        ] {
+            let payload = format!(
+                r#"{{"error":"enclava_init_failed","terminal":true,"failed_step":"{step}","retry_after":null}}"#
+            );
+            let parsed = parse_bootstrap_init_error_at(payload.as_bytes(), now_unix);
+            assert_eq!(parsed.code, "enclava_init_failed");
+            assert_eq!(parsed.step, None, "unrecognized step must drop: {step:?}");
+            assert_eq!(parsed.retry_after, None);
+        }
+        // Non-string and object values drop the same way. The last case is
+        // the cross-wire shape: an acme code carrying a step literal — the
+        // step still drops, the broker code stays.
+        let payloads: Vec<&[u8]> = vec![
+            br#"{"error":"enclava_init_failed","terminal":true,"failed_step":42}"#,
+            br#"{"error":"enclava_init_failed","terminal":true,"failed_step":null}"#,
+            br#"{"error":"enclava_init_failed","terminal":true,"failed_step":{"step":"tls_decode_failed"}}"#,
+            br#"{"error":"enclava_init_failed","terminal":true,"failed_step":["tls_decode_failed"]}"#,
+            br#"{"error":"acme_rate_limited","terminal":true,"failed_step":"tls_decode_failed"}"#,
+        ];
+        for payload in payloads {
+            let parsed = parse_bootstrap_init_error_at(payload, now_unix);
+            assert_eq!(parsed.step, None, "value must drop: {payload:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keeps_the_step_and_the_deadline_independently() {
+        let now_unix = 1_800_000_000i64;
+        // The producer's goal-state shape: a validated deadline on the
+        // broker code (no step ever rides an acme code — the gate drops
+        // it even when a mixed payload carries one).
+        let parsed = parse_bootstrap_init_error_at(
+            br#"{"error":"acme_rate_limited","terminal":true,"retry_after":"2027-06-15T08:00:00Z","failed_step":"tls_validate_failed"}"#,
+            now_unix,
+        );
+        assert_eq!(parsed.code, "acme_rate_limited");
+        assert_eq!(parsed.step, None);
+        assert_eq!(parsed.retry_after.as_deref(), Some("2027-06-15T08:00:00Z"));
+        // And the init failure's own shape: the step rides the generic
+        // code with no deadline.
+        let parsed = parse_bootstrap_init_error_at(
+            br#"{"error":"enclava_init_failed","terminal":true,"failed_step":"tls_validate_failed"}"#,
+            now_unix,
+        );
+        assert_eq!(parsed.code, "enclava_init_failed");
+        assert_eq!(parsed.step, Some("tls_validate_failed"));
+        assert_eq!(parsed.retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_failed_step_and_merges_the_stage() {
+        let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-bootstrap-step",
+            Some(b"not-ready\n"),
+            Some(
+                br#"{"error":"enclava_init_failed","terminal":true,"failed_step":"bind_target_create_failed"}"#,
+            ),
+        )
+        .await;
+        fs::write(
+            init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived"),
+            "binding workload mount namespaces\n",
+        )
+        .expect("write stage file");
+
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let boot = body.get("bootstrap_error").expect("failure must surface");
+        assert_eq!(
+            boot.get("failed_step").and_then(Value::as_str),
+            Some("bind_target_create_failed")
+        );
+        assert_eq!(
+            boot.get("last_init_stage").and_then(Value::as_str),
+            Some("binding workload mount namespaces")
+        );
+        // The full key set of the merged object: no key beyond the
+        // documented five.
+        let keys: Vec<&str> = boot
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![
+                "error",
+                "failed_step",
+                "last_init_stage",
+                "retry_after",
+                "terminal"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_omits_failed_step_when_the_file_has_none() {
+        let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-bootstrap-no-step",
+            Some(b"not-ready\n"),
+            Some(br#"{"error":"enclava_init_failed","terminal":true}"#),
+        )
+        .await;
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let boot = body.get("bootstrap_error").expect("failure must surface");
+        assert!(boot.get("failed_step").is_none());
+        assert_eq!(
+            boot.get("error").and_then(Value::as_str),
+            Some("enclava_init_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_unrecognized_failed_step_stays_the_recognized_generic_failure() {
+        // A lookalike/prefixed/overlong/typed step must not collapse the
+        // diagnostic: the generic terminal failure stays, the stage merge
+        // stays, and only the step key is absent.
+        for step_payload in [
+            r#""failed_step":"tls_decode_failed2""#,
+            r#""failed_step":"prefix:tls_decode_failed""#,
+            r#""failed_step":42"#,
+            r#""failed_step":null"#,
+            &format!(r#""failed_step":"{}""#, "x".repeat(300)),
+        ] {
+            let payload =
+                format!(r#"{{"error":"enclava_init_failed","terminal":true,{step_payload}}}"#);
+            let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+                "status-bootstrap-bad-step",
+                Some(b"not-ready\n"),
+                Some(payload.as_bytes()),
+            )
+            .await;
+            fs::write(
+                init_stage_file_from_ready(&state.config.enclava_init_ready_file).expect("derived"),
+                "binding workload mount namespaces\n",
+            )
+            .expect("write stage file");
+
+            let response = status(State(state)).await;
+            assert_eq!(response.status().as_u16(), 200);
+            let body = read_json(response).await;
+            let boot = body.get("bootstrap_error").expect("failure must surface");
+            assert_eq!(
+                boot.get("error").and_then(Value::as_str),
+                Some("enclava_init_failed")
+            );
+            assert!(boot.get("failed_step").is_none());
+            assert_eq!(
+                boot.get("last_init_stage").and_then(Value::as_str),
+                Some("binding workload mount namespaces")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_bootstrap_error_object_never_exceeds_the_documented_key_set() {
+        // The top-level ownership error string stays exactly
+        // enclava_init_failed, and the bootstrap_error object carries no key
+        // beyond error/terminal/retry_after/last_init_stage/failed_step.
+        let (state, _ready, _error, _dir, _token, _api) = status_test_state_with_init_files(
+            "status-bootstrap-key-set",
+            Some(b"not-ready\n"),
+            Some(
+                br#"{"error":"enclava_init_failed","terminal":true,"failed_step":"bind_mount_failed","detail":"SECRET-SYNTHETIC-PROSE"}"#,
+            ),
+        )
+        .await;
+        let response = status(State(state)).await;
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(response).await;
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("SECRET-SYNTHETIC-PROSE"),
+            "no extra field may be echoed: {rendered}"
+        );
+        let boot = body.get("bootstrap_error").expect("failure must surface");
+        let keys: Vec<&str> = boot
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in keys {
+            assert!(
+                [
+                    "error",
+                    "terminal",
+                    "retry_after",
+                    "last_init_stage",
+                    "failed_step"
+                ]
+                .contains(&key),
+                "unexpected key {key}"
+            );
+        }
     }
 }
